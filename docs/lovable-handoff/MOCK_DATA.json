@@ -1,0 +1,227 @@
+{
+  "customers": [
+    {
+      "id": 1,
+      "billing_name": "Acme Cloud Solutions Pvt Ltd",
+      "gst_number": "29AAAAA0000A1Z5",
+      "billing_address": "Tech Park, Whitefield, Bangalore",
+      "state": "Karnataka",
+      "contact_person": "Priya Sharma",
+      "phone": "+91 9876543210",
+      "email": "finance@acmecloud.example.com",
+      "total_orders": 5,
+      "lifetime_billed": 2450000.0,
+      "outstanding_balance": 322000.0
+    },
+    {
+      "id": 2,
+      "billing_name": "Nexus Dynamics LLP",
+      "gst_number": "27BBBBB1111B2Z6",
+      "billing_address": "Bandra-Kurla Complex, Mumbai",
+      "state": "Maharashtra",
+      "contact_person": "Vikram Mehta",
+      "phone": "+91 9123456780",
+      "email": "accounts@nexusdynamics.example.com",
+      "total_orders": 3,
+      "lifetime_billed": 1150000.0,
+      "outstanding_balance": 0.0
+    }
+  ],
+  "financial_years": [
+    { "code": "FY 2026-27", "start_date": "2026-04-01", "end_date": "2027-03-31", "is_active": 1 },
+    { "code": "FY 2025-26", "start_date": "2025-04-01", "end_date": "2026-03-31", "is_active": 1 },
+    { "code": "FY 2024-25", "start_date": "2024-04-01", "end_date": "2025-03-31", "is_active": 1 }
+  ],
+  "tax_rates": [
+    { "id": 1, "name": "GST 18% (Standard IT & Services)", "rate": 0.18, "tax_type": "GST", "is_default": 1 },
+    { "id": 2, "name": "GST 28% (Hardware / Tech Equip)", "rate": 0.28, "tax_type": "GST", "is_default": 0 },
+    { "id": 3, "name": "GST 12% (IT Goods / Print)", "rate": 0.12, "tax_type": "GST", "is_default": 0 },
+    { "id": 4, "name": "GST 5% (Transport / Basic Goods)", "rate": 0.05, "tax_type": "GST", "is_default": 0 },
+    { "id": 5, "name": "0% (SEZ Unit / Export / Exempt)", "rate": 0.0, "tax_type": "EXEMPT", "is_default": 0 }
+  ],
+  "tds_rates": [
+    { "id": 1, "section_code": "194J (2%)", "description": "Technical Services / Call Centre", "rate": 0.02 },
+    { "id": 2, "section_code": "194J (10%)", "description": "Professional / Legal Fees", "rate": 0.1 },
+    { "id": 3, "section_code": "194C (2%)", "description": "Contractor / Company Works", "rate": 0.02 },
+    { "id": 4, "section_code": "194C (1%)", "description": "Contractor / Individual / HUF", "rate": 0.01 },
+    { "id": 5, "section_code": "194Q (0.1%)", "description": "Purchase of Goods exceeding 50L", "rate": 0.001 }
+  ],
+  "users": [
+    { "id": 1, "username": "admin", "full_name": "System Administrator", "role": "admin", "created_at": "2026-04-01 00:00:00" },
+    { "id": 2, "username": "finance_lead", "full_name": "Aisha Khan", "role": "finance", "created_at": "2026-04-02 10:15:00" },
+    { "id": 3, "username": "siliya", "full_name": "Siliya Mol PS", "role": "sales", "created_at": "2026-04-03 11:30:00" },
+    { "id": 4, "username": "syama", "full_name": "Syama.S", "role": "sales", "created_at": "2026-04-03 11:45:00" },
+    { "id": 5, "username": "anshar", "full_name": "Anshar", "role": "sales", "created_at": "2026-04-03 12:00:00" },
+    { "id": 6, "username": "auditor", "full_name": "Kavita Rao", "role": "viewer", "created_at": "2026-04-05 09:00:00" }
+  ],
+  "sales_targets": [
+    {
+      "user_id": 3,
+      "fy_code": "FY 2026-27",
+      "target_amount": 4000000.0,
+      "half_yearly_target": 2000000.0,
+      "quarterly_target": 1000000.0,
+      "monthly_target": 333333.33
+    }
+  ],
+  "invoices": [
+    {
+      "id": 101,
+      "fy_code": "FY 2026-27",
+      "order_type": "PO",
+      "po_number": "PO-CORP-2026-099",
+      "po_date": "2026-04-10",
+      "customer_id": 1,
+      "executive_id": 3,
+      "customer_name": "Acme Cloud Solutions Pvt Ltd",
+      "customer_gstin": "29AAAAA0000A1Z5",
+      "customer_address": "Tech Park, Whitefield, Bangalore",
+      "customer_state": "Karnataka",
+      "currency": "INR",
+      "exchange_rate": 1.0,
+      "original_amount": 450000.0,
+      "exclusive_amount": 450000.0,
+      "tax_rate": 0.18,
+      "tax_amount": 81000.0,
+      "total_amount": 531000.0,
+      "invoice_number": "INV-2026-042",
+      "invoice_date": "2026-04-12",
+      "due_date": "2026-05-12",
+      "remarks": "Cloud migration phase 1 milestone",
+      "payment_status": "PARTIAL",
+      "total_cash_paid": 200000.0,
+      "total_tds_deducted": 9000.0,
+      "total_paid": 209000.0,
+      "outstanding_balance": 322000.0,
+      "computed_status": "PARTIAL",
+      "executive_name": "Siliya Mol PS",
+      "line_items": [
+        {
+          "id": 201,
+          "invoice_id": 101,
+          "description": "Enterprise Cloud Architecture Consulting",
+          "quantity": 100.0,
+          "unit_price": 4500.0,
+          "tax_rate": 0.18,
+          "tax_amount": 81000.0,
+          "total_amount": 531000.0
+        }
+      ],
+      "payments": [
+        {
+          "id": 85,
+          "invoice_id": 101,
+          "payment_amount": 200000.0,
+          "tds_amount": 9000.0,
+          "tds_section": "194J (2%)",
+          "payment_date": "2026-04-20",
+          "payment_mode": "NEFT",
+          "remittance_number": "UTR-ICICI-9876543210"
+        }
+      ]
+    },
+    {
+      "id": 102,
+      "fy_code": "FY 2026-27",
+      "order_type": "PO",
+      "po_number": "PO-NEXUS-881",
+      "po_date": "2026-04-14",
+      "customer_id": 2,
+      "executive_id": 4,
+      "customer_name": "Nexus Dynamics LLP",
+      "customer_gstin": "27BBBBB1111B2Z6",
+      "customer_address": "Bandra-Kurla Complex, Mumbai",
+      "customer_state": "Maharashtra",
+      "currency": "INR",
+      "exchange_rate": 1.0,
+      "original_amount": 250000.0,
+      "exclusive_amount": 250000.0,
+      "tax_rate": 0.18,
+      "tax_amount": 45000.0,
+      "total_amount": 295000.0,
+      "invoice_number": null,
+      "invoice_date": null,
+      "due_date": null,
+      "remarks": "Pending project kickoff",
+      "payment_status": "PENDING",
+      "total_cash_paid": 0.0,
+      "total_tds_deducted": 0.0,
+      "total_paid": 0.0,
+      "outstanding_balance": 295000.0,
+      "computed_status": "UNBILLED",
+      "executive_name": "Syama.S",
+      "line_items": [
+        {
+          "id": 202,
+          "invoice_id": 102,
+          "description": "DevOps Pipeline Implementation",
+          "quantity": 1.0,
+          "unit_price": 250000.0,
+          "tax_rate": 0.18,
+          "tax_amount": 45000.0,
+          "total_amount": 295000.0
+        }
+      ],
+      "payments": []
+    }
+  ],
+  "dashboard_summary": {
+    "kpis": {
+      "total_invoices": 1,
+      "total_invoiced": 531000.0,
+      "total_cash_collected": 200000.0,
+      "total_tds_recognized": 9000.0,
+      "total_settled": 209000.0,
+      "total_outstanding": 322000.0,
+      "current_fy_outstanding": 322000.0,
+      "current_fy_invoiced": 531000.0,
+      "current_fy_collected": 209000.0,
+      "current_fy_code": "FY 2026-27",
+      "overall_collection_rate": 39.4
+    },
+    "yoy": [
+      {
+        "fy_code": "FY 2026-27",
+        "total_orders": 2,
+        "exclusive_value": 700000.0,
+        "invoiced_gross": 531000.0,
+        "cash_collected": 200000.0,
+        "tds_deducted": 9000.0,
+        "collections": 209000.0,
+        "balance_outstanding": 322000.0,
+        "collection_rate": 39.4
+      }
+    ],
+    "aging": [
+      { "bucket": "Current / Not Due", "amount": 322000.0 },
+      { "bucket": "1-30 Days Overdue", "amount": 0.0 },
+      { "bucket": "31-60 Days Overdue", "amount": 0.0 },
+      { "bucket": "61-90 Days Overdue", "amount": 0.0 },
+      { "bucket": "90+ Days Overdue", "amount": 0.0 }
+    ],
+    "executives": [
+      {
+        "user_id": 3,
+        "id": 3,
+        "name": "Siliya Mol PS",
+        "fy26_27_orders": 1,
+        "fy26_27_sales": 531000.0,
+        "fy26_27_outstanding": 322000.0,
+        "all_time_sales": 531000.0,
+        "yearly_target": 4000000.0,
+        "target_achievement_pct": 13.3
+      },
+      {
+        "user_id": 4,
+        "id": 4,
+        "name": "Syama.S",
+        "fy26_27_orders": 1,
+        "fy26_27_sales": 0.0,
+        "fy26_27_outstanding": 295000.0,
+        "all_time_sales": 0.0,
+        "yearly_target": 3500000.0,
+        "target_achievement_pct": 0.0
+      }
+    ]
+  }
+}
