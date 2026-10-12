@@ -97,13 +97,19 @@ def health_check():
     return {"status": "healthy", "service": "CollectFlow", "version": "1.0.0"}
 
 
+from sqlalchemy import text, select, func
+from app.core.database import get_db_session
+from app.models.domain_models import Customer, FinancialYear, GstRateMaster, TdsSectionMaster, User
+
+
 @app.get("/ready")
 def readiness_check():
     """Readiness probe checking database connectivity."""
     try:
-        res = query_one("SELECT 1 as is_alive;")
-        if not res or res.get("is_alive") != 1:
-            raise Exception("Database probe failed")
+        with get_db_session() as db:
+            res = db.execute(text("SELECT 1 as is_alive;")).scalar()
+            if res != 1:
+                raise Exception("Database probe failed")
         return {"status": "ready", "database": "connected"}
     except Exception as e:
         return JSONResponse(status_code=503, content={"status": "not_ready", "error": str(e)})
@@ -117,28 +123,49 @@ def index():
 
 @app.get("/api/meta")
 def get_metadata(user: dict = Depends(get_current_user)):
-    fys = query_all("SELECT code FROM financial_years WHERE is_active = 1 ORDER BY code DESC;")
-    execs = query_all("""
-        SELECT id, COALESCE(full_name, username) AS name
-        FROM users
-        WHERE role = 'sales'
-        ORDER BY COALESCE(full_name, username) ASC;
-    """)
-    custs = query_all("SELECT id, billing_name FROM customers ORDER BY billing_name ASC;")
-    tax_rates = query_all(
-        "SELECT id, name, rate, tax_type, is_default FROM tax_rates WHERE is_active = 1 ORDER BY rate ASC;"
-    )
-    tds_rates = query_all(
-        "SELECT id, section_code, description, rate FROM tds_rates WHERE is_active = 1 ORDER BY id ASC;"
-    )
+    with get_db_session() as db:
+        fys = db.scalars(select(FinancialYear.code).where(FinancialYear.is_active.is_(True)).order_by(FinancialYear.code.desc())).all()
+        execs = db.execute(
+            select(User.id, func.coalesce(User.full_name, User.username).label("name"))
+            .where(User.role == "sales", User.is_active.is_(True))
+            .order_by(func.coalesce(User.full_name, User.username).asc())
+        ).all()
+        custs = db.execute(
+            select(Customer.id, Customer.billing_name)
+            .where(Customer.is_active.is_(True))
+            .order_by(Customer.billing_name.asc())
+        ).all()
+        gst_rates = db.scalars(
+            select(GstRateMaster).where(GstRateMaster.is_active.is_(True)).order_by(GstRateMaster.rate.asc())
+        ).all()
+        tds_rates = db.scalars(
+            select(TdsSectionMaster).where(TdsSectionMaster.is_active.is_(True)).order_by(TdsSectionMaster.id.asc())
+        ).all()
 
-    return {
-        "financial_years": [f["code"] for f in fys],
-        "executives": execs,
-        "customers": custs,
-        "tax_rates": tax_rates,
-        "tds_rates": tds_rates,
-    }
+        return {
+            "financial_years": list(fys),
+            "executives": [{"id": e[0], "name": e[1]} for e in execs],
+            "customers": [{"id": c[0], "billing_name": c[1]} for c in custs],
+            "tax_rates": [
+                {
+                    "id": g.id,
+                    "name": g.name,
+                    "rate": float(g.rate),
+                    "tax_type": "GST",
+                    "is_default": 1 if g.is_default else 0,
+                }
+                for g in gst_rates
+            ],
+            "tds_rates": [
+                {
+                    "id": t.id,
+                    "section_code": t.section_code,
+                    "description": t.description,
+                    "rate": float(t.default_rate),
+                }
+                for t in tds_rates
+            ],
+        }
 
 
 if __name__ == "__main__":
