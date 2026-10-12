@@ -185,60 +185,67 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_login_attempts_lookup ON login_attempts(identifier, attempted_at);"
         )
 
-        # Invoices customer snapshot columns
-        inv_cols = [r["name"] for r in conn.execute("PRAGMA table_info(invoices);").fetchall()]
-        if "customer_name" not in inv_cols:
-            conn.execute("ALTER TABLE invoices ADD COLUMN customer_name TEXT;")
-        if "customer_gstin" not in inv_cols:
-            conn.execute("ALTER TABLE invoices ADD COLUMN customer_gstin TEXT;")
-        if "customer_address" not in inv_cols:
-            conn.execute("ALTER TABLE invoices ADD COLUMN customer_address TEXT;")
-        if "customer_state" not in inv_cols:
-            conn.execute("ALTER TABLE invoices ADD COLUMN customer_state TEXT;")
+        # Invoices customer snapshot columns (if invoices table exists)
+        has_invoices = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='invoices';").fetchone()
+        if has_invoices:
+            inv_cols = [r["name"] for r in conn.execute("PRAGMA table_info(invoices);").fetchall()]
+            if "customer_name" not in inv_cols:
+                conn.execute("ALTER TABLE invoices ADD COLUMN customer_name TEXT;")
+            if "customer_gstin" not in inv_cols:
+                conn.execute("ALTER TABLE invoices ADD COLUMN customer_gstin TEXT;")
+            if "customer_address" not in inv_cols:
+                conn.execute("ALTER TABLE invoices ADD COLUMN customer_address TEXT;")
+            if "customer_state" not in inv_cols:
+                conn.execute("ALTER TABLE invoices ADD COLUMN customer_state TEXT;")
 
-        # Customers email column
-        cust_cols = [r["name"] for r in conn.execute("PRAGMA table_info(customers);").fetchall()]
-        if "email" not in cust_cols:
-            conn.execute("ALTER TABLE customers ADD COLUMN email TEXT;")
+        # Customers email column (if customers table exists)
+        has_customers = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='customers';").fetchone()
+        if has_customers:
+            cust_cols = [r["name"] for r in conn.execute("PRAGMA table_info(customers);").fetchall()]
+            if "email" not in cust_cols:
+                conn.execute("ALTER TABLE customers ADD COLUMN email TEXT;")
 
-        # Payments idempotency key column and index
-        pay_cols = [r["name"] for r in conn.execute("PRAGMA table_info(payments);").fetchall()]
-        if "idempotency_key" not in pay_cols:
-            conn.execute("ALTER TABLE payments ADD COLUMN idempotency_key TEXT;")
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_idempotency ON payments(idempotency_key) WHERE idempotency_key IS NOT NULL;"
-        )
+        # Payments idempotency key column and index (if payments table exists)
+        has_payments = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='payments';").fetchone()
+        if has_payments:
+            pay_cols = [r["name"] for r in conn.execute("PRAGMA table_info(payments);").fetchall()]
+            if "idempotency_key" not in pay_cols:
+                conn.execute("ALTER TABLE payments ADD COLUMN idempotency_key TEXT;")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_idempotency ON payments(idempotency_key) WHERE idempotency_key IS NOT NULL;"
+            )
 
-        # Database-level unique constraints for commercial identifiers (normalized whitespace and case)
-        conn.execute("DROP INDEX IF EXISTS idx_invoices_unique_po;")
-        conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_unique_po
-            ON invoices(LOWER(TRIM(po_number)))
-            WHERE po_number IS NOT NULL
-              AND TRIM(po_number) != ''
-              AND LOWER(TRIM(po_number)) NOT IN ('no po', 'recurring / direct invoice');
-            """
-        )
-        conn.execute("DROP INDEX IF EXISTS idx_invoices_unique_inv;")
-        conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_unique_inv
-            ON invoices(LOWER(TRIM(invoice_number)))
-            WHERE invoice_number IS NOT NULL
-              AND TRIM(invoice_number) != '';
-            """
-        )
+        if has_invoices:
+            # Database-level unique constraints for commercial identifiers (normalized whitespace and case)
+            conn.execute("DROP INDEX IF EXISTS idx_invoices_unique_po;")
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_unique_po
+                ON invoices(LOWER(TRIM(po_number)))
+                WHERE po_number IS NOT NULL
+                  AND TRIM(po_number) != ''
+                  AND LOWER(TRIM(po_number)) NOT IN ('no po', 'recurring / direct invoice');
+                """
+            )
+            conn.execute("DROP INDEX IF EXISTS idx_invoices_unique_inv;")
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_unique_inv
+                ON invoices(LOWER(TRIM(invoice_number)))
+                WHERE invoice_number IS NOT NULL
+                  AND TRIM(invoice_number) != '';
+                """
+            )
 
-        # Backfill snapshot customer data for existing invoices
-        conn.execute("""
-        UPDATE invoices
-        SET customer_name = (SELECT billing_name FROM customers WHERE customers.id = invoices.customer_id),
-            customer_gstin = (SELECT gst_number FROM customers WHERE customers.id = invoices.customer_id),
-            customer_address = (SELECT billing_address FROM customers WHERE customers.id = invoices.customer_id),
-            customer_state = (SELECT state FROM customers WHERE customers.id = invoices.customer_id)
-        WHERE customer_name IS NULL;
-        """)
+            # Backfill snapshot customer data for existing invoices
+            conn.execute("""
+            UPDATE invoices
+            SET customer_name = (SELECT billing_name FROM customers WHERE customers.id = invoices.customer_id),
+                customer_gstin = (SELECT gst_number FROM customers WHERE customers.id = invoices.customer_id),
+                customer_address = (SELECT billing_address FROM customers WHERE customers.id = invoices.customer_id),
+                customer_state = (SELECT state FROM customers WHERE customers.id = invoices.customer_id)
+            WHERE customer_name IS NULL;
+            """)
 
         # Drop obsolete isolated tables if present
         conn.execute("DROP TABLE IF EXISTS executive_targets;")
