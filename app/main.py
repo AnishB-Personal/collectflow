@@ -144,6 +144,13 @@ def get_metadata(user: dict = Depends(get_current_user)):
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.getenv("HOST", "127.0.0.1")
+    env_mode = os.getenv("COLLECTFLOW_ENV", "production").lower()
+    raw_host = os.getenv("HOST", "127.0.0.1")
+    if env_mode in ("integration", "sandbox"):
+        # Strictly bind to localhost only in integration mode
+        host = "127.0.0.1"
+    else:
+        host = raw_host
+
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app.main:app", host=host, port=port, reload=True)

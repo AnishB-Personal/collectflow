@@ -9,25 +9,52 @@ from typing import Any, Dict, List, Optional
 DEFAULT_PROD_DB_FILENAME = "collectflow.db"
 
 
+def get_default_prod_db_path() -> str:
+    return os.path.realpath(
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", DEFAULT_PROD_DB_FILENAME)
+    )
+
+
 def get_db_path() -> str:
     env_mode = os.environ.get("COLLECTFLOW_ENV", "production").lower()
     custom_path = os.environ.get("COLLECTFLOW_DB_PATH")
 
     if env_mode in ("integration", "sandbox"):
-        if not custom_path:
+        if not custom_path or not custom_path.strip():
             raise RuntimeError(
                 "CRITICAL ISOLATION ERROR: COLLECTFLOW_ENV is set to integration/sandbox, "
                 "but COLLECTFLOW_DB_PATH is not explicitly defined. Startup aborted to prevent production database access."
             )
-        resolved = os.path.abspath(custom_path)
-        if os.path.basename(resolved) == DEFAULT_PROD_DB_FILENAME and "sandbox" not in resolved and "integration" not in resolved and "test" not in resolved:
-            raise RuntimeError(
-                f"CRITICAL ISOLATION ERROR: COLLECTFLOW_DB_PATH points to production database '{resolved}'. "
-                "Integration mode requires an isolated sandbox database path containing 'sandbox', 'integration', or 'test'."
-            )
-        return resolved
+        
+        # Resolve real canonical path (dereferencing all symlinks, relative segments .., and normalizations)
+        canonical_path = os.path.realpath(os.path.abspath(custom_path.strip()))
+        prod_canonical = get_default_prod_db_path()
 
-    return custom_path or os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", DEFAULT_PROD_DB_FILENAME)
+        # Direct identity match check
+        if canonical_path == prod_canonical:
+            raise RuntimeError(
+                f"CRITICAL ISOLATION ERROR: COLLECTFLOW_DB_PATH resolves directly to production database '{canonical_path}'."
+            )
+
+        # Check if targeting production database file directly or via symlink
+        if os.path.basename(canonical_path) == DEFAULT_PROD_DB_FILENAME:
+            raise RuntimeError(
+                f"CRITICAL ISOLATION ERROR: COLLECTFLOW_DB_PATH cannot use production filename '{DEFAULT_PROD_DB_FILENAME}'."
+            )
+
+        # Require explicit sandbox/integration/test keyword in canonical path
+        normalized = canonical_path.lower()
+        if not any(token in normalized for token in ("sandbox", "integration", "test")):
+            raise RuntimeError(
+                f"CRITICAL ISOLATION ERROR: COLLECTFLOW_DB_PATH '{canonical_path}' is not an authorized sandbox path. "
+                "Path must explicitly contain 'sandbox', 'integration', or 'test'."
+            )
+
+        return canonical_path
+
+    return os.path.realpath(
+        custom_path or os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", DEFAULT_PROD_DB_FILENAME)
+    )
 
 
 def create_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
