@@ -6,13 +6,33 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def sandbox_client():
     sandbox_db = "/home/anishb/projects/personal/collectflow/data/collectflow_sandbox.db"
+    old_env = os.environ.get("COLLECTFLOW_ENV")
+    old_db = os.environ.get("COLLECTFLOW_DB_PATH")
+    old_cors = os.environ.get("CORS_ALLOWED_ORIGINS")
+
     os.environ["COLLECTFLOW_ENV"] = "integration"
     os.environ["COLLECTFLOW_DB_PATH"] = sandbox_db
     os.environ["CORS_ALLOWED_ORIGINS"] = "http://localhost:5173,http://127.0.0.1:5173"
 
     from app.main import app
 
-    return TestClient(app)
+    client = TestClient(app)
+    yield client
+
+    if old_env is not None:
+        os.environ["COLLECTFLOW_ENV"] = old_env
+    else:
+        os.environ.pop("COLLECTFLOW_ENV", None)
+
+    if old_db is not None:
+        os.environ["COLLECTFLOW_DB_PATH"] = old_db
+    else:
+        os.environ.pop("COLLECTFLOW_DB_PATH", None)
+
+    if old_cors is not None:
+        os.environ["CORS_ALLOWED_ORIGINS"] = old_cors
+    else:
+        os.environ.pop("CORS_ALLOWED_ORIGINS", None)
 
 
 def test_meta_endpoint_requires_auth_and_succeeds_with_token(sandbox_client):
