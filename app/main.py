@@ -4,6 +4,7 @@ import time
 import uuid
 
 from fastapi import Depends, FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -16,6 +17,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [req
 logger = logging.getLogger("collectflow")
 
 app = FastAPI(title="CollectFlow", description="Order-to-Cash & Accounts Receivable Management System")
+
+# Configure exact-origin CORS middleware
+raw_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000")
+allowed_origins = [o.strip() for o in raw_origins.split(",") if o.strip() and o.strip() != "*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID"],
+    max_age=600,
+)
 
 
 @app.middleware("http")

@@ -6,10 +6,28 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 
+DEFAULT_PROD_DB_FILENAME = "collectflow.db"
+
+
 def get_db_path() -> str:
-    return os.environ.get(
-        "COLLECTFLOW_DB_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "collectflow.db")
-    )
+    env_mode = os.environ.get("COLLECTFLOW_ENV", "production").lower()
+    custom_path = os.environ.get("COLLECTFLOW_DB_PATH")
+
+    if env_mode in ("integration", "sandbox"):
+        if not custom_path:
+            raise RuntimeError(
+                "CRITICAL ISOLATION ERROR: COLLECTFLOW_ENV is set to integration/sandbox, "
+                "but COLLECTFLOW_DB_PATH is not explicitly defined. Startup aborted to prevent production database access."
+            )
+        resolved = os.path.abspath(custom_path)
+        if os.path.basename(resolved) == DEFAULT_PROD_DB_FILENAME and "sandbox" not in resolved and "integration" not in resolved and "test" not in resolved:
+            raise RuntimeError(
+                f"CRITICAL ISOLATION ERROR: COLLECTFLOW_DB_PATH points to production database '{resolved}'. "
+                "Integration mode requires an isolated sandbox database path containing 'sandbox', 'integration', or 'test'."
+            )
+        return resolved
+
+    return custom_path or os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", DEFAULT_PROD_DB_FILENAME)
 
 
 def create_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
