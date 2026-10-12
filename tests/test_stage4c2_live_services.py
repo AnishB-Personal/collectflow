@@ -212,6 +212,28 @@ def test_customer_master_operations():
     assert del_acme_resp.status_code == 400
     assert "associated with it" in del_acme_resp.json()["detail"]
 
+    # 7. Exact two-decimal string serialization check
+    assert acme["total_billed"] == "531000.00"
+    assert acme["total_paid"] == "209000.00"
+    assert acme["total_outstanding"] == "322000.00"
+
+    # 8. Sales role can create customer per contract
+    sales_login = client.post("/api/auth/login", json={"username": "sandbox_sales", "password": "SalesPass123!"})
+    sales_headers = {"Authorization": f"Bearer {sales_login.json()['token']}"}
+    sales_cust_resp = client.post(
+        "/api/customers",
+        json={
+            "billing_name": "Sales Initiated Customer",
+            "city": "Pune",
+            "state": "Maharashtra",
+            "contact_person": "Priya Sharma",
+        },
+        headers=sales_headers,
+    )
+    assert sales_cust_resp.status_code == 200
+    sales_cid = sales_cust_resp.json()["id"]
+    client.delete(f"/api/customers/{sales_cid}", headers=admin_headers)
+
 
 def test_statutory_reference_endpoints():
     viewer_login = client.post("/api/auth/login", json={"username": "sandbox_viewer", "password": "ViewerPass123!"})

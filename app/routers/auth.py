@@ -196,6 +196,7 @@ def require_roles(*allowed_roles: str) -> Callable:
 
 require_admin = require_roles("admin")
 require_finance_or_admin = require_roles("admin", "finance")
+require_sales_finance_admin = require_roles("admin", "finance", "sales")
 
 
 @router.post("/login")

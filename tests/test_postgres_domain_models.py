@@ -109,7 +109,7 @@ def test_argon2id_password_hashing():
         admin = db.scalar(select(User).where(User.username == "sandbox_admin"))
         assert admin is not None
         assert admin.password_hash.startswith("$argon2id$")
-        assert ph.verify(admin.password_hash, "password123") is True
+        assert ph.verify(admin.password_hash, "AdminPass123!") is True
 
         with pytest.raises(VerifyMismatchError):
             ph.verify(admin.password_hash, "wrongpassword")

@@ -21,10 +21,12 @@ from app.models.domain_models import (
     PaymentTransaction,
     PurchaseOrder,
 )
+from decimal import Decimal
 from app.routers.auth import (
     get_current_user,
     log_security_audit,
     require_finance_or_admin,
+    require_sales_finance_admin,
 )
 
 router = APIRouter(prefix="/api/customers", tags=["Customers"])
@@ -106,9 +108,9 @@ def list_customers(
                 .where(CommercialInvoice.customer_id == c.id, CommercialInvoice.lifecycle_status != "CANCELLED")
             ).first()
 
-            total_billed = float(invoice_stats[0]) if invoice_stats else 0.0
-            total_paid = float(invoice_stats[1]) if invoice_stats else 0.0
-            total_outstanding = max(0.0, total_billed - total_paid)
+            total_billed = Decimal(str(invoice_stats[0] if invoice_stats else 0)).quantize(Decimal("0.01"))
+            total_paid = Decimal(str(invoice_stats[1] if invoice_stats else 0)).quantize(Decimal("0.01"))
+            total_outstanding = max(Decimal("0.00"), total_billed - total_paid).quantize(Decimal("0.01"))
 
             results.append(
                 {
@@ -127,9 +129,9 @@ def list_customers(
                     "phone_2": c.phone_2,
                     "is_active": c.is_active,
                     "total_orders": order_count,
-                    "total_billed": total_billed,
-                    "total_paid": total_paid,
-                    "total_outstanding": total_outstanding,
+                    "total_billed": f"{total_billed:.2f}",
+                    "total_paid": f"{total_paid:.2f}",
+                    "total_outstanding": f"{total_outstanding:.2f}",
                 }
             )
 
@@ -161,7 +163,7 @@ def get_customer(customer_id: int, user: dict = Depends(get_current_user)):
 
 
 @router.post("")
-def create_customer(item: CustomerCreate, user: dict = Depends(require_finance_or_admin)):
+def create_customer(item: CustomerCreate, user: dict = Depends(require_sales_finance_admin)):
     name = item.billing_name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Customer name is required")
