@@ -1,0 +1,448 @@
+openapi: 3.1.0
+info:
+  title: CollectFlow Financial Operations API
+  version: 1.0.0
+  description: >
+    Authoritative REST API specification for CollectFlow.
+    Features exact 2-decimal string monetary contracts, statutory Indian GST calculations,
+    PostgreSQL row-level locking concurrency, non-destructive payment adjustments,
+    and statutory invoice immutability.
+
+servers:
+  - url: http://127.0.0.1:8000
+    description: Local Integration Sandbox (FastAPI + PostgreSQL 16)
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: Ephemeral 64-hex bearer session token stored strictly in JavaScript client memory.
+
+  schemas:
+    MoneyString:
+      type: string
+      pattern: "^-?\\d+\\.\\d{2}$"
+      example: "531000.00"
+      description: Exact 2-decimal financial string. Floating-point types are prohibited.
+
+    DateString:
+      type: string
+      pattern: "^\\d{4}-\\d{2}-\\d{2}$"
+      example: "2026-04-30"
+
+    ApiError:
+      type: object
+      required:
+        - detail
+      properties:
+        detail:
+          type: string
+          example: "Invalid username or password"
+        code:
+          type: string
+          example: "UNAUTHORIZED"
+
+    UserProfile:
+      type: object
+      required:
+        - id
+        - username
+        - role
+      properties:
+        id:
+          type: integer
+        username:
+          type: string
+        role:
+          type: string
+          enum: [admin, finance, sales, viewer]
+        full_name:
+          type: string
+          nullable: true
+
+    PurchaseOrder:
+      type: object
+      required:
+        - id
+        - fy_code
+        - po_number
+        - po_date
+        - customer_id
+        - customer_name
+        - executive_id
+        - executive_name
+        - exclusive_amount
+        - tax_amount
+        - total_amount
+        - status
+      properties:
+        id:
+          type: integer
+        fy_code:
+          type: string
+          example: "FY 2026-27"
+        po_number:
+          type: string
+          example: "PO-NEXUS-881"
+        po_date:
+          $ref: '#/components/schemas/DateString'
+        customer_id:
+          type: integer
+        customer_name:
+          type: string
+        executive_id:
+          type: integer
+        executive_name:
+          type: string
+        exclusive_amount:
+          $ref: '#/components/schemas/MoneyString'
+        tax_rate:
+          type: string
+          example: "0.1800"
+        tax_amount:
+          $ref: '#/components/schemas/MoneyString'
+        total_amount:
+          $ref: '#/components/schemas/MoneyString'
+        status:
+          type: string
+          enum: [UNBILLED, CONVERTED, CANCELLED]
+        remarks:
+          type: string
+          nullable: true
+
+    CommercialInvoice:
+      type: object
+      required:
+        - id
+        - fy_code
+        - customer_id
+        - customer_name
+        - executive_id
+        - executive_name
+        - invoice_number
+        - invoice_date
+        - due_date
+        - exclusive_amount
+        - tax_amount
+        - total_amount
+        - cgst_amount
+        - sgst_amount
+        - igst_amount
+        - total_cash_paid
+        - total_tds_deducted
+        - total_paid
+        - outstanding_balance
+        - lifecycle_status
+        - payment_status
+        - days_overdue
+      properties:
+        id:
+          type: integer
+        po_id:
+          type: integer
+          nullable: true
+        po_number:
+          type: string
+          nullable: true
+        fy_code:
+          type: string
+        customer_id:
+          type: integer
+        customer_name:
+          type: string
+        executive_id:
+          type: integer
+        executive_name:
+          type: string
+        invoice_number:
+          type: string
+          example: "INV-2026-042"
+        invoice_date:
+          $ref: '#/components/schemas/DateString'
+        due_date:
+          $ref: '#/components/schemas/DateString'
+        exclusive_amount:
+          $ref: '#/components/schemas/MoneyString'
+        tax_rate:
+          type: string
+        tax_amount:
+          $ref: '#/components/schemas/MoneyString'
+        total_amount:
+          $ref: '#/components/schemas/MoneyString'
+        cgst_amount:
+          $ref: '#/components/schemas/MoneyString'
+        sgst_amount:
+          $ref: '#/components/schemas/MoneyString'
+        igst_amount:
+          $ref: '#/components/schemas/MoneyString'
+        total_cash_paid:
+          $ref: '#/components/schemas/MoneyString'
+        total_tds_deducted:
+          $ref: '#/components/schemas/MoneyString'
+        total_paid:
+          $ref: '#/components/schemas/MoneyString'
+        outstanding_balance:
+          $ref: '#/components/schemas/MoneyString'
+        lifecycle_status:
+          type: string
+          enum: [ISSUED, CANCELLED]
+        payment_status:
+          type: string
+          enum: [PENDING, PARTIAL, PAID, OVERDUE, CANCELLED]
+        days_overdue:
+          type: integer
+
+paths:
+  /api/auth/login:
+    post:
+      summary: User login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        '200':
+          description: Authenticated session
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  token: { type: string }
+                  user: { $ref: '#/components/schemas/UserProfile' }
+        '401':
+          description: Invalid credentials
+
+  /api/auth/me:
+    get:
+      summary: Get current authenticated profile
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  authenticated: { type: boolean }
+                  user: { $ref: '#/components/schemas/UserProfile' }
+        '401':
+          description: Unauthorized session
+
+  /api/orders:
+    get:
+      summary: List unbilled purchase orders
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: fy
+          in: query
+          schema: { type: string }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  page: { type: integer }
+                  total: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PurchaseOrder' }
+
+    post:
+      summary: Register a purchase order
+      security:
+        - BearerAuth: []
+      description: Restricted to admin, finance, sales.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fy_code, po_number, po_date, customer_id, executive_id, exclusive_amount]
+              properties:
+                fy_code: { type: string }
+                po_number: { type: string }
+                po_date: { $ref: '#/components/schemas/DateString' }
+                customer_id: { type: integer }
+                executive_id: { type: integer }
+                exclusive_amount: { $ref: '#/components/schemas/MoneyString' }
+                tax_rate: { type: string, default: "0.1800" }
+                remarks: { type: string }
+      responses:
+        '201':
+          description: Order created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PurchaseOrder' }
+
+  /api/orders/{id}/convert:
+    post:
+      summary: Convert unbilled PO to issued commercial invoice
+      security:
+        - BearerAuth: []
+      description: Restricted to admin, finance.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invoice_number, invoice_date, due_date]
+              properties:
+                invoice_number: { type: string }
+                invoice_date: { $ref: '#/components/schemas/DateString' }
+                due_date: { $ref: '#/components/schemas/DateString' }
+      responses:
+        '200':
+          description: Converted invoice
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommercialInvoice' }
+
+  /api/invoices:
+    get:
+      summary: List commercial invoices
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: fy
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/CommercialInvoice' }
+
+  /api/invoices/{id}/cancel:
+    post:
+      summary: Legally cancel an unpaid invoice
+      security:
+        - BearerAuth: []
+      description: Strictly blocked if invoice has recorded settlements.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+      responses:
+        '200':
+          description: Successfully cancelled
+        '400':
+          description: Invoice has active payments or is already cancelled
+
+  /api/payments:
+    get:
+      summary: Query payments ledger
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Payments ledger list
+    post:
+      summary: Record settlement (Cash/TDS)
+      security:
+        - BearerAuth: []
+      description: Overpayment rejected with HTTP 400.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invoice_id, payment_date]
+              properties:
+                invoice_id: { type: integer }
+                payment_amount: { $ref: '#/components/schemas/MoneyString' }
+                tds_amount: { $ref: '#/components/schemas/MoneyString' }
+                tds_section: { type: string }
+                payment_date: { $ref: '#/components/schemas/DateString' }
+                payment_mode: { type: string }
+                remittance_number: { type: string }
+                idempotency_key: { type: string }
+      responses:
+        '200':
+          description: Payment recorded
+        '400':
+          description: Overpayment or negative values
+
+  /api/reporting/summary:
+    get:
+      summary: High-level KPI aggregations
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: fy
+          in: query
+          schema: { type: string }
+        - name: as_of_date
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Financial KPIs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_invoiced: { $ref: '#/components/schemas/MoneyString' }
+                  total_cash: { $ref: '#/components/schemas/MoneyString' }
+                  total_tds: { $ref: '#/components/schemas/MoneyString' }
+                  total_settled: { $ref: '#/components/schemas/MoneyString' }
+                  total_outstanding: { $ref: '#/components/schemas/MoneyString' }
+                  unbilled_orders_value: { $ref: '#/components/schemas/MoneyString' }
+
+  /api/reporting/ar-aging:
+    get:
+      summary: 6-bucket AR Aging analysis
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: as_of_date
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Bucketed aging summary
