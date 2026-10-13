@@ -121,3 +121,22 @@ def test_accept_valid_loopback_dev_urls():
     for url in valid:
         # Should not raise any exception
         validate_isolated_database_url(url, "integration")
+
+
+def test_test_mode_without_valid_test_dsn_fails_before_database_operation(monkeypatch):
+    from app.core.database import get_database_url
+
+    # 1. Test mode without COLLECTFLOW_DATABASE_URL must fail fast before any DB operation
+    monkeypatch.setenv("COLLECTFLOW_ENV", "test")
+    monkeypatch.delenv("COLLECTFLOW_DATABASE_URL", raising=False)
+    with pytest.raises(RuntimeError) as exc_info:
+        get_database_url()
+    assert "Explicit COLLECTFLOW_DATABASE_URL is required in 'test' mode" in str(exc_info.value) or "Refusing" in str(exc_info.value)
+
+    # 2. Test mode with a dev database DSN must fail fast and refuse connection
+    dev_dsn = "postgresql+psycopg://collectflow_user:secret@127.0.0.1:5432/collectflow_dev"
+    monkeypatch.setenv("COLLECTFLOW_DATABASE_URL", dev_dsn)
+    with pytest.raises(RuntimeError) as exc_info2:
+        get_database_url()
+    assert "not permitted in 'test' mode" in str(exc_info2.value) or "Test mode requires" in str(exc_info2.value)
+

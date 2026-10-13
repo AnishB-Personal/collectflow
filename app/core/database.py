@@ -19,8 +19,6 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 # Declarative Base
 Base = declarative_base()
 
-DEFAULT_DEV_PG_URL = "postgresql+psycopg://collectflow_user:collectflow_secret@127.0.0.1:5432/collectflow_dev"
-
 # Permitted non-production database names
 PERMITTED_DEV_DATABASES = {
     "collectflow_dev",
@@ -152,6 +150,16 @@ def validate_isolated_database_url(url_str: str, env_mode: str) -> None:
             f"CRITICAL ISOLATION ERROR: Database '{db_name}' is not in approved database allowlist {PERMITTED_DEV_DATABASES}."
         )
 
+    # Environment-appropriate database enforcement
+    if env_mode == "test" and db_name != "collectflow_test":
+        raise RuntimeError(
+            f"CRITICAL ISOLATION ERROR: Database '{db_name}' is not permitted in 'test' mode. Test mode requires 'collectflow_test'."
+        )
+    if env_mode in ("dev", "development") and db_name not in ("collectflow_dev", "collectflow_sandbox"):
+        raise RuntimeError(
+            f"CRITICAL ISOLATION ERROR: Database '{db_name}' is not permitted in '{env_mode}' mode."
+        )
+
     # 4. User validation: MUST be in approved user allowlist
     username = (url.username or "").strip().lower()
     if not username or username not in PERMITTED_DEV_USERS or any(token in username for token in ("prod", "production")):
@@ -169,13 +177,27 @@ def get_database_url() -> str:
         raise RuntimeError(f"CRITICAL ISOLATION ERROR: Unauthorized COLLECTFLOW_ENV '{raw_env}'.")
 
     custom_url = os.environ.get("COLLECTFLOW_DATABASE_URL")
-    if custom_url:
-        validate_isolated_database_url(custom_url, env_mode)
-        return custom_url
+    if not custom_url:
+        if env_mode == "test":
+            raise RuntimeError(
+                "CRITICAL ISOLATION ERROR: Explicit COLLECTFLOW_DATABASE_URL is required in 'test' mode. "
+                "Refusing silent fallback to development database."
+            )
+        # In non-test mode, require explicit credentials from environment
+        db_user = os.environ.get("COLLECTFLOW_DB_USER")
+        db_pass = os.environ.get("COLLECTFLOW_DB_PASSWORD")
+        if not db_user or not db_pass:
+            raise RuntimeError(
+                "CRITICAL ISOLATION ERROR: Explicit COLLECTFLOW_DATABASE_URL (or COLLECTFLOW_DB_USER and "
+                "COLLECTFLOW_DB_PASSWORD) is required. Hardcoded reusable credentials are not permitted in application source."
+            )
+        db_host = os.environ.get("COLLECTFLOW_DB_HOST", "127.0.0.1")
+        db_port = os.environ.get("COLLECTFLOW_DB_PORT", "5432")
+        db_name = os.environ.get("COLLECTFLOW_DB_NAME", "collectflow_dev")
+        custom_url = f"postgresql+psycopg://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
 
-    # Validate default URL as well
-    validate_isolated_database_url(DEFAULT_DEV_PG_URL, env_mode)
-    return DEFAULT_DEV_PG_URL
+    validate_isolated_database_url(custom_url, env_mode)
+    return custom_url
 
 
 def create_db_engine():
