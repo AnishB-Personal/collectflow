@@ -20,6 +20,7 @@ from sqlalchemy import select, delete, func
 from app.main import app
 from app.core.database import get_db_session, validate_isolated_database_url
 from app.models.domain_models import AuditLog, CommercialInvoice, Customer, PaymentTransaction, PurchaseOrder, SessionModel, User
+from app.routers.auth import log_security_audit
 
 client = TestClient(app)
 
@@ -199,6 +200,19 @@ def test_h07_concurrent_last_admin_demotion_race():
     """Verify that concurrent demotion attempts serialized with pg_advisory_xact_lock prevent eliminating all admins."""
     import concurrent.futures
 
+    # Ensure clean starting state
+    with get_db_session() as db:
+        admin_u = db.scalar(select(User).where(User.id == 1))
+        if admin_u:
+            admin_u.role = "admin"
+            admin_u.is_active = True
+        old_temp = db.scalar(select(User).where(User.username == "temp_admin_2"))
+        if old_temp:
+            db.execute(delete(SessionModel).where(SessionModel.user_id == old_temp.id))
+            db.execute(delete(AuditLog).where(AuditLog.entity_id == str(old_temp.id)))
+            db.execute(delete(User).where(User.id == old_temp.id))
+        db.commit()
+
     admin_login = client.post("/api/auth/login", json={"username": "sandbox_admin", "password": "AdminPass123!"})
     admin_headers = {"Authorization": f"Bearer {admin_login.json()['token']}"}
 
@@ -240,11 +254,53 @@ def test_h07_concurrent_last_admin_demotion_race():
             f"Race condition occurred: both demotions succeeded! {status_codes}"
         )
         assert 400 in status_codes, f"Expected at least one demotion to fail with 400: {status_codes}"
+        assert 200 in status_codes, f"Expected exactly one demotion to succeed with 200: {status_codes}"
+
+        # Inspect final database state before cleanup
+        with get_db_session() as db:
+            active_admin_count = db.scalar(
+                select(func.count(User.id)).where(User.role == "admin", User.is_active.is_(True))
+            )
+            assert active_admin_count >= 1, (
+                f"CRITICAL INVARIANT VIOLATION: Zero active administrators remain! Count={active_admin_count}"
+            )
+
+            admin1 = db.scalar(select(User).where(User.id == 1))
+            admin2 = db.scalar(select(User).where(User.id == admin2_id))
+            assert admin1 and admin2
+            assert admin1.role == "admin" or admin2.role == "admin", (
+                "At least one administrator must remain with admin role!"
+            )
+            assert not (admin1.role == "viewer" and admin2.role == "viewer"), (
+                "Both administrators were demoted to viewer!"
+            )
+
+            # Identify demoted vs surviving admin
+            demoted_uid = admin2_id if admin2.role == "viewer" else 1
+
+            # Verify session consistency: sessions of the demoted user were revoked
+            demoted_sessions = db.scalars(
+                select(SessionModel).where(SessionModel.user_id == demoted_uid)
+            ).all()
+            assert len(demoted_sessions) == 0, "Sessions of demoted user must be revoked atomically!"
+
+            # Verify audit log consistency: exactly one demotion audit log exists for this race
+            role_change_audits = db.scalars(
+                select(AuditLog).where(
+                    AuditLog.action == "USER_UPDATED",
+                    AuditLog.entity_id.in_([str(1), str(admin2_id)]),
+                )
+            ).all()
+            assert len(role_change_audits) == 1, (
+                f"Expected exactly 1 audit log for the successful demotion, found {len(role_change_audits)}"
+            )
+            assert role_change_audits[0].entity_id == str(demoted_uid)
     finally:
         # Clean up
         with get_db_session() as db:
             db.execute(delete(SessionModel).where(SessionModel.user_id == admin2_id))
             db.execute(delete(User).where(User.id == admin2_id))
+            db.execute(delete(AuditLog).where(AuditLog.entity_id.in_([str(1), str(admin2_id)])))
             # Ensure sandbox_admin remains admin
             admin_user = db.scalar(select(User).where(User.id == 1))
             if admin_user:
@@ -296,24 +352,84 @@ def test_m01_admin_password_reset_and_session_revocation():
 
 
 def test_m02_atomic_audit_log_rollback():
-    """Verify that if a mutation transaction fails, any pending audit log is rolled back atomically."""
+    """Verify transaction atomicity via failure injection after business and audit records are added but before commit."""
+    import uuid
+    from sqlalchemy.orm import Session
+
+    unique_name = f"Rollback Test Corp {uuid.uuid4().hex[:8]}"
     admin_login = client.post("/api/auth/login", json={"username": "sandbox_admin", "password": "AdminPass123!"})
     admin_headers = {"Authorization": f"Bearer {admin_login.json()['token']}"}
 
-    with get_db_session() as db:
-        initial_audit_count = db.scalar(select(func.count(AuditLog.id)))
+    # 1. Direct session failure injection test:
+    # Staging both Customer record and AuditLog record in session, then raising exception before commit.
+    with pytest.raises(RuntimeError) as exc_info:
+        with get_db_session() as db:
+            cust = Customer(
+                billing_name=unique_name,
+                billing_address="Test Address",
+                city="Pune",
+                state="Maharashtra",
+                country="IN",
+                gst_number="27ABCDE1234F1Z5",
+                is_active=True,
+            )
+            db.add(cust)
+            db.flush()
 
-    # Attempt to create customer with invalid GSTIN (fails format validation before DB commit)
-    bad_res = client.post(
-        "/api/customers",
-        json={"billing_name": "Audit Test Failure", "gst_number": "INVALID_GSTIN"},
-        headers=admin_headers,
-    )
-    assert bad_res.status_code == 400
+            log_security_audit(
+                "CUSTOMER_CREATED",
+                "CUSTOMER",
+                unique_name,
+                user_id=1,
+                username="sandbox_admin",
+                details={"name": unique_name},
+                db=db,
+            )
 
+            # Both records are staged in the active transaction
+            assert cust in db
+
+            # INJECT FAILURE BEFORE COMMIT
+            raise RuntimeError("SIMULATED_FAILURE_AFTER_STAGING_BEFORE_COMMIT")
+
+    assert "SIMULATED_FAILURE_AFTER_STAGING_BEFORE_COMMIT" in str(exc_info.value)
+
+    # In a new clean session, verify that BOTH business record and audit log were rolled back
     with get_db_session() as db:
-        after_audit_count = db.scalar(select(func.count(AuditLog.id)))
-        assert after_audit_count == initial_audit_count
+        customer_after = db.scalar(select(Customer).where(Customer.billing_name == unique_name))
+        audit_after = db.scalar(
+            select(AuditLog).where(AuditLog.action == "CUSTOMER_CREATED", AuditLog.entity_id == unique_name)
+        )
+        assert customer_after is None, "Business record must be rolled back on transaction abort!"
+        assert audit_after is None, "Audit log record must be rolled back on transaction abort!"
+
+    # 2. Endpoint-level failure injection test:
+    # Monkeypatching session commit during POST /api/customers request
+    unique_api_name = f"API Rollback Test {uuid.uuid4().hex[:8]}"
+    original_commit = Session.commit
+
+    def failing_commit(self):
+        raise RuntimeError("SIMULATED_COMMIT_ABORT_AFTER_AUDIT_LOG")
+
+    try:
+        Session.commit = failing_commit
+        with pytest.raises(RuntimeError, match="SIMULATED_COMMIT_ABORT_AFTER_AUDIT_LOG"):
+            client.post(
+                "/api/customers",
+                json={"billing_name": unique_api_name, "gst_number": "27ABCDE1234F1Z5"},
+                headers=admin_headers,
+            )
+    finally:
+        Session.commit = original_commit
+
+    # Verify neither the customer nor any audit log for this customer was committed
+    with get_db_session() as db:
+        api_cust_after = db.scalar(select(Customer).where(Customer.billing_name == unique_api_name))
+        api_audit_after = db.scalar(
+            select(AuditLog).where(AuditLog.action == "CUSTOMER_CREATED", AuditLog.entity_id == unique_api_name)
+        )
+        assert api_cust_after is None, "API customer record must be rolled back!"
+        assert api_audit_after is None, "API audit log must be rolled back!"
 
 
 def test_h08_customer_contract_and_conflict():
