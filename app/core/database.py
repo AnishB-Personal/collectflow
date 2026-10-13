@@ -84,16 +84,35 @@ def validate_isolated_database_url(url_str: str, env_mode: str) -> None:
 
     # Reject query parameter overrides that might hijack host or connection options
     if url.query:
-        disallowed_query_keys = {"host", "sslrootcert", "sslcert", "sslkey", "options"}
+        disallowed_query_keys = {
+            "host",
+            "hostaddr",
+            "port",
+            "dbname",
+            "user",
+            "service",
+            "passfile",
+            "options",
+            "sslrootcert",
+            "sslcert",
+            "sslkey",
+            "sslmode",
+            "target_session_attrs",
+            "fallback_application_name",
+            "gssencmode",
+        }
         for k in url.query.keys():
             if k.lower() in disallowed_query_keys:
                 raise RuntimeError(
                     f"CRITICAL ISOLATION ERROR: Database URL query parameter '{k}' is prohibited."
                 )
 
-    # SQLite is permitted only if strictly memory or test file
+    # SQLite is permitted only if strictly memory or test file in mock/sqlite_legacy mode
     if url.drivername.startswith("sqlite"):
-        # Check SQLite path
+        if env_mode not in ("test", "mock", "sqlite_legacy"):
+            raise RuntimeError(
+                f"CRITICAL ISOLATION ERROR: SQLite driver is not permitted in '{env_mode}' mode. PostgreSQL is required."
+            )
         db_path = url.database or ""
         if db_path != ":memory:" and not any(t in db_path.lower() for t in ("test", "sandbox", "dev")):
             raise RuntimeError(
@@ -117,7 +136,7 @@ def validate_isolated_database_url(url_str: str, env_mode: str) -> None:
             f"CRITICAL ISOLATION ERROR: Non-standard port '{port}' is prohibited in '{env_mode}' mode."
         )
 
-    # 3. Database name validation
+    # 3. Database name validation: MUST be strictly in approved database allowlist
     db_name = (url.database or "").strip()
     if not db_name:
         raise RuntimeError("CRITICAL ISOLATION ERROR: Missing database name in PostgreSQL URL.")
@@ -128,25 +147,28 @@ def validate_isolated_database_url(url_str: str, env_mode: str) -> None:
             f"CRITICAL ISOLATION ERROR: Database '{db_name}' appears to be a production database."
         )
 
-    if db_name not in PERMITTED_DEV_DATABASES and not any(
-        token in db_name.lower() for token in ("dev", "test", "sandbox", "integration")
-    ):
+    if db_name not in PERMITTED_DEV_DATABASES:
         raise RuntimeError(
-            f"CRITICAL ISOLATION ERROR: Database '{db_name}' is not an authorized test/dev database."
+            f"CRITICAL ISOLATION ERROR: Database '{db_name}' is not in approved database allowlist {PERMITTED_DEV_DATABASES}."
         )
 
-    # 4. User validation
+    # 4. User validation: MUST be in approved user allowlist
     username = (url.username or "").strip().lower()
-    if username and username not in PERMITTED_DEV_USERS and "prod" in username:
+    if not username or username not in PERMITTED_DEV_USERS or any(token in username for token in ("prod", "production")):
         raise RuntimeError(
             f"CRITICAL ISOLATION ERROR: Database user '{url.username}' is not permitted in '{env_mode}' mode."
         )
 
 
 def get_database_url() -> str:
-    env_mode = os.environ.get("COLLECTFLOW_ENV", "integration").lower()
-    custom_url = os.environ.get("COLLECTFLOW_DATABASE_URL")
+    raw_env = os.environ.get("COLLECTFLOW_ENV")
+    if not raw_env:
+        raise RuntimeError("CRITICAL ISOLATION ERROR: COLLECTFLOW_ENV environment variable is required.")
+    env_mode = raw_env.lower()
+    if env_mode not in PERMITTED_ENV_MODES:
+        raise RuntimeError(f"CRITICAL ISOLATION ERROR: Unauthorized COLLECTFLOW_ENV '{raw_env}'.")
 
+    custom_url = os.environ.get("COLLECTFLOW_DATABASE_URL")
     if custom_url:
         validate_isolated_database_url(custom_url, env_mode)
         return custom_url

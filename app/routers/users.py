@@ -13,7 +13,7 @@ import re
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from app.core.database import get_db_session
 from app.models.domain_models import CommercialInvoice, SessionModel, User
 from app.routers.auth import (
@@ -119,9 +119,41 @@ def create_user(item: UserCreate, current_user: dict = Depends(require_admin)):
         }
 
 
+@router.put("/{user_id}/password")
+def reset_user_password(user_id: int, item: PasswordReset, current_user: dict = Depends(require_admin)):
+    """Admin-only password reset for managed accounts."""
+    if len(item.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    with get_db_session() as db:
+        user = db.scalar(select(User).where(User.id == user_id).with_for_update())
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        user.password_hash = hash_password_argon2(item.new_password)
+        # Immediately invalidate all active sessions for the target user
+        db.execute(delete(SessionModel).where(SessionModel.user_id == user_id))
+
+        log_security_audit(
+            "PASSWORD_RESET",
+            "USER",
+            str(user_id),
+            user_id=current_user["id"],
+            username=current_user["username"],
+            details={"reset_target_user": user.username},
+            db=db,
+        )
+        db.commit()
+
+        return {"success": True, "message": f"Password for user '{user.username}' reset successfully"}
+
+
 @router.put("/{user_id}")
 def update_user(user_id: int, item: UserUpdate, current_user: dict = Depends(require_admin)):
     with get_db_session() as db:
+        # Acquire transaction advisory serialization lock to prevent concurrent last-admin race conditions
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtext('collectflow_admin_mutation_lock'))"))
+
         user = db.scalar(select(User).where(User.id == user_id).with_for_update())
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
@@ -134,11 +166,13 @@ def update_user(user_id: int, item: UserUpdate, current_user: dict = Depends(req
             if new_role not in VALID_ROLES:
                 raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {', '.join(VALID_ROLES)}")
 
-            # Prevent demoting last admin with row locking
+            # Prevent demoting last admin with deterministic ordered lock acquisition
             if user.role == "admin" and new_role != "admin":
-                # Lock all active admins to prevent concurrent race condition
                 admins = db.scalars(
-                    select(User).where(User.role == "admin", User.is_active.is_(True)).with_for_update()
+                    select(User)
+                    .where(User.role == "admin", User.is_active.is_(True))
+                    .order_by(User.id.asc())
+                    .with_for_update()
                 ).all()
                 if len(admins) <= 1:
                     raise HTTPException(status_code=400, detail="Cannot change role: must have at least one active administrator")
@@ -153,7 +187,10 @@ def update_user(user_id: int, item: UserUpdate, current_user: dict = Depends(req
                     raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
                 if user.role == "admin":
                     admins = db.scalars(
-                        select(User).where(User.role == "admin", User.is_active.is_(True)).with_for_update()
+                        select(User)
+                        .where(User.role == "admin", User.is_active.is_(True))
+                        .order_by(User.id.asc())
+                        .with_for_update()
                     ).all()
                     if len(admins) <= 1:
                         raise HTTPException(status_code=400, detail="Cannot deactivate the last administrator account")
@@ -163,7 +200,7 @@ def update_user(user_id: int, item: UserUpdate, current_user: dict = Depends(req
         if item.full_name is not None:
             user.full_name = item.full_name.strip() if item.full_name else None
 
-        # Revoke sessions on role change or deactivation
+        # Revoke sessions atomically on role change or deactivation
         if role_changed or deactivated:
             db.execute(delete(SessionModel).where(SessionModel.user_id == user_id))
 
@@ -197,14 +234,20 @@ def delete_user(user_id: int, current_user: dict = Depends(require_admin)):
         raise HTTPException(status_code=400, detail="Cannot delete your own account")
 
     with get_db_session() as db:
+        # Acquire transaction advisory serialization lock
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtext('collectflow_admin_mutation_lock'))"))
+
         user = db.scalar(select(User).where(User.id == user_id).with_for_update())
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        # Prevent deleting the last admin with row locking
+        # Prevent deleting the last admin with deterministic ordered lock acquisition
         if user.role == "admin":
             admins = db.scalars(
-                select(User).where(User.role == "admin", User.is_active.is_(True)).with_for_update()
+                select(User)
+                .where(User.role == "admin", User.is_active.is_(True))
+                .order_by(User.id.asc())
+                .with_for_update()
             ).all()
             if len(admins) <= 1:
                 raise HTTPException(status_code=400, detail="Cannot delete the last administrator account")
@@ -217,7 +260,7 @@ def delete_user(user_id: int, current_user: dict = Depends(require_admin)):
                 detail=f"Cannot delete user '{user.username}' because they are referenced on {invoice_ref_count} historical invoice(s). You may deactivate the user instead.",
             )
 
-        # Invalidate active sessions first
+        # Invalidate active sessions atomically
         db.execute(delete(SessionModel).where(SessionModel.user_id == user_id))
         db.delete(user)
 

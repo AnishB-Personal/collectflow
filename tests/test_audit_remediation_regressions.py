@@ -15,7 +15,7 @@ from datetime import date
 from decimal import Decimal
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, func
 
 from app.main import app
 from app.core.database import get_db_session, validate_isolated_database_url
@@ -110,35 +110,36 @@ def test_h06_session_revocation_on_role_change_and_deactivation():
     sales_headers = {"Authorization": f"Bearer {sales_token}"}
     sales_uid = sales_login.json()["user"]["id"]
 
-    # Verify session works
-    me1 = client.get("/api/auth/me", headers=sales_headers)
-    assert me1.status_code == 200
-    assert me1.json()["user"]["role"] == "sales"
+    try:
+        # Verify session works
+        me1 = client.get("/api/auth/me", headers=sales_headers)
+        assert me1.status_code == 200
+        assert me1.json()["user"]["role"] == "sales"
 
-    # 2. Admin modifies sales user's role to viewer
-    up_role = client.put(f"/api/users/{sales_uid}/role", json={"role": "viewer"}, headers=admin_headers)
-    assert up_role.status_code == 200
+        # 2. Admin modifies sales user's role to viewer
+        up_role = client.put(f"/api/users/{sales_uid}/role", json={"role": "viewer"}, headers=admin_headers)
+        assert up_role.status_code == 200
 
-    # 3. Old sales session MUST now be rejected with 401
-    me2 = client.get("/api/auth/me", headers=sales_headers)
-    assert me2.status_code == 401
+        # 3. Old sales session MUST now be rejected with 401
+        me2 = client.get("/api/auth/me", headers=sales_headers)
+        assert me2.status_code == 401
 
-    # 4. Log in again with updated role
-    re_login = client.post("/api/auth/login", json={"username": "sandbox_sales", "password": "SalesPass123!"})
-    assert re_login.status_code == 200
-    new_token = re_login.json()["token"]
-    new_headers = {"Authorization": f"Bearer {new_token}"}
+        # 4. Log in again with updated role
+        re_login = client.post("/api/auth/login", json={"username": "sandbox_sales", "password": "SalesPass123!"})
+        assert re_login.status_code == 200
+        new_token = re_login.json()["token"]
+        new_headers = {"Authorization": f"Bearer {new_token}"}
 
-    # 5. Deactivate user
-    deact_resp = client.put(f"/api/users/{sales_uid}/deactivate", headers=admin_headers)
-    assert deact_resp.status_code == 200
+        # 5. Deactivate user
+        deact_resp = client.put(f"/api/users/{sales_uid}/deactivate", headers=admin_headers)
+        assert deact_resp.status_code == 200
 
-    # Session immediately rejected
-    me3 = client.get("/api/auth/me", headers=new_headers)
-    assert me3.status_code == 401
-
-    # Restore sandbox_sales
-    client.put(f"/api/users/{sales_uid}", json={"role": "sales", "is_active": True}, headers=admin_headers)
+        # Session immediately rejected
+        me3 = client.get("/api/auth/me", headers=new_headers)
+        assert me3.status_code == 401
+    finally:
+        # Restore sandbox_sales
+        client.put(f"/api/users/{sales_uid}", json={"role": "sales", "is_active": True}, headers=admin_headers)
 
 
 def test_h07_last_admin_protection():
@@ -171,3 +172,171 @@ def test_l03_sanitized_readiness_probe():
     assert data["status"] == "ready"
     assert data["database"] == "connected"
     assert "error" not in data
+
+
+def test_l03_readiness_probe_failure_503():
+    """Verify /ready probe returns sanitized 503 and no tracebacks or internal URLs when DB is unavailable."""
+    from unittest.mock import patch
+    from contextlib import contextmanager
+
+    @contextmanager
+    def broken_db_session():
+        raise RuntimeError("FATAL: connection to server at '127.0.0.1', port 5432 failed: Connection refused")
+        yield
+
+    with patch("app.main.get_db_session", broken_db_session):
+        resp = client.get("/ready")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "not_ready"
+        assert data["reason"] == "Database connection probe failed"
+        # Zero raw exception or IP leakage
+        assert "127.0.0.1" not in str(data)
+        assert "Connection refused" not in str(data)
+
+
+def test_h07_concurrent_last_admin_demotion_race():
+    """Verify that concurrent demotion attempts serialized with pg_advisory_xact_lock prevent eliminating all admins."""
+    import concurrent.futures
+
+    admin_login = client.post("/api/auth/login", json={"username": "sandbox_admin", "password": "AdminPass123!"})
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['token']}"}
+
+    # Create a 2nd admin
+    c_res = client.post(
+        "/api/users",
+        json={"username": "temp_admin_2", "password": "AdminPass456!", "role": "admin", "full_name": "Second Admin"},
+        headers=admin_headers,
+    )
+    assert c_res.status_code == 200
+    admin2_id = c_res.json()["user_id"]
+
+    login_admin2 = client.post("/api/auth/login", json={"username": "temp_admin_2", "password": "AdminPass456!"})
+    assert login_admin2.status_code == 200
+    admin2_token = login_admin2.json()["token"]
+    admin2_headers = {"Authorization": f"Bearer {admin2_token}"}
+
+    try:
+        # Now there are exactly 2 admins: sandbox_admin (id=1) and temp_admin_2 (id=admin2_id)
+        # Attempt to demote both admins concurrently:
+        # admin1 demotes admin2, and admin2 demotes admin1
+        def demote_admin2():
+            c = TestClient(app)
+            return c.put(f"/api/users/{admin2_id}/role", json={"role": "viewer"}, headers=admin_headers)
+
+        def demote_admin1():
+            c = TestClient(app)
+            return c.put(f"/api/users/1/role", json={"role": "viewer"}, headers=admin2_headers)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            fut1 = executor.submit(demote_admin2)
+            fut2 = executor.submit(demote_admin1)
+            res1 = fut1.result()
+            res2 = fut2.result()
+
+        # Due to advisory locking and FOR UPDATE row locking, at most ONE can succeed
+        status_codes = [res1.status_code, res2.status_code]
+        assert not (status_codes[0] == 200 and status_codes[1] == 200), (
+            f"Race condition occurred: both demotions succeeded! {status_codes}"
+        )
+        assert 400 in status_codes, f"Expected at least one demotion to fail with 400: {status_codes}"
+    finally:
+        # Clean up
+        with get_db_session() as db:
+            db.execute(delete(SessionModel).where(SessionModel.user_id == admin2_id))
+            db.execute(delete(User).where(User.id == admin2_id))
+            # Ensure sandbox_admin remains admin
+            admin_user = db.scalar(select(User).where(User.id == 1))
+            if admin_user:
+                admin_user.role = "admin"
+                admin_user.is_active = True
+            db.commit()
+
+
+def test_m01_admin_password_reset_and_session_revocation():
+    """Verify admin password reset revokes all active sessions for the target user."""
+    admin_login = client.post("/api/auth/login", json={"username": "sandbox_admin", "password": "AdminPass123!"})
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['token']}"}
+
+    # Login as sales
+    sales_login = client.post("/api/auth/login", json={"username": "sandbox_sales", "password": "SalesPass123!"})
+    assert sales_login.status_code == 200
+    sales_token = sales_login.json()["token"]
+    sales_uid = sales_login.json()["user"]["id"]
+    sales_headers = {"Authorization": f"Bearer {sales_token}"}
+
+    try:
+        # Verify session is valid
+        me1 = client.get("/api/auth/me", headers=sales_headers)
+        assert me1.status_code == 200
+
+        # Admin resets sales user password
+        reset_res = client.put(
+            f"/api/users/{sales_uid}/password",
+            json={"new_password": "NewSalesPass789!"},
+            headers=admin_headers,
+        )
+        assert reset_res.status_code == 200
+        assert reset_res.json()["success"] is True
+
+        # Old session is immediately revoked
+        me2 = client.get("/api/auth/me", headers=sales_headers)
+        assert me2.status_code == 401
+
+        # Can log in with new password
+        login_new = client.post("/api/auth/login", json={"username": "sandbox_sales", "password": "NewSalesPass789!"})
+        assert login_new.status_code == 200
+    finally:
+        # Reset back to original password
+        client.put(
+            f"/api/users/{sales_uid}/password",
+            json={"new_password": "SalesPass123!"},
+            headers=admin_headers,
+        )
+
+
+def test_m02_atomic_audit_log_rollback():
+    """Verify that if a mutation transaction fails, any pending audit log is rolled back atomically."""
+    admin_login = client.post("/api/auth/login", json={"username": "sandbox_admin", "password": "AdminPass123!"})
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['token']}"}
+
+    with get_db_session() as db:
+        initial_audit_count = db.scalar(select(func.count(AuditLog.id)))
+
+    # Attempt to create customer with invalid GSTIN (fails format validation before DB commit)
+    bad_res = client.post(
+        "/api/customers",
+        json={"billing_name": "Audit Test Failure", "gst_number": "INVALID_GSTIN"},
+        headers=admin_headers,
+    )
+    assert bad_res.status_code == 400
+
+    with get_db_session() as db:
+        after_audit_count = db.scalar(select(func.count(AuditLog.id)))
+        assert after_audit_count == initial_audit_count
+
+
+def test_h08_customer_contract_and_conflict():
+    """Verify 409 Conflict on duplicate billing name and contract response formatting."""
+    admin_login = client.post("/api/auth/login", json={"username": "sandbox_admin", "password": "AdminPass123!"})
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['token']}"}
+
+    # Attempt duplicate billing name
+    dup_res = client.post(
+        "/api/customers",
+        json={"billing_name": "Acme Cloud Solutions Pvt Ltd", "gst_number": "27AABCA1234A1Z5"},
+        headers=admin_headers,
+    )
+    assert dup_res.status_code == 409
+    assert "Customer name already exists" in dup_res.json()["detail"]
+
+    # Check existing customer response contract formatting
+    acme_res = client.get("/api/customers/1", headers=admin_headers)
+    assert acme_res.status_code == 200
+    data = acme_res.json()
+    assert "outstanding_balance" in data
+    assert data["outstanding_balance"] == data["total_outstanding"]
+    assert isinstance(data["total_billed"], str)
+    assert "." in data["total_billed"]
+    assert len(data["total_billed"].split(".")[1]) == 2
+

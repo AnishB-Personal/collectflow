@@ -39,14 +39,14 @@ class CustomerCreate(BaseModel):
     billing_address: Optional[str] = Field(default=None, max_length=500)
     city: Optional[str] = Field(default=None, max_length=50)
     state: Optional[str] = Field(default=None, max_length=50)
-    country: Optional[str] = Field(default="IN", max_length=50)
+    country: Optional[str] = Field(default="IN", max_length=10)
     pin_code: Optional[str] = Field(default=None, max_length=20)
     gst_number: Optional[str] = Field(default=None, max_length=20)
     phone_1: Optional[str] = Field(default=None, max_length=25)
     phone_2: Optional[str] = Field(default=None, max_length=25)
     contact_person: Optional[str] = Field(default=None, max_length=100)
-    designation: Optional[str] = Field(default=None, max_length=100)
-    email: Optional[str] = Field(default=None, max_length=150)
+    designation: Optional[str] = Field(default=None, max_length=50)
+    email: Optional[str] = Field(default=None, max_length=100)
 
 
 class CustomerUpdate(BaseModel):
@@ -54,14 +54,14 @@ class CustomerUpdate(BaseModel):
     billing_address: Optional[str] = Field(default=None, max_length=500)
     city: Optional[str] = Field(default=None, max_length=50)
     state: Optional[str] = Field(default=None, max_length=50)
-    country: Optional[str] = Field(default=None, max_length=50)
+    country: Optional[str] = Field(default=None, max_length=10)
     pin_code: Optional[str] = Field(default=None, max_length=20)
     gst_number: Optional[str] = Field(default=None, max_length=20)
     phone_1: Optional[str] = Field(default=None, max_length=25)
     phone_2: Optional[str] = Field(default=None, max_length=25)
     contact_person: Optional[str] = Field(default=None, max_length=100)
-    designation: Optional[str] = Field(default=None, max_length=100)
-    email: Optional[str] = Field(default=None, max_length=150)
+    designation: Optional[str] = Field(default=None, max_length=50)
+    email: Optional[str] = Field(default=None, max_length=100)
     is_active: Optional[bool] = None
 
 
@@ -88,6 +88,7 @@ class CustomerResponse(BaseModel):
     total_settled: str = "0.00"
     total_paid: str = "0.00"  # Alias for backward compatibility
     total_outstanding: str = "0.00"
+    outstanding_balance: str = "0.00"  # Contract alignment alias
 
 
 def validate_gstin_format(gstin: Optional[str]) -> Optional[str]:
@@ -190,6 +191,7 @@ def list_customers(
                     total_settled=f"{total_settled:.2f}",
                     total_paid=f"{total_settled:.2f}",
                     total_outstanding=f"{total_outstanding:.2f}",
+                    outstanding_balance=f"{total_outstanding:.2f}",
                 )
             )
 
@@ -264,6 +266,7 @@ def get_customer(customer_id: int, user: dict = Depends(get_current_user)):
             total_settled=f"{total_settled:.2f}",
             total_paid=f"{total_settled:.2f}",
             total_outstanding=f"{total_outstanding:.2f}",
+            outstanding_balance=f"{total_outstanding:.2f}",
         )
 
 
@@ -278,7 +281,7 @@ def create_customer(item: CustomerCreate, user: dict = Depends(require_sales_fin
     with get_db_session() as db:
         existing = db.scalar(select(Customer).where(func.lower(Customer.billing_name) == name.lower()))
         if existing:
-            raise HTTPException(status_code=400, detail="Customer name already exists")
+            raise HTTPException(status_code=409, detail="Customer name already exists")
 
         new_customer = Customer(
             billing_name=name,
@@ -309,7 +312,7 @@ def create_customer(item: CustomerCreate, user: dict = Depends(require_sales_fin
         )
         db.commit()
 
-        return {"success": True, "id": new_customer.id, "message": f"Customer '{name}' created successfully"}
+        return {"success": True, "id": new_customer.id, "customer_id": new_customer.id, "message": f"Customer '{name}' created successfully"}
 
 
 @router.put("/{customer_id}")
@@ -319,40 +322,45 @@ def update_customer(customer_id: int, item: CustomerUpdate, user: dict = Depends
         if not c:
             raise HTTPException(status_code=404, detail="Customer not found")
 
-        if item.billing_name is not None:
-            name = item.billing_name.strip()
-            if not name:
+        fields_set = getattr(item, "model_fields_set", getattr(item, "__fields_set__", set()))
+        if "billing_name" in fields_set:
+            if not item.billing_name or not item.billing_name.strip():
                 raise HTTPException(status_code=400, detail="Customer name cannot be empty")
+            name = item.billing_name.strip()
             existing = db.scalar(
                 select(Customer).where(func.lower(Customer.billing_name) == name.lower(), Customer.id != customer_id)
             )
             if existing:
-                raise HTTPException(status_code=400, detail="Customer name already exists")
+                raise HTTPException(status_code=409, detail="Customer name already exists")
             c.billing_name = name
 
-        if item.billing_address is not None:
+        if "billing_address" in fields_set:
+            if not item.billing_address or not item.billing_address.strip():
+                raise HTTPException(status_code=400, detail="Billing address cannot be empty")
             c.billing_address = item.billing_address.strip()
-        if item.city is not None:
+        if "city" in fields_set:
             c.city = item.city.strip() if item.city else None
-        if item.state is not None:
-            c.state = item.state.strip() if item.state else c.state
-        if item.country is not None:
-            c.country = item.country.strip() if item.country else c.country
-        if item.pin_code is not None:
+        if "state" in fields_set:
+            if not item.state or not item.state.strip():
+                raise HTTPException(status_code=400, detail="State cannot be empty")
+            c.state = item.state.strip()
+        if "country" in fields_set:
+            c.country = item.country.strip() if item.country else "IN"
+        if "pin_code" in fields_set:
             c.pin_code = item.pin_code.strip() if item.pin_code else None
-        if item.gst_number is not None:
-            c.gst_number = validate_gstin_format(item.gst_number)
-        if item.contact_person is not None:
+        if "gst_number" in fields_set:
+            c.gst_number = validate_gstin_format(item.gst_number) if item.gst_number else None
+        if "contact_person" in fields_set:
             c.contact_person = item.contact_person.strip() if item.contact_person else None
-        if item.designation is not None:
+        if "designation" in fields_set:
             c.designation = item.designation.strip() if item.designation else None
-        if item.email is not None:
+        if "email" in fields_set:
             c.email = item.email.strip() if item.email else None
-        if item.phone_1 is not None:
+        if "phone_1" in fields_set:
             c.phone_1 = item.phone_1.strip() if item.phone_1 else None
-        if item.phone_2 is not None:
+        if "phone_2" in fields_set:
             c.phone_2 = item.phone_2.strip() if item.phone_2 else None
-        if item.is_active is not None:
+        if "is_active" in fields_set and item.is_active is not None:
             c.is_active = item.is_active
 
         log_security_audit(

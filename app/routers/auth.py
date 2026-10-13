@@ -17,6 +17,7 @@ from typing import Callable, Optional
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy import delete, desc, func, select, update
 from app.core.database import get_db_session
@@ -24,6 +25,7 @@ from app.models.domain_models import AuditLog, LoginAttempt, SessionModel, User
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 ph = PasswordHasher()
+http_bearer = HTTPBearer(auto_error=False)
 
 
 class LoginRequest(BaseModel):
@@ -52,6 +54,11 @@ def verify_password_argon2(plain_password: str, password_hash: str) -> bool:
 def hash_password_argon2(plain_password: str) -> str:
     """Generate Argon2id hash for a password."""
     return ph.hash(plain_password)
+
+
+# Backward compatibility aliases
+hash_password = hash_password_argon2
+verify_password = verify_password_argon2
 
 
 def check_login_rate_limit(identifier: str, max_failures: int = 5, cooldown_seconds: int = 15) -> None:
@@ -92,7 +99,7 @@ def check_login_rate_limit(identifier: str, max_failures: int = 5, cooldown_seco
                     )
 
 
-def record_login_attempt(identifier: str, success: bool, ip_address: Optional[str] = None):
+def record_login_attempt(identifier: str, success: bool, ip_address: Optional[str] = None, clear_on_success: bool = True):
     with get_db_session() as db:
         attempt = LoginAttempt(
             identifier=identifier,
@@ -101,8 +108,8 @@ def record_login_attempt(identifier: str, success: bool, ip_address: Optional[st
             attempted_at=datetime.datetime.now(datetime.timezone.utc),
         )
         db.add(attempt)
-        if success:
-            # Clear previous failed attempts on success
+        if success and clear_on_success:
+            # Clear previous failed attempts on success for this specific identifier
             db.execute(
                 delete(LoginAttempt).where(
                     LoginAttempt.identifier == identifier,
@@ -153,12 +160,20 @@ def log_security_audit(
             session.commit()
 
 
-def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
-    """Dependency returning authenticated user dict from PostgreSQL session."""
-    if not authorization or not authorization.startswith("Bearer "):
+def get_current_user(
+    authorization: Optional[str] = Header(None),
+    bearer_creds: Optional[HTTPAuthorizationCredentials] = Depends(http_bearer),
+) -> dict:
+    """Dependency returning authenticated user dict from PostgreSQL session with HTTPBearer OpenAPI integration."""
+    raw_token = None
+    if bearer_creds and bearer_creds.credentials:
+        raw_token = bearer_creds.credentials.strip()
+    elif authorization and authorization.startswith("Bearer "):
+        raw_token = authorization.split(" ")[1].strip()
+
+    if not raw_token:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    raw_token = authorization.split(" ")[1].strip()
     token_hashed = hash_token(raw_token)
     now_utc = datetime.datetime.now(datetime.timezone.utc)
 
@@ -225,21 +240,24 @@ def login(req: LoginRequest, request: Request):
             record_login_attempt(user_rate_key, success=False, ip_address=client_ip)
             record_login_attempt(ip_rate_key, success=False, ip_address=client_ip)
             log_security_audit(
-                "LOGIN_FAILED", "USER", None, username=uname, details={"reason": "User not found or inactive"}, ip_address=client_ip, request_id=req_id
+                "LOGIN_FAILED", "USER", None, username=uname, details={"reason": "User not found or inactive"}, ip_address=client_ip, request_id=req_id, db=db
             )
+            db.commit()
             raise HTTPException(status_code=401, detail="Invalid username or password")
 
         if not verify_password_argon2(req.password, user.password_hash):
             record_login_attempt(user_rate_key, success=False, ip_address=client_ip)
             record_login_attempt(ip_rate_key, success=False, ip_address=client_ip)
             log_security_audit(
-                "LOGIN_FAILED", "USER", str(user.id), user_id=user.id, username=user.username, details={"reason": "Invalid password"}, ip_address=client_ip, request_id=req_id
+                "LOGIN_FAILED", "USER", str(user.id), user_id=user.id, username=user.username, details={"reason": "Invalid password"}, ip_address=client_ip, request_id=req_id, db=db
             )
+            db.commit()
             raise HTTPException(status_code=401, detail="Invalid username or password")
 
-        # Success: record attempt and reset streak
-        record_login_attempt(user_rate_key, success=True, ip_address=client_ip)
-        record_login_attempt(ip_rate_key, success=True, ip_address=client_ip)
+        # Success: record attempt for user rate key and clear user failures.
+        # Do NOT clear ip_rate_key failures so other brute-force streaks from this IP remain monitored!
+        record_login_attempt(user_rate_key, success=True, ip_address=client_ip, clear_on_success=True)
+        record_login_attempt(ip_rate_key, success=True, ip_address=client_ip, clear_on_success=False)
 
         # Issue secure 32-byte session token; store SHA-256 hash in DB
         raw_token = secrets.token_hex(32)
@@ -255,11 +273,11 @@ def login(req: LoginRequest, request: Request):
             created_at=datetime.datetime.now(datetime.timezone.utc),
         )
         db.add(session_entry)
-        db.commit()
 
         log_security_audit(
-            "LOGIN_SUCCESS", "USER", str(user.id), user_id=user.id, username=user.username, details={"ip": client_ip}, ip_address=client_ip, request_id=req_id
+            "LOGIN_SUCCESS", "USER", str(user.id), user_id=user.id, username=user.username, details={"ip": client_ip}, ip_address=client_ip, request_id=req_id, db=db
         )
+        db.commit()
 
         return {
             "success": True,
@@ -289,8 +307,8 @@ def logout(request: Request, authorization: Optional[str] = Header(None)):
             if session:
                 user_id = session.user_id
                 db.delete(session)
+                log_security_audit("LOGOUT", "USER", str(user_id), user_id=user_id, details={"status": "revoked"}, request_id=req_id, db=db)
                 db.commit()
-                log_security_audit("LOGOUT", "USER", str(user_id), user_id=user_id, details={"status": "revoked"}, request_id=req_id)
             else:
                 db.execute(delete(SessionModel).where(SessionModel.token_hash == token_hashed))
                 db.commit()
@@ -313,10 +331,10 @@ def change_password(req: PasswordChangeRequest, request: Request, current_user: 
         user.password_hash = hash_password_argon2(req.new_password)
         # Invalidate all active sessions for this user so re-login is required
         db.execute(delete(SessionModel).where(SessionModel.user_id == current_user["id"]))
-        db.commit()
 
         log_security_audit(
-            "PASSWORD_CHANGED", "USER", str(user.id), user_id=user.id, username=user.username, details={"status": "password updated"}, request_id=req_id
+            "PASSWORD_CHANGED", "USER", str(user.id), user_id=user.id, username=user.username, details={"status": "password updated"}, request_id=req_id, db=db
         )
+        db.commit()
 
     return {"success": True, "message": "Password changed successfully. Please log in again."}

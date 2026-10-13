@@ -95,10 +95,10 @@ else:
     from fastapi import APIRouter
     quarantined = APIRouter()
 
-    @quarantined.api_route("/api/dashboard/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
-    @quarantined.api_route("/api/invoices/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
-    @quarantined.api_route("/api/payments/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
-    @quarantined.api_route("/api/export/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+    @quarantined.api_route("/api/dashboard/{path:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
+    @quarantined.api_route("/api/invoices/{path:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
+    @quarantined.api_route("/api/payments/{path:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
+    @quarantined.api_route("/api/export/{path:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
     async def quarantined_endpoint(request: Request, path: str = ""):
         return JSONResponse(
             status_code=501,

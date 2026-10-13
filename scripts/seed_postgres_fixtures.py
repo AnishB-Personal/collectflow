@@ -53,14 +53,10 @@ ph = PasswordHasher()
 
 def seed_fixtures():
     with get_db_session() as db:
-        print("Checking if fixtures are already seeded...")
-        existing_fy = db.scalar(select(FinancialYear).where(FinancialYear.code == "FY 2026-27"))
-        if existing_fy:
-            print("Database already contains baseline fixtures. Skipping seeding.")
-            return
+        print("Idempotently verifying and seeding baseline fixtures...")
 
-        print("Seeding Financial Years...")
-        fys = [
+        # 1. Financial Years
+        all_fys = [
             FinancialYear(code="FY 2018-19", start_date=date(2018, 4, 1), end_date=date(2019, 3, 31), is_active=False),
             FinancialYear(code="FY 2019-20", start_date=date(2019, 4, 1), end_date=date(2020, 3, 31), is_active=False),
             FinancialYear(code="FY 2020-21", start_date=date(2020, 4, 1), end_date=date(2021, 3, 31), is_active=False),
@@ -71,39 +67,50 @@ def seed_fixtures():
             FinancialYear(code="FY 2025-26", start_date=date(2025, 4, 1), end_date=date(2026, 3, 31), is_active=False),
             FinancialYear(code="FY 2026-27", start_date=date(2026, 4, 1), end_date=date(2027, 3, 31), is_active=True),
         ]
-        db.add_all(fys)
+        for fy in all_fys:
+            if not db.scalar(select(FinancialYear).where(FinancialYear.code == fy.code)):
+                db.add(fy)
+        db.flush()
 
-        print("Seeding GST Rate Master...")
+        # 2. GST Rate Master
         gst_rates = [
             GstRateMaster(name="GST 18%", rate=Decimal("0.1800"), cgst_rate=Decimal("0.0900"), sgst_rate=Decimal("0.0900"), igst_rate=Decimal("0.1800"), is_default=True, is_active=True),
             GstRateMaster(name="GST 12%", rate=Decimal("0.1200"), cgst_rate=Decimal("0.0600"), sgst_rate=Decimal("0.0600"), igst_rate=Decimal("0.1200"), is_default=False, is_active=True),
             GstRateMaster(name="GST 5%", rate=Decimal("0.0500"), cgst_rate=Decimal("0.0250"), sgst_rate=Decimal("0.0250"), igst_rate=Decimal("0.0500"), is_default=False, is_active=True),
             GstRateMaster(name="GST 0%", rate=Decimal("0.0000"), cgst_rate=Decimal("0.0000"), sgst_rate=Decimal("0.0000"), igst_rate=Decimal("0.0000"), is_default=False, is_active=True),
         ]
-        db.add_all(gst_rates)
+        for g in gst_rates:
+            if not db.scalar(select(GstRateMaster).where(GstRateMaster.name == g.name)):
+                db.add(g)
+        db.flush()
 
-        print("Seeding TDS Section Master...")
+        # 3. TDS Section Master
         tds_sections = [
             TdsSectionMaster(section_code="194C", description="Payment to Contractors/Sub-contractors", default_rate=Decimal("0.0200"), is_active=True),
             TdsSectionMaster(section_code="194J", description="Fees for Professional or Technical Services", default_rate=Decimal("0.1000"), is_active=True),
             TdsSectionMaster(section_code="194J(b)", description="Technical Services (Specified)", default_rate=Decimal("0.0200"), is_active=True),
         ]
-        db.add_all(tds_sections)
+        for t in tds_sections:
+            if not db.scalar(select(TdsSectionMaster).where(TdsSectionMaster.section_code == t.section_code)):
+                db.add(t)
+        db.flush()
 
-        print("Seeding Synthetic Users with Argon2id...")
+        # 4. Synthetic Users with Argon2id
         users = [
             User(username="sandbox_admin", password_hash=ph.hash("AdminPass123!"), full_name="Sandbox Administrator", role="admin", is_active=True),
             User(username="sandbox_finance", password_hash=ph.hash("FinancePass123!"), full_name="Sandbox Finance Lead", role="finance", is_active=True),
             User(username="sandbox_sales", password_hash=ph.hash("SalesPass123!"), full_name="Sandbox Sales Executive", role="sales", is_active=True),
             User(username="sandbox_viewer", password_hash=ph.hash("ViewerPass123!"), full_name="Sandbox Audit Viewer", role="viewer", is_active=True),
         ]
-        db.add_all(users)
+        for u in users:
+            if not db.scalar(select(User).where(User.username == u.username)):
+                db.add(u)
         db.flush()
 
-        admin_user = users[0]
-        sales_user = users[2]
+        admin_user = db.scalar(select(User).where(User.username == "sandbox_admin"))
+        sales_user = db.scalar(select(User).where(User.username == "sandbox_sales"))
 
-        print("Seeding Customers...")
+        # 5. Customers (Declaring supplier state as Karnataka, Acme in Maharashtra -> inter-state; TechVanguard in Karnataka -> intra-state)
         customers = [
             Customer(
                 billing_name="Acme Cloud Solutions Pvt Ltd",
@@ -134,133 +141,154 @@ def seed_fixtures():
                 is_active=True,
             ),
         ]
-        db.add_all(customers)
+        for c in customers:
+            if not db.scalar(select(Customer).where(Customer.billing_name == c.billing_name)):
+                db.add(c)
         db.flush()
 
-        acme = customers[0]
+        acme = db.scalar(select(Customer).where(Customer.billing_name == "Acme Cloud Solutions Pvt Ltd"))
 
-        print("Seeding Purchase Order PO-NEXUS-881...")
-        po = PurchaseOrder(
-            fy_code="FY 2026-27",
-            po_number="PO-NEXUS-881",
-            po_date=date(2026, 4, 10),
-            customer_id=acme.id,
-            executive_id=sales_user.id,
-            currency="INR",
-            exchange_rate=Decimal("1.000000"),
-            exclusive_amount=Decimal("250000.00"),
-            tax_rate=Decimal("0.1800"),
-            tax_amount=Decimal("45000.00"),
-            total_amount=Decimal("295000.00"),
-            status="UNBILLED",
-            remarks="Nexus Cloud Infrastructure Consultation & Migration Services",
-        )
-        db.add(po)
-        db.flush()
+        # 6. Purchase Order PO-NEXUS-881 (unbilled baseline)
+        existing_po = db.scalar(select(PurchaseOrder).where(PurchaseOrder.po_number == "PO-NEXUS-881"))
+        if not existing_po and acme and sales_user:
+            po = PurchaseOrder(
+                fy_code="FY 2026-27",
+                po_number="PO-NEXUS-881",
+                po_date=date(2026, 4, 10),
+                customer_id=acme.id,
+                executive_id=sales_user.id,
+                currency="INR",
+                exchange_rate=Decimal("1.000000"),
+                exclusive_amount=Decimal("250000.00"),
+                tax_rate=Decimal("0.1800"),
+                tax_amount=Decimal("45000.00"),
+                total_amount=Decimal("295000.00"),
+                status="UNBILLED",
+                remarks="Nexus Cloud Infrastructure Consultation & Migration Services",
+            )
+            db.add(po)
+            db.flush()
 
-        po_item = PurchaseOrderItem(
-            po_id=po.id,
-            item_description="Cloud Architecture Modernization & High-Availability Design",
-            quantity=Decimal("1.0000"),
-            unit_price=Decimal("250000.00"),
-            exclusive_amount=Decimal("250000.00"),
-            tax_rate=Decimal("0.1800"),
-            tax_amount=Decimal("45000.00"),
-            total_amount=Decimal("295000.00"),
-        )
-        db.add(po_item)
+            po_item = PurchaseOrderItem(
+                po_id=po.id,
+                item_description="Cloud Architecture Modernization & High-Availability Design",
+                quantity=Decimal("1.0000"),
+                unit_price=Decimal("250000.00"),
+                exclusive_amount=Decimal("250000.00"),
+                tax_rate=Decimal("0.1800"),
+                tax_amount=Decimal("45000.00"),
+                total_amount=Decimal("295000.00"),
+            )
+            db.add(po_item)
+            db.flush()
 
-        print("Seeding Baseline Commercial Invoice INV-2026-042...")
-        inv = CommercialInvoice(
-            po_id=None,  # Decoupled direct invoice so PO-NEXUS-881 remains truly UNBILLED
-            fy_code="FY 2026-27",
-            customer_id=acme.id,
-            executive_id=sales_user.id,
-            invoice_number="INV-2026-042",
-            invoice_date=date(2026, 4, 12),
-            due_date=date(2026, 5, 12),
-            currency="INR",
-            exchange_rate=Decimal("1.000000"),
-            exclusive_amount=Decimal("450000.00"),
-            tax_rate=Decimal("0.1800"),
-            tax_amount=Decimal("81000.00"),
-            total_amount=Decimal("531000.00"),
-            snapshot_customer_name=acme.billing_name,
-            snapshot_gstin=acme.gst_number,
-            snapshot_billing_address=acme.billing_address,
-            snapshot_state=acme.state,
-            cgst_amount=Decimal("40500.00"),
-            sgst_amount=Decimal("40500.00"),
-            igst_amount=Decimal("0.00"),
-            lifecycle_status="ISSUED",
-            remarks="Standard professional services retainer - April 2026",
-        )
-        db.add(inv)
-        db.flush()
+        # 7. Baseline Commercial Invoice INV-2026-042 (direct invoice, decoupled from PO)
+        existing_inv = db.scalar(select(CommercialInvoice).where(CommercialInvoice.invoice_number == "INV-2026-042"))
+        if not existing_inv and acme and sales_user:
+            inv = CommercialInvoice(
+                po_id=None,  # Decoupled direct invoice so PO-NEXUS-881 remains completely UNBILLED
+                fy_code="FY 2026-27",
+                customer_id=acme.id,
+                executive_id=sales_user.id,
+                invoice_number="INV-2026-042",
+                invoice_date=date(2026, 4, 12),
+                due_date=date(2026, 5, 12),
+                currency="INR",
+                exchange_rate=Decimal("1.000000"),
+                exclusive_amount=Decimal("450000.00"),
+                tax_rate=Decimal("0.1800"),
+                tax_amount=Decimal("81000.00"),
+                total_amount=Decimal("531000.00"),
+                snapshot_customer_name=acme.billing_name,
+                snapshot_gstin=acme.gst_number,
+                snapshot_billing_address=acme.billing_address,
+                snapshot_state=acme.state,
+                cgst_amount=Decimal("40500.00"),
+                sgst_amount=Decimal("40500.00"),
+                igst_amount=Decimal("0.00"),
+                lifecycle_status="ISSUED",
+                remarks="Standard professional services retainer - April 2026",
+            )
+            db.add(inv)
+            db.flush()
 
-        inv_item = CommercialInvoiceItem(
-            invoice_id=inv.id,
-            item_description="Enterprise Core Software Engineering Services (Retainer)",
-            quantity=Decimal("1.0000"),
-            unit_price=Decimal("450000.00"),
-            exclusive_amount=Decimal("450000.00"),
-            tax_rate=Decimal("0.1800"),
-            tax_amount=Decimal("81000.00"),
-            total_amount=Decimal("531000.00"),
-        )
-        db.add(inv_item)
+            inv_item = CommercialInvoiceItem(
+                invoice_id=inv.id,
+                item_description="Enterprise Core Software Engineering Services (Retainer)",
+                quantity=Decimal("1.0000"),
+                unit_price=Decimal("450000.00"),
+                exclusive_amount=Decimal("450000.00"),
+                tax_rate=Decimal("0.1800"),
+                tax_amount=Decimal("81000.00"),
+                total_amount=Decimal("531000.00"),
+            )
+            db.add(inv_item)
+            db.flush()
 
-        print("Seeding Payment Settlement REM-2026-001...")
-        payment = PaymentTransaction(
-            invoice_id=inv.id,
-            parent_transaction_id=None,
-            transaction_type="PAYMENT",
-            cash_amount=Decimal("200000.00"),
-            tds_amount=Decimal("9000.00"),
-            total_settled=Decimal("209000.00"),
-            tds_section="194C",
-            payment_date=date(2026, 4, 25),
-            remittance_number="REM-2026-001",
-            payment_mode="NEFT",
-            notes="Partial settlement for April services via HDFC bank transfer",
-            recorded_by=admin_user.id,
-        )
-        db.add(payment)
+        inv = db.scalar(select(CommercialInvoice).where(CommercialInvoice.invoice_number == "INV-2026-042"))
 
-        print("Seeding Sales Target for sandbox_sales...")
-        target = SalesTarget(
-            user_id=sales_user.id,
-            fy_code="FY 2026-27",
-            yearly_target=Decimal("7500000.00"),
-            half_yearly_target=Decimal("3750000.00"),
-            quarterly_target=Decimal("1875000.00"),
-            monthly_target=Decimal("625000.00"),
-            monthly_bottom_line=Decimal("500000.00"),
-            yearly_bottom_line=Decimal("6000000.00"),
-        )
-        db.add(target)
+        # 8. Payment Settlement REM-2026-001
+        if inv and admin_user:
+            existing_payment = db.scalar(select(PaymentTransaction).where(PaymentTransaction.remittance_number == "REM-2026-001"))
+            if not existing_payment:
+                payment = PaymentTransaction(
+                    invoice_id=inv.id,
+                    parent_transaction_id=None,
+                    transaction_type="PAYMENT",
+                    cash_amount=Decimal("200000.00"),
+                    tds_amount=Decimal("9000.00"),
+                    total_settled=Decimal("209000.00"),
+                    tds_section="194C",
+                    payment_date=date(2026, 4, 25),
+                    remittance_number="REM-2026-001",
+                    payment_mode="NEFT",
+                    notes="Partial settlement for April services via HDFC bank transfer",
+                    recorded_by=admin_user.id,
+                )
+                db.add(payment)
+                db.flush()
 
-        print("Seeding initial Audit Log...")
-        audit = AuditLog(
-            user_id=admin_user.id,
-            username=admin_user.username,
-            action="SEED_DATABASE",
-            entity_type="SYSTEM",
-            entity_id="SEED-4C1",
-            details={
-                "message": "Baseline Stage 4C.1 synthetic database fixtures seeded",
-                "invoice": "INV-2026-042",
-                "po": "PO-NEXUS-881",
-                "settlement": "REM-2026-001",
-            },
-            ip_address="127.0.0.1",
-            request_id="seed-init-001",
-            timestamp=datetime.now(timezone.utc),
-        )
-        db.add(audit)
+        # 9. Sales Target for sandbox_sales
+        if sales_user:
+            existing_target = db.scalar(select(SalesTarget).where(SalesTarget.user_id == sales_user.id, SalesTarget.fy_code == "FY 2026-27"))
+            if not existing_target:
+                target = SalesTarget(
+                    user_id=sales_user.id,
+                    fy_code="FY 2026-27",
+                    yearly_target=Decimal("7500000.00"),
+                    half_yearly_target=Decimal("3750000.00"),
+                    quarterly_target=Decimal("1875000.00"),
+                    monthly_target=Decimal("625000.00"),
+                    monthly_bottom_line=Decimal("500000.00"),
+                    yearly_bottom_line=Decimal("6000000.00"),
+                )
+                db.add(target)
+                db.flush()
+
+        # 10. Audit Log
+        if admin_user:
+            existing_audit = db.scalar(select(AuditLog).where(AuditLog.entity_id == "SEED-4C1"))
+            if not existing_audit:
+                audit = AuditLog(
+                    user_id=admin_user.id,
+                    username=admin_user.username,
+                    action="SEED_DATABASE",
+                    entity_type="SYSTEM",
+                    entity_id="SEED-4C1",
+                    details={
+                        "message": "Baseline Stage 4C.1 synthetic database fixtures seeded",
+                        "invoice": "INV-2026-042",
+                        "po": "PO-NEXUS-881",
+                        "settlement": "REM-2026-001",
+                    },
+                    ip_address="127.0.0.1",
+                    request_id="seed-init-001",
+                    timestamp=datetime.now(timezone.utc),
+                )
+                db.add(audit)
 
         db.commit()
-        print("Successfully seeded all synthetic baseline fixtures!")
+        print("Successfully verified/seeded all synthetic baseline fixtures!")
 
 
 if __name__ == "__main__":

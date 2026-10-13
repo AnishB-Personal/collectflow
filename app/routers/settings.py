@@ -13,7 +13,7 @@ from decimal import Decimal
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update, text
 from app.core.database import get_db_session
 from app.models.domain_models import (
     CommercialInvoice,
@@ -180,6 +180,8 @@ def create_gst_rate(item: GSTCreate, user: dict = Depends(require_finance_or_adm
 
     with get_db_session() as db:
         if item.is_default:
+            # Atomically serialize default rate updates under concurrency
+            db.execute(text("SELECT pg_advisory_xact_lock(hashtext('collectflow_gst_default_rate_lock'))"))
             # Unset existing defaults
             db.execute(
                 update(GstRateMaster).where(GstRateMaster.is_default.is_(True)).values(is_default=False)

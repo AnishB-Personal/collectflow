@@ -46,7 +46,37 @@ def test_reject_unauthorized_non_dev_database_names():
     for url in invalid_urls:
         with pytest.raises(RuntimeError) as exc_info:
             validate_isolated_database_url(url, "integration")
-        assert "not an authorized test/dev database" in str(exc_info.value)
+        assert "approved database allowlist" in str(exc_info.value)
+
+
+def test_reject_query_parameter_overrides():
+    hijack_urls = [
+        "postgresql+psycopg://collectflow_user:secret@127.0.0.1:5432/collectflow_dev?host=remote.db.com",
+        "postgresql+psycopg://collectflow_user:secret@127.0.0.1:5432/collectflow_dev?hostaddr=10.0.0.1",
+        "postgresql+psycopg://collectflow_user:secret@127.0.0.1:5432/collectflow_dev?service=remote_pg",
+        "postgresql+psycopg://collectflow_user:secret@127.0.0.1:5432/collectflow_dev?passfile=/etc/shadow",
+        "postgresql+psycopg://collectflow_user:secret@127.0.0.1:5432/collectflow_dev?options=-c%20default_transaction_read_only=off",
+        "postgresql+psycopg://collectflow_user:secret@127.0.0.1:5432/collectflow_dev?sslmode=disable",
+    ]
+    for url in hijack_urls:
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_isolated_database_url(url, "integration")
+        assert "prohibited" in str(exc_info.value)
+
+
+def test_reject_unauthorized_env_mode():
+    valid_url = "postgresql+psycopg://collectflow_user:secret@127.0.0.1:5432/collectflow_dev"
+    for invalid_env in ["production", "prod", "staging_prod", "", None]:
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_isolated_database_url(valid_url, invalid_env)
+        assert "CRITICAL ISOLATION ERROR" in str(exc_info.value)
+
+
+def test_reject_sqlite_in_live_integration_mode():
+    sqlite_url = "sqlite:///./data/collectflow.db"
+    with pytest.raises(RuntimeError) as exc_info:
+        validate_isolated_database_url(sqlite_url, "integration")
+    assert "SQLite driver is not permitted" in str(exc_info.value)
 
 
 def test_reject_malformed_urls():
