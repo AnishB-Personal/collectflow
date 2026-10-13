@@ -1,9 +1,16 @@
 import os
 import sqlite3
 import tempfile
+test_env_path = os.path.join(os.path.dirname(__file__), "..", ".env.test")
+if os.path.exists(test_env_path):
+    with open(test_env_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
 
 os.environ.setdefault("COLLECTFLOW_ENV", "test")
-os.environ.setdefault("COLLECTFLOW_DATABASE_URL", "postgresql+psycopg://collectflow_user:collectflow_secret@127.0.0.1:5432/collectflow_test")
 
 import pytest
 from fastapi.testclient import TestClient
