@@ -322,7 +322,7 @@ def update_customer(customer_id: int, item: CustomerUpdate, user: dict = Depends
         if not c:
             raise HTTPException(status_code=404, detail="Customer not found")
 
-        fields_set = getattr(item, "model_fields_set", getattr(item, "__fields_set__", set()))
+        fields_set = item.model_fields_set if hasattr(item, "model_fields_set") else getattr(item, "__fields_set__", set())
         if "billing_name" in fields_set:
             if not item.billing_name or not item.billing_name.strip():
                 raise HTTPException(status_code=400, detail="Customer name cannot be empty")
