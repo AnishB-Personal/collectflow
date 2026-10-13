@@ -43,6 +43,7 @@ class UserRoleUpdate(BaseModel):
 class UserUpdate(BaseModel):
     role: Optional[str] = None
     full_name: Optional[str] = None
+    is_active: Optional[bool] = None
 
 
 class PasswordReset(BaseModel):
@@ -98,8 +99,7 @@ def create_user(item: UserCreate, current_user: dict = Depends(require_admin)):
             is_active=True,
         )
         db.add(new_user)
-        db.commit()
-        db.refresh(new_user)
+        db.flush()
 
         log_security_audit(
             "USER_CREATED",
@@ -108,7 +108,9 @@ def create_user(item: UserCreate, current_user: dict = Depends(require_admin)):
             user_id=current_user["id"],
             username=current_user["username"],
             details={"created_username": uname, "role": role},
+            db=db,
         )
+        db.commit()
 
         return {
             "success": True,
@@ -120,35 +122,61 @@ def create_user(item: UserCreate, current_user: dict = Depends(require_admin)):
 @router.put("/{user_id}")
 def update_user(user_id: int, item: UserUpdate, current_user: dict = Depends(require_admin)):
     with get_db_session() as db:
-        user = db.scalar(select(User).where(User.id == user_id))
+        user = db.scalar(select(User).where(User.id == user_id).with_for_update())
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
+
+        role_changed = False
+        deactivated = False
 
         if item.role is not None:
             new_role = item.role.lower()
             if new_role not in VALID_ROLES:
                 raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {', '.join(VALID_ROLES)}")
 
-            # Prevent demoting last admin
+            # Prevent demoting last admin with row locking
             if user.role == "admin" and new_role != "admin":
-                admin_count = db.scalar(select(func.count(User.id)).where(User.role == "admin", User.is_active.is_(True))) or 0
-                if admin_count <= 1:
+                # Lock all active admins to prevent concurrent race condition
+                admins = db.scalars(
+                    select(User).where(User.role == "admin", User.is_active.is_(True)).with_for_update()
+                ).all()
+                if len(admins) <= 1:
                     raise HTTPException(status_code=400, detail="Cannot change role: must have at least one active administrator")
 
-            user.role = new_role
+            if user.role != new_role:
+                role_changed = True
+                user.role = new_role
+
+        if item.is_active is not None:
+            if not item.is_active and user.is_active:
+                if user.id == current_user["id"]:
+                    raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
+                if user.role == "admin":
+                    admins = db.scalars(
+                        select(User).where(User.role == "admin", User.is_active.is_(True)).with_for_update()
+                    ).all()
+                    if len(admins) <= 1:
+                        raise HTTPException(status_code=400, detail="Cannot deactivate the last administrator account")
+                deactivated = True
+            user.is_active = item.is_active
 
         if item.full_name is not None:
             user.full_name = item.full_name.strip() if item.full_name else None
 
-        db.commit()
+        # Revoke sessions on role change or deactivation
+        if role_changed or deactivated:
+            db.execute(delete(SessionModel).where(SessionModel.user_id == user_id))
+
         log_security_audit(
             "USER_UPDATED",
             "USER",
             str(user.id),
             user_id=current_user["id"],
             username=current_user["username"],
-            details={"updated_id": user.id, "new_role": user.role},
+            details={"updated_id": user.id, "new_role": user.role, "is_active": user.is_active},
+            db=db,
         )
+        db.commit()
 
         return {"success": True, "message": "User updated successfully"}
 
@@ -158,20 +186,27 @@ def update_user_role(user_id: int, item: UserRoleUpdate, current_user: dict = De
     return update_user(user_id, UserUpdate(role=item.role, full_name=item.full_name), current_user)
 
 
+@router.put("/{user_id}/deactivate")
+def deactivate_user(user_id: int, current_user: dict = Depends(require_admin)):
+    return update_user(user_id, UserUpdate(is_active=False), current_user)
+
+
 @router.delete("/{user_id}")
 def delete_user(user_id: int, current_user: dict = Depends(require_admin)):
     if user_id == current_user["id"]:
         raise HTTPException(status_code=400, detail="Cannot delete your own account")
 
     with get_db_session() as db:
-        user = db.scalar(select(User).where(User.id == user_id))
+        user = db.scalar(select(User).where(User.id == user_id).with_for_update())
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        # Prevent deleting the last admin
+        # Prevent deleting the last admin with row locking
         if user.role == "admin":
-            admin_count = db.scalar(select(func.count(User.id)).where(User.role == "admin", User.is_active.is_(True))) or 0
-            if admin_count <= 1:
+            admins = db.scalars(
+                select(User).where(User.role == "admin", User.is_active.is_(True)).with_for_update()
+            ).all()
+            if len(admins) <= 1:
                 raise HTTPException(status_code=400, detail="Cannot delete the last administrator account")
 
         # Block deletion if user is referenced on historical invoices
@@ -179,13 +214,12 @@ def delete_user(user_id: int, current_user: dict = Depends(require_admin)):
         if invoice_ref_count > 0:
             raise HTTPException(
                 status_code=400,
-                detail=f"Cannot delete user '{user.username}' because they are referenced on {invoice_ref_count} historical invoice(s)",
+                detail=f"Cannot delete user '{user.username}' because they are referenced on {invoice_ref_count} historical invoice(s). You may deactivate the user instead.",
             )
 
         # Invalidate active sessions first
         db.execute(delete(SessionModel).where(SessionModel.user_id == user_id))
         db.delete(user)
-        db.commit()
 
         log_security_audit(
             "USER_DELETED",
@@ -194,6 +228,8 @@ def delete_user(user_id: int, current_user: dict = Depends(require_admin)):
             user_id=current_user["id"],
             username=current_user["username"],
             details={"deleted_username": user.username},
+            db=db,
         )
+        db.commit()
 
         return {"success": True, "message": f"User '{user.username}' deleted successfully"}

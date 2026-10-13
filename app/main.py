@@ -75,14 +75,40 @@ async def security_and_observability_middleware(request: Request, call_next):
     return response
 
 
+# Stage 4C.2 Router inclusion & Legacy SQLite quarantine
 app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(settings.router)
-app.include_router(dashboard.router)
-app.include_router(invoices.router)
-app.include_router(payments.router)
 app.include_router(customers.router)
-app.include_router(export.router)
+
+env_mode = os.environ.get("COLLECTFLOW_ENV", "integration").lower()
+is_mock_legacy_mode = env_mode in ("mock", "sqlite_legacy")
+
+if is_mock_legacy_mode:
+    # Mount legacy SQLite Phase 1-3 routers for legacy tests only
+    app.include_router(dashboard.router)
+    app.include_router(invoices.router)
+    app.include_router(payments.router)
+    app.include_router(export.router)
+else:
+    # Under PostgreSQL (Stage 4C.2 integration), explicitly quarantine legacy SQLite endpoints
+    from fastapi import APIRouter
+    quarantined = APIRouter()
+
+    @quarantined.api_route("/api/dashboard/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+    @quarantined.api_route("/api/invoices/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+    @quarantined.api_route("/api/payments/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+    @quarantined.api_route("/api/export/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+    async def quarantined_endpoint(request: Request, path: str = ""):
+        return JSONResponse(
+            status_code=501,
+            content={
+                "detail": "Endpoint deferred to Stage 4C.3/4C.4 under PostgreSQL architecture.",
+                "stage": "Stage 4C.2 Active Scope: Auth, Identity, Customers, Statutory Reference Data",
+            },
+        )
+
+    app.include_router(quarantined)
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 if os.path.isdir(STATIC_DIR):
@@ -104,7 +130,7 @@ from app.models.domain_models import Customer, FinancialYear, GstRateMaster, Tds
 
 @app.get("/ready")
 def readiness_check():
-    """Readiness probe checking database connectivity."""
+    """Readiness probe checking database connectivity (sanitized against exception leakage)."""
     try:
         with get_db_session() as db:
             res = db.execute(text("SELECT 1 as is_alive;")).scalar()
@@ -112,7 +138,11 @@ def readiness_check():
                 raise Exception("Database probe failed")
         return {"status": "ready", "database": "connected"}
     except Exception as e:
-        return JSONResponse(status_code=503, content={"status": "not_ready", "error": str(e)})
+        logger.error(f"Readiness probe failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "reason": "Database connection probe failed"},
+        )
 
 
 @app.get("/", response_class=HTMLResponse)

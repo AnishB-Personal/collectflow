@@ -31,22 +31,22 @@ router = APIRouter(prefix="/api/settings", tags=["Settings"])
 
 
 class FYCreate(BaseModel):
-    code: str
+    code: str = Field(min_length=4, max_length=20)
     start_date: Optional[str] = None
     end_date: Optional[str] = None
 
 
 class GSTCreate(BaseModel):
-    name: str
-    rate: float = Field(ge=0.0)  # e.g. 0.18 or 18%
+    name: str = Field(min_length=1, max_length=50)
+    rate: float = Field(ge=0.0, le=100.0)  # e.g. 0.18 or 18%
     tax_type: Optional[str] = "GST"
     is_default: Optional[bool] = False
 
 
 class TDSCreate(BaseModel):
-    section_code: str
-    description: Optional[str] = None
-    rate: float = Field(ge=0.0)  # e.g. 0.02 or 2%
+    section_code: str = Field(min_length=1, max_length=20)
+    description: Optional[str] = Field(default=None, max_length=255)
+    rate: float = Field(ge=0.0, le=100.0)  # e.g. 0.02 or 2%
 
 
 @router.get("/financial-years")
@@ -93,7 +93,6 @@ def create_financial_year(item: FYCreate, user: dict = Depends(require_finance_o
             is_active=True,
         )
         db.add(new_fy)
-        db.commit()
 
         log_security_audit(
             "FY_CREATED",
@@ -102,7 +101,9 @@ def create_financial_year(item: FYCreate, user: dict = Depends(require_finance_o
             user_id=user["id"],
             username=user["username"],
             details={"start_date": s_date_str, "end_date": e_date_str},
+            db=db,
         )
+        db.commit()
 
         return {"success": True, "message": f"Financial Year '{code}' created"}
 
@@ -123,9 +124,9 @@ def delete_financial_year(code: str, user: dict = Depends(require_finance_or_adm
             )
 
         db.delete(fy)
-        db.commit()
 
-        log_security_audit("FY_DELETED", "SETTINGS", code, user_id=user["id"], username=user["username"])
+        log_security_audit("FY_DELETED", "SETTINGS", code, user_id=user["id"], username=user["username"], db=db)
+        db.commit()
 
         return {"success": True, "message": f"Financial Year '{code}' deleted"}
 
@@ -178,6 +179,12 @@ def create_gst_rate(item: GSTCreate, user: dict = Depends(require_finance_or_adm
     name = item.name.strip()
 
     with get_db_session() as db:
+        if item.is_default:
+            # Unset existing defaults
+            db.execute(
+                update(GstRateMaster).where(GstRateMaster.is_default.is_(True)).values(is_default=False)
+            )
+
         new_gst = GstRateMaster(
             name=name,
             rate=rate_dec,
@@ -188,8 +195,7 @@ def create_gst_rate(item: GSTCreate, user: dict = Depends(require_finance_or_adm
             is_active=True,
         )
         db.add(new_gst)
-        db.commit()
-        db.refresh(new_gst)
+        db.flush()
 
         log_security_audit(
             "GST_RATE_CREATED",
@@ -198,7 +204,9 @@ def create_gst_rate(item: GSTCreate, user: dict = Depends(require_finance_or_adm
             user_id=user["id"],
             username=user["username"],
             details={"name": name, "rate": float(rate_dec)},
+            db=db,
         )
+        db.commit()
 
         return {"success": True, "id": new_gst.id, "message": f"GST rate '{name}' created"}
 
@@ -224,8 +232,7 @@ def create_tds_rate(item: TDSCreate, user: dict = Depends(require_finance_or_adm
             is_active=True,
         )
         db.add(new_tds)
-        db.commit()
-        db.refresh(new_tds)
+        db.flush()
 
         log_security_audit(
             "TDS_SECTION_CREATED",
@@ -234,6 +241,8 @@ def create_tds_rate(item: TDSCreate, user: dict = Depends(require_finance_or_adm
             user_id=user["id"],
             username=user["username"],
             details={"section_code": code, "default_rate": float(rate_dec)},
+            db=db,
         )
+        db.commit()
 
         return {"success": True, "id": new_tds.id, "message": f"TDS section '{code}' created"}

@@ -128,21 +128,29 @@ def log_security_audit(
     details: Optional[dict] = None,
     ip_address: Optional[str] = None,
     request_id: Optional[str] = None,
+    db: Optional[get_db_session] = None,
 ):
-    with get_db_session() as db:
-        log = AuditLog(
-            action=action,
-            entity_type=entity_type,
-            entity_id=str(entity_id) if entity_id is not None else None,
-            user_id=user_id,
-            username=username,
-            details=details,
-            ip_address=ip_address,
-            request_id=request_id,
-            timestamp=datetime.datetime.now(datetime.timezone.utc),
-        )
-        db.add(log)
-        db.commit()
+    """
+    Atomic audit logging. When db session is passed, logs inside the active transaction.
+    Otherwise creates a dedicated session and commits.
+    """
+    log_entry = AuditLog(
+        action=action,
+        entity_type=entity_type,
+        entity_id=str(entity_id) if entity_id is not None else None,
+        user_id=user_id,
+        username=username,
+        details=details,
+        ip_address=ip_address,
+        request_id=request_id,
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    if db is not None:
+        db.add(log_entry)
+    else:
+        with get_db_session() as session:
+            session.add(log_entry)
+            session.commit()
 
 
 def get_current_user(authorization: Optional[str] = Header(None)) -> dict:

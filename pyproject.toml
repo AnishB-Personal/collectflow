@@ -19,3 +19,5 @@ testpaths = ["tests"]
 pythonpath = ["."]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+norecursedirs = ["tests/legacy", ".venv", "venv"]
+addopts = "--ignore=tests/legacy"

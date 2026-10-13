@@ -172,7 +172,7 @@ def seed_fixtures():
 
         print("Seeding Baseline Commercial Invoice INV-2026-042...")
         inv = CommercialInvoice(
-            po_id=po.id,
+            po_id=None,  # Decoupled direct invoice so PO-NEXUS-881 remains truly UNBILLED
             fy_code="FY 2026-27",
             customer_id=acme.id,
             executive_id=sales_user.id,

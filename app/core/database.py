@@ -44,11 +44,26 @@ PERMITTED_DEV_USERS = {
 }
 
 
+PERMITTED_ENV_MODES = {
+    "integration",
+    "sandbox",
+    "test",
+    "development",
+    "dev",
+}
+
+
 def validate_isolated_database_url(url_str: str, env_mode: str) -> None:
     """
     Rigorously validates database URL for non-production environments using AST / URL parsing.
     Prevents remote connections, production databases, and unverified credentials.
+    Fails closed if env_mode is unrecognized or invalid.
     """
+    if not env_mode or env_mode.lower() not in PERMITTED_ENV_MODES:
+        raise RuntimeError(
+            f"CRITICAL ISOLATION ERROR: Environment mode '{env_mode}' is not an authorized non-production environment {PERMITTED_ENV_MODES}."
+        )
+
     if not url_str or not isinstance(url_str, str):
         raise ValueError("CRITICAL ISOLATION ERROR: Database URL cannot be empty.")
 
@@ -67,58 +82,65 @@ def validate_isolated_database_url(url_str: str, env_mode: str) -> None:
             f"CRITICAL ISOLATION ERROR: Driver '{url.drivername}' is not supported. Must be postgresql or sqlite."
         )
 
+    # Reject query parameter overrides that might hijack host or connection options
+    if url.query:
+        disallowed_query_keys = {"host", "sslrootcert", "sslcert", "sslkey", "options"}
+        for k in url.query.keys():
+            if k.lower() in disallowed_query_keys:
+                raise RuntimeError(
+                    f"CRITICAL ISOLATION ERROR: Database URL query parameter '{k}' is prohibited."
+                )
+
     # SQLite is permitted only if strictly memory or test file
     if url.drivername.startswith("sqlite"):
-        if env_mode in ("integration", "sandbox", "test"):
-            # Check SQLite path
-            db_path = url.database or ""
-            if db_path != ":memory:" and not any(t in db_path.lower() for t in ("test", "sandbox", "dev")):
-                raise RuntimeError(
-                    f"CRITICAL ISOLATION ERROR: SQLite database '{db_path}' is not an authorized sandbox path."
-                )
+        # Check SQLite path
+        db_path = url.database or ""
+        if db_path != ":memory:" and not any(t in db_path.lower() for t in ("test", "sandbox", "dev")):
+            raise RuntimeError(
+                f"CRITICAL ISOLATION ERROR: SQLite database '{db_path}' is not an authorized sandbox path."
+            )
         return
 
     # PostgreSQL strict isolation enforcement
-    if env_mode in ("integration", "sandbox", "test", "development", "dev"):
-        # 1. Host validation: MUST be strictly loopback
-        host = (url.host or "").strip().lower()
-        if host not in PERMITTED_LOOPBACK_HOSTS:
-            raise RuntimeError(
-                f"CRITICAL ISOLATION ERROR: Remote host '{url.host}' is prohibited in '{env_mode}' mode. "
-                f"Database must reside strictly on loopback {PERMITTED_LOOPBACK_HOSTS}."
-            )
+    # 1. Host validation: MUST be strictly loopback
+    host = (url.host or "").strip().lower()
+    if host not in PERMITTED_LOOPBACK_HOSTS:
+        raise RuntimeError(
+            f"CRITICAL ISOLATION ERROR: Remote host '{url.host}' is prohibited in '{env_mode}' mode. "
+            f"Database must reside strictly on loopback {PERMITTED_LOOPBACK_HOSTS}."
+        )
 
-        # 2. Port validation: Must be loopback port (standard 5432 or 5433)
-        port = url.port or 5432
-        if port not in (5432, 5433, 5434):
-            raise RuntimeError(
-                f"CRITICAL ISOLATION ERROR: Non-standard port '{port}' is prohibited in '{env_mode}' mode."
-            )
+    # 2. Port validation: Must be loopback port (standard 5432 or 5433)
+    port = url.port or 5432
+    if port not in (5432, 5433, 5434):
+        raise RuntimeError(
+            f"CRITICAL ISOLATION ERROR: Non-standard port '{port}' is prohibited in '{env_mode}' mode."
+        )
 
-        # 3. Database name validation
-        db_name = (url.database or "").strip()
-        if not db_name:
-            raise RuntimeError("CRITICAL ISOLATION ERROR: Missing database name in PostgreSQL URL.")
+    # 3. Database name validation
+    db_name = (url.database or "").strip()
+    if not db_name:
+        raise RuntimeError("CRITICAL ISOLATION ERROR: Missing database name in PostgreSQL URL.")
 
-        if db_name not in PERMITTED_DEV_DATABASES and not any(
-            token in db_name.lower() for token in ("dev", "test", "sandbox", "integration")
-        ):
-            raise RuntimeError(
-                f"CRITICAL ISOLATION ERROR: Database '{db_name}' is not an authorized test/dev database."
-            )
+    # Disallow production tokens in database name
+    if any(token in db_name.lower() for token in ("prod", "production", "live_prod")):
+        raise RuntimeError(
+            f"CRITICAL ISOLATION ERROR: Database '{db_name}' appears to be a production database."
+        )
 
-        # Disallow production tokens in database name
-        if any(token in db_name.lower() for token in ("prod", "production", "live_prod")):
-            raise RuntimeError(
-                f"CRITICAL ISOLATION ERROR: Database '{db_name}' appears to be a production database."
-            )
+    if db_name not in PERMITTED_DEV_DATABASES and not any(
+        token in db_name.lower() for token in ("dev", "test", "sandbox", "integration")
+    ):
+        raise RuntimeError(
+            f"CRITICAL ISOLATION ERROR: Database '{db_name}' is not an authorized test/dev database."
+        )
 
-        # 4. User validation
-        username = (url.username or "").strip().lower()
-        if username and username not in PERMITTED_DEV_USERS and "prod" in username:
-            raise RuntimeError(
-                f"CRITICAL ISOLATION ERROR: Database user '{url.username}' is not permitted in '{env_mode}' mode."
-            )
+    # 4. User validation
+    username = (url.username or "").strip().lower()
+    if username and username not in PERMITTED_DEV_USERS and "prod" in username:
+        raise RuntimeError(
+            f"CRITICAL ISOLATION ERROR: Database user '{url.username}' is not permitted in '{env_mode}' mode."
+        )
 
 
 def get_database_url() -> str:
