@@ -38,7 +38,7 @@ class FYCreate(BaseModel):
 
 class GSTCreate(BaseModel):
     name: str = Field(min_length=1, max_length=50)
-    rate: float = Field(ge=0.0, le=100.0)  # e.g. 0.18 or 18%
+    rate: float = Field(ge=0.0, le=1.0)  # Decimal statutory rate (e.g. 0.18 for 18%, 0.01 for 1%)
     tax_type: Optional[str] = "GST"
     is_default: Optional[bool] = False
 
@@ -46,7 +46,7 @@ class GSTCreate(BaseModel):
 class TDSCreate(BaseModel):
     section_code: str = Field(min_length=1, max_length=20)
     description: Optional[str] = Field(default=None, max_length=255)
-    rate: float = Field(ge=0.0, le=100.0)  # e.g. 0.02 or 2%
+    rate: float = Field(ge=0.0, le=1.0)  # Decimal statutory rate (e.g. 0.02 for 2%, 0.005 for 0.5%)
 
 
 @router.get("/financial-years")
@@ -171,9 +171,6 @@ def get_taxes(user: dict = Depends(get_current_user)):
 @router.post("/taxes/gst")
 def create_gst_rate(item: GSTCreate, user: dict = Depends(require_finance_or_admin)):
     rate_val = item.rate
-    if rate_val > 1.0:
-        rate_val = rate_val / 100.0  # normalize e.g. 18 -> 0.18
-
     rate_dec = Decimal(str(rate_val)).quantize(Decimal("0.0001"))
     half_rate = (rate_dec / Decimal("2")).quantize(Decimal("0.0001"))
     name = item.name.strip()
@@ -217,9 +214,6 @@ def create_gst_rate(item: GSTCreate, user: dict = Depends(require_finance_or_adm
 def create_tds_rate(item: TDSCreate, user: dict = Depends(require_finance_or_admin)):
     code = item.section_code.strip()
     rate_val = item.rate
-    if rate_val > 1.0:
-        rate_val = rate_val / 100.0
-
     rate_dec = Decimal(str(rate_val)).quantize(Decimal("0.0001"))
 
     with get_db_session() as db:

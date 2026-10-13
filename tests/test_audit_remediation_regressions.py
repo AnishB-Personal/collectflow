@@ -456,3 +456,102 @@ def test_h08_customer_contract_and_conflict():
     assert "." in data["total_billed"]
     assert len(data["total_billed"].split(".")[1]) == 2
 
+
+def test_statutory_percentage_contract_acceptance_cases():
+    """Verify that GST and TDS rate creations use an unambiguous decimal representation.
+    Acceptance cases:
+    - 0.5%  -> stored rate 0.0050 (readback 0.005)
+    - 1%    -> stored rate 0.0100 (readback 0.01)
+    - 1.5%  -> stored rate 0.0150 (readback 0.015)
+    - 18%   -> stored rate 0.1800 (readback 0.18)
+    And invalid values > 1.0 are rejected by schema validation (422).
+    """
+    admin_login = client.post("/api/auth/login", json={"username": "sandbox_admin", "password": "AdminPass123!"})
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['token']}"}
+
+    from app.models.domain_models import GstRateMaster, TdsSectionMaster
+    import uuid
+
+    cases = [
+        ("0.5%", 0.005, Decimal("0.0050")),
+        ("1%", 0.01, Decimal("0.0100")),
+        ("1.5%", 0.015, Decimal("0.0150")),
+        ("18%", 0.18, Decimal("0.1800")),
+    ]
+
+    created_gst_ids = []
+    created_tds_codes = []
+
+    try:
+        for label, rate_input, expected_db in cases:
+            unique_suffix = uuid.uuid4().hex[:6]
+
+            # 1. GST Rate Creation
+            gst_name = f"Test GST {label} {unique_suffix}"
+            gst_res = client.post(
+                "/api/settings/taxes/gst",
+                json={"name": gst_name, "rate": rate_input, "tax_type": "GST"},
+                headers=admin_headers,
+            )
+            assert gst_res.status_code == 200, gst_res.text
+            gst_id = gst_res.json()["id"]
+            created_gst_ids.append(gst_id)
+
+            # 2. TDS Section Creation
+            tds_code = f"TDS-{label.replace('.', '_')}-{unique_suffix}"
+            tds_res = client.post(
+                "/api/settings/taxes/tds",
+                json={"section_code": tds_code, "rate": rate_input, "description": f"Test {label}"},
+                headers=admin_headers,
+            )
+            assert tds_res.status_code == 200, tds_res.text
+            created_tds_codes.append(tds_code)
+
+            # 3. Direct DB Verification
+            with get_db_session() as db:
+                gst_record = db.scalar(select(GstRateMaster).where(GstRateMaster.id == gst_id))
+                assert gst_record is not None
+                assert gst_record.rate == expected_db, f"Expected {expected_db} in DB, got {gst_record.rate}"
+
+                tds_record = db.scalar(select(TdsSectionMaster).where(TdsSectionMaster.section_code == tds_code))
+                assert tds_record is not None
+                assert tds_record.default_rate == expected_db, f"Expected {expected_db} in DB, got {tds_record.default_rate}"
+
+        # 4. API Readback verification via GET /api/settings/taxes
+        taxes_res = client.get("/api/settings/taxes", headers=admin_headers)
+        assert taxes_res.status_code == 200
+        taxes_data = taxes_res.json()
+
+        for label, rate_input, _ in cases:
+            matching_gst = next((g for g in taxes_data["gst_rates"] if label in g["name"]), None)
+            assert matching_gst is not None, f"GST {label} not found in readback"
+            assert matching_gst["rate"] == rate_input, f"GST readback mismatch: expected {rate_input}, got {matching_gst['rate']}"
+
+            matching_tds = next((t for t in taxes_data["tds_rates"] if f"Test {label}" == t["description"]), None)
+            assert matching_tds is not None, f"TDS {label} not found in readback"
+            assert matching_tds["rate"] == rate_input, f"TDS readback mismatch: expected {rate_input}, got {matching_tds['rate']}"
+
+        # 5. Schema Validation: values > 1.0 are rejected with 422
+        invalid_gst = client.post(
+            "/api/settings/taxes/gst",
+            json={"name": "Invalid GST 18%", "rate": 18.0, "tax_type": "GST"},
+            headers=admin_headers,
+        )
+        assert invalid_gst.status_code == 422
+
+        invalid_tds = client.post(
+            "/api/settings/taxes/tds",
+            json={"section_code": "INVALID-TDS", "rate": 2.0, "description": "Invalid TDS"},
+            headers=admin_headers,
+        )
+        assert invalid_tds.status_code == 422
+
+    finally:
+        # Cleanup created records
+        with get_db_session() as db:
+            for gid in created_gst_ids:
+                db.execute(delete(GstRateMaster).where(GstRateMaster.id == gid))
+            for tcode in created_tds_codes:
+                db.execute(delete(TdsSectionMaster).where(TdsSectionMaster.section_code == tcode))
+            db.commit()
+
