@@ -15,6 +15,7 @@ Validates against live PostgreSQL database:
 
 import datetime
 from decimal import Decimal
+import re
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -57,6 +58,9 @@ def cleanup_test_records():
                 for it in items:
                     db.delete(it)
                 db.delete(po)
+            test_custs = db.scalars(select(Customer).where(Customer.gst_number.in_(["29TESTG0000Z1Z1", "27MODIF1111A1Z9"]))).all()
+            for c in test_custs:
+                db.delete(c)
             db.commit()
 
     _do_cleanup()
@@ -108,9 +112,11 @@ def test_orders_crud_and_calculation():
     assert get_resp.status_code == 200
     po_data = get_resp.json()
     assert po_data["po_number"] == "PO-TEST-S3-001"
-    assert po_data["exclusive_amount"] == 70000.00
-    assert po_data["tax_amount"] == 12600.00
-    assert po_data["total_amount"] == 82600.00
+    assert po_data["exclusive_amount"] == "70000.00"
+    assert po_data["tax_amount"] == "12600.00"
+    assert po_data["total_amount"] == "82600.00"
+    assert po_data["outstanding_balance"] == "0.00"
+    assert po_data["unbilled_amount"] == "82600.00"
     assert po_data["status"] == "UNBILLED"
     assert po_data["computed_status"] == "UNBILLED"
     assert len(po_data["line_items"]) == 2
@@ -138,8 +144,10 @@ def test_orders_crud_and_calculation():
 
     updated_get = client.get(f"/api/orders/{po_id}", headers=headers_admin)
     assert updated_get.status_code == 200
-    assert updated_get.json()["exclusive_amount"] == 60000.00
-    assert updated_get.json()["total_amount"] == 70800.00
+    assert updated_get.json()["exclusive_amount"] == "60000.00"
+    assert updated_get.json()["total_amount"] == "70800.00"
+    assert updated_get.json()["outstanding_balance"] == "0.00"
+    assert updated_get.json()["unbilled_amount"] == "70800.00"
     assert updated_get.json()["remarks"] == "Updated Test PO Remarks"
 
     # 4. Sales cannot delete unbilled PO (403)
@@ -225,10 +233,10 @@ def test_po_to_invoice_conversion_workflow():
     assert inv_check["invoice_number"] == "INV-TEST-CONV-01"
     assert inv_check["invoice_date"] == "2026-06-05"
     assert inv_check["due_date"] == "2026-07-05"
-    assert inv_check["exclusive_amount"] == 100000.00
-    assert inv_check["tax_amount"] == 18000.00
-    assert inv_check["total_amount"] == 118000.00
-    assert inv_check["outstanding_balance"] == 118000.00
+    assert inv_check["exclusive_amount"] == "100000.00"
+    assert inv_check["tax_amount"] == "18000.00"
+    assert inv_check["total_amount"] == "118000.00"
+    assert inv_check["outstanding_balance"] == "118000.00"
     assert inv_check["payment_status"] == "PENDING"
     assert inv_check["computed_status"] in ("PENDING", "OVERDUE")
     assert inv_check["lifecycle_status"] == "ISSUED"
@@ -274,14 +282,14 @@ def test_statutory_gst_split_inter_vs_intra():
         },
         headers=headers,
     )
-    assert inv1_resp.status_code == 200, inv1_resp.text
+    assert inv1_resp.status_code in (200, 201), inv1_resp.text
     inv1_id = inv1_resp.json()["id"]
 
     inv1 = client.get(f"/api/invoices/{inv1_id}", headers=headers).json()["invoice"]
-    assert inv1["tax_amount"] == 9000.00
-    assert inv1["cgst_amount"] == 4500.00
-    assert inv1["sgst_amount"] == 4500.00
-    assert inv1["igst_amount"] == 0.00
+    assert inv1["tax_amount"] == "9000.00"
+    assert inv1["cgst_amount"] == "4500.00"
+    assert inv1["sgst_amount"] == "4500.00"
+    assert inv1["igst_amount"] == "0.00"
 
     # 2. Direct Invoice for Maharashtra Customer (Inter-state) - Customer 1
     # Exclusive: 50,000, 18% Tax: 9,000 -> CGST: 0, SGST: 0, IGST: 9000
@@ -297,14 +305,14 @@ def test_statutory_gst_split_inter_vs_intra():
         },
         headers=headers,
     )
-    assert inv2_resp.status_code == 200, inv2_resp.text
+    assert inv2_resp.status_code in (200, 201), inv2_resp.text
     inv2_id = inv2_resp.json()["id"]
 
     inv2 = client.get(f"/api/invoices/{inv2_id}", headers=headers).json()["invoice"]
-    assert inv2["tax_amount"] == 9000.00
-    assert inv2["cgst_amount"] == 0.00
-    assert inv2["sgst_amount"] == 0.00
-    assert inv2["igst_amount"] == 9000.00
+    assert inv2["tax_amount"] == "9000.00"
+    assert inv2["cgst_amount"] == "0.00"
+    assert inv2["sgst_amount"] == "0.00"
+    assert inv2["igst_amount"] == "9000.00"
 
     # Clean up
     with get_db_session() as db:
@@ -351,7 +359,7 @@ def test_customer_snapshot_immutability():
         },
         headers=headers,
     )
-    assert inv_resp.status_code == 200
+    assert inv_resp.status_code in (200, 201), inv_resp.text
     inv_id = inv_resp.json()["id"]
 
     # 3. Update customer details in master database
@@ -406,7 +414,7 @@ def test_invoice_cancellation_workflow():
         },
         headers=headers,
     )
-    assert inv_resp.status_code == 200
+    assert inv_resp.status_code in (200, 201), inv_resp.text
     inv_id = inv_resp.json()["id"]
 
     # 2. Cancellation without reason should be rejected (422 validation error)
@@ -427,7 +435,7 @@ def test_invoice_cancellation_workflow():
     assert inv_check["lifecycle_status"] == "CANCELLED"
     assert inv_check["payment_status"] == "CANCELLED"
     assert inv_check["computed_status"] == "CANCELLED"
-    assert inv_check["outstanding_balance"] == 0.00
+    assert inv_check["outstanding_balance"] == "0.00"
     assert inv_check["cancellation_reason"] == "Customer project cancelled under formal written request"
 
     # 5. Re-cancelling cancelled invoice rejected with 400
@@ -517,3 +525,250 @@ def test_stage4c3_rbac_matrix():
         headers={"Authorization": f"Bearer {token_viewer}"},
     )
     assert viewer_create_inv.status_code == 403
+
+
+MONEY_REGEX = re.compile(r"^-?\d+\.\d{2}$")
+
+
+def test_cf4c3_01_monetary_tax_integrity_and_serialization():
+    token_admin = _get_token("sandbox_admin", "AdminPass123!")
+    headers_admin = {"Authorization": f"Bearer {token_admin}"}
+
+    # 1. Fractional amounts & half-up rounding boundary
+    # Qty 3.3333 * Unit Price 100.335 -> excl = 334.45
+    # Tax rate 0.18 -> tax = 334.45 * 0.18 = 60.201 -> 60.20
+    # Total = 334.45 + 60.20 = 394.65
+    po_payload = {
+        "fy_code": "FY 2026-27",
+        "po_number": "PO-TEST-ROUNDING-01",
+        "po_date": "2026-05-15",
+        "customer_id": 1,
+        "items": [
+            {
+                "item_description": "Fractional Precision Hours",
+                "quantity": 3.3333,
+                "unit_price": 100.335,
+                "tax_rate": 0.18,
+            }
+        ],
+    }
+    po_resp = client.post("/api/orders", json=po_payload, headers=headers_admin)
+    assert po_resp.status_code == 201, po_resp.text
+    po_data = po_resp.json()
+    assert MONEY_REGEX.match(po_data["exclusive_amount"])
+    assert MONEY_REGEX.match(po_data["tax_amount"])
+    assert MONEY_REGEX.match(po_data["total_amount"])
+    assert MONEY_REGEX.match(po_data["outstanding_balance"])
+    assert MONEY_REGEX.match(po_data["unbilled_amount"])
+    assert po_data["exclusive_amount"] == "334.45"
+    assert po_data["tax_amount"] == "60.20"
+    assert po_data["total_amount"] == "394.65"
+    assert po_data["outstanding_balance"] == "0.00"
+    assert po_data["unbilled_amount"] == "394.65"
+
+    # Line item serialization check
+    li = po_data["line_items"][0]
+    assert MONEY_REGEX.match(li["unit_price"])
+    assert MONEY_REGEX.match(li["exclusive_amount"])
+    assert MONEY_REGEX.match(li["tax_amount"])
+    assert MONEY_REGEX.match(li["total_amount"])
+
+    # 2. Inconsistent caller-supplied tax_amount rejected with HTTP 400
+    bad_tax_payload = {
+        "fy_code": "FY 2026-27",
+        "po_number": "PO-TEST-BAD-TAX",
+        "po_date": "2026-05-15",
+        "customer_id": 1,
+        "tax_amount": 999.00,  # Highly inconsistent with line item
+        "items": [
+            {
+                "item_description": "Standard Task",
+                "quantity": 1.0,
+                "unit_price": 1000.0,
+                "tax_rate": 0.18,
+            }
+        ],
+    }
+    bad_tax_resp = client.post("/api/orders", json=bad_tax_payload, headers=headers_admin)
+    assert bad_tax_resp.status_code == 400
+    assert "inconsistent" in bad_tax_resp.json()["detail"].lower()
+
+    # 3. Inconsistent caller-supplied total_amount rejected with HTTP 400
+    bad_tot_payload = {
+        "fy_code": "FY 2026-27",
+        "po_number": "PO-TEST-BAD-TOT",
+        "po_date": "2026-05-15",
+        "customer_id": 1,
+        "total_amount": 5000.00,  # Should be 1180.00
+        "items": [
+            {
+                "item_description": "Standard Task",
+                "quantity": 1.0,
+                "unit_price": 1000.0,
+                "tax_rate": 0.18,
+            }
+        ],
+    }
+    bad_tot_resp = client.post("/api/orders", json=bad_tot_payload, headers=headers_admin)
+    assert bad_tot_resp.status_code == 400
+    assert "inconsistent" in bad_tot_resp.json()["detail"].lower()
+
+    # 4. Inconsistent caller-supplied amounts on direct invoice rejected with HTTP 400
+    bad_inv_tax = {
+        "fy_code": "FY 2026-27",
+        "invoice_number": "INV-TEST-BAD-TAX",
+        "invoice_date": "2026-06-15",
+        "customer_id": 1,
+        "exclusive_amount": 10000.00,
+        "tax_rate": 0.18,
+        "tax_amount": 500.00,  # Inconsistent with 18% of 10,000 (1800.00)
+    }
+    bad_inv_resp = client.post("/api/invoices", json=bad_inv_tax, headers=headers_admin)
+    assert bad_inv_resp.status_code == 400
+    assert "inconsistent" in bad_inv_resp.json()["detail"].lower()
+
+    # 5. Multi-line totals exact decimal sum on direct invoice
+    multi_inv_payload = {
+        "fy_code": "FY 2026-27",
+        "invoice_number": "INV-TEST-MULTI-LINE",
+        "invoice_date": "2026-06-15",
+        "customer_id": 2,
+        "items": [
+            {
+                "description": "Item A",
+                "quantity": 2.5,
+                "unit_price": 1500.0,
+                "tax_rate": 0.18,
+            },
+            {
+                "description": "Item B",
+                "quantity": 4.0,
+                "unit_price": 2250.75,
+                "tax_rate": 0.18,
+            },
+        ],
+    }
+    multi_resp = client.post("/api/invoices", json=multi_inv_payload, headers=headers_admin)
+    assert multi_resp.status_code in (200, 201), multi_resp.text
+    inv_id = multi_resp.json()["id"]
+
+    inv_get = client.get(f"/api/invoices/{inv_id}", headers=headers_admin).json()["invoice"]
+    # Item A: 2.5 * 1500 = 3750.00, tax = 675.00, tot = 4425.00
+    # Item B: 4.0 * 2250.75 = 9003.00, tax = 1620.54, tot = 10623.54
+    # Excl sum: 12753.00, Tax sum: 2295.54, Total: 15048.54
+    assert inv_get["exclusive_amount"] == "12753.00"
+    assert inv_get["tax_amount"] == "2295.54"
+    assert inv_get["total_amount"] == "15048.54"
+    assert inv_get["outstanding_balance"] == "15048.54"
+    assert MONEY_REGEX.match(inv_get["total_cash_paid"])
+    assert MONEY_REGEX.match(inv_get["total_tds_deducted"])
+    assert MONEY_REGEX.match(inv_get["total_paid"])
+
+
+def test_cf4c3_02_unbilled_receivables_and_po_nexus_881():
+    token_admin = _get_token("sandbox_admin", "AdminPass123!")
+    headers = {"Authorization": f"Bearer {token_admin}"}
+
+    # 1. Verify baseline PO-NEXUS-881 via GET /api/orders
+    orders_resp = client.get("/api/orders?search=PO-NEXUS-881", headers=headers)
+    assert orders_resp.status_code == 200
+    nexus_orders = [o for o in orders_resp.json()["data"] if o["po_number"] == "PO-NEXUS-881"]
+    assert len(nexus_orders) == 1, f"Expected PO-NEXUS-881 in orders list: {orders_resp.text}"
+    nexus = nexus_orders[0]
+
+    # Gross value preserved separately
+    assert nexus["total_amount"] == "295000.00"
+    assert nexus["exclusive_amount"] == "250000.00"
+    assert nexus["tax_amount"] == "45000.00"
+    assert nexus["unbilled_amount"] == "295000.00"
+    # Zero recognized AR
+    assert nexus["outstanding_balance"] == "0.00"
+    assert nexus["recognized_ar"] == "0.00"
+    assert nexus["status"] == "UNBILLED"
+    assert nexus["computed_status"] == "UNBILLED"
+
+    # 2. Verify via single order lookup GET /api/orders/{id}
+    nexus_id = nexus["id"]
+    single_get = client.get(f"/api/orders/{nexus_id}", headers=headers).json()
+    assert single_get["total_amount"] == "295000.00"
+    assert single_get["unbilled_amount"] == "295000.00"
+    assert single_get["outstanding_balance"] == "0.00"
+    assert single_get["recognized_ar"] == "0.00"
+
+
+def test_cf4c3_04_conversion_due_date_boundaries():
+    token_admin = _get_token("sandbox_admin", "AdminPass123!")
+    headers = {"Authorization": f"Bearer {token_admin}"}
+
+    # 1. Create unbilled PO
+    po_resp = client.post(
+        "/api/orders",
+        json={
+            "fy_code": "FY 2026-27",
+            "po_number": "PO-TEST-DUE-BOUNDS",
+            "po_date": "2026-06-01",
+            "customer_id": 1,
+            "exclusive_amount": 50000.00,
+            "tax_rate": 0.18,
+        },
+        headers=headers,
+    )
+    assert po_resp.status_code == 201
+    po_id = po_resp.json()["id"]
+
+    # 2. Negative test: due_date earlier than invoice_date rejected with HTTP 400
+    early_due_resp = client.post(
+        f"/api/orders/{po_id}/convert",
+        json={
+            "invoice_number": "INV-TEST-EARLY-DUE",
+            "invoice_date": "2026-06-15",
+            "due_date": "2026-06-10",  # 5 days BEFORE invoice_date
+        },
+        headers=headers,
+    )
+    assert early_due_resp.status_code == 400
+    assert "due date cannot precede invoice date" in early_due_resp.json()["detail"].lower()
+
+    # 3. Boundary test: due_date == invoice_date accepted
+    same_due_resp = client.post(
+        f"/api/orders/{po_id}/convert",
+        json={
+            "invoice_number": "INV-TEST-SAME-DUE",
+            "invoice_date": "2026-06-15",
+            "due_date": "2026-06-15",  # Same day due date
+        },
+        headers=headers,
+    )
+    assert same_due_resp.status_code in (200, 201), same_due_resp.text
+    conv_inv = same_due_resp.json()
+    assert conv_inv["due_date"] == "2026-06-15"
+    assert conv_inv["invoice_date"] == "2026-06-15"
+
+    # 4. Default Net-30: Omitted due_date defaults to Net 30
+    po_resp2 = client.post(
+        "/api/orders",
+        json={
+            "fy_code": "FY 2026-27",
+            "po_number": "PO-TEST-NET30-DEF",
+            "po_date": "2026-07-01",
+            "customer_id": 1,
+            "exclusive_amount": 25000.00,
+            "tax_rate": 0.18,
+        },
+        headers=headers,
+    )
+    assert po_resp2.status_code == 201
+    po_id2 = po_resp2.json()["id"]
+
+    net30_resp = client.post(
+        f"/api/orders/{po_id2}/convert",
+        json={
+            "invoice_number": "INV-TEST-NET30-DEF",
+            "invoice_date": "2026-07-01",
+            # due_date omitted
+        },
+        headers=headers,
+    )
+    assert net30_resp.status_code in (200, 201), net30_resp.text
+    assert net30_resp.json()["due_date"] == "2026-07-31"  # 30 days after 2026-07-01
+

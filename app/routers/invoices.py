@@ -43,10 +43,21 @@ router = APIRouter(prefix="/api/invoices", tags=["Invoices"])
 
 
 class InvoiceItemCreate(BaseModel):
-    description: str = Field(min_length=1, max_length=255)
+    description: Optional[str] = None
+    item_description: Optional[str] = None
     quantity: float = Field(default=1.0, gt=0)
     unit_price: float = Field(default=0.0, ge=0.0)
     tax_rate: float = Field(default=0.18, ge=0.0, le=1.0)
+
+    @property
+    def desc(self) -> str:
+        return (self.description or self.item_description or "Standard Line Item").strip()
+
+
+def _format_money(val: Any) -> str:
+    if val is None:
+        return "0.00"
+    return f"{Decimal(str(val)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
 
 
 class InvoiceCreate(BaseModel):
@@ -97,11 +108,11 @@ def _serialize_invoice(
             "invoice_id": it.invoice_id,
             "description": it.item_description,
             "quantity": float(it.quantity),
-            "unit_price": float(it.unit_price),
-            "exclusive_amount": float(it.exclusive_amount),
-            "tax_rate": float(it.tax_rate),
-            "tax_amount": float(it.tax_amount),
-            "total_amount": float(it.total_amount),
+            "unit_price": _format_money(it.unit_price),
+            "exclusive_amount": _format_money(it.exclusive_amount),
+            "tax_rate": f"{Decimal(str(it.tax_rate)):.4f}",
+            "tax_amount": _format_money(it.tax_amount),
+            "total_amount": _format_money(it.total_amount),
         }
         for it in (items if items is not None else (inv.items or []))
     ]
@@ -112,10 +123,10 @@ def _serialize_invoice(
         {
             "id": tx.id,
             "invoice_id": tx.invoice_id,
-            "payment_amount": float(tx.cash_amount),
-            "cash_amount": float(tx.cash_amount),
-            "tds_amount": float(tx.tds_amount),
-            "total_settled": float(tx.total_settled),
+            "payment_amount": _format_money(tx.cash_amount),
+            "cash_amount": _format_money(tx.cash_amount),
+            "tds_amount": _format_money(tx.tds_amount),
+            "total_settled": _format_money(tx.total_settled),
             "tds_section": tx.tds_section,
             "payment_date": tx.payment_date.isoformat() if tx.payment_date else None,
             "payment_mode": tx.payment_mode,
@@ -127,22 +138,26 @@ def _serialize_invoice(
     ]
 
     # Financial settlement aggregation
-    cash_paid = sum((Decimal(str(tx.cash_amount)) for tx in txs), Decimal("0.00")).quantize(Decimal("0.01"))
-    tds_deducted = sum((Decimal(str(tx.tds_amount)) for tx in txs), Decimal("0.00")).quantize(Decimal("0.01"))
-    total_paid = sum((Decimal(str(tx.total_settled)) for tx in txs), Decimal("0.00")).quantize(Decimal("0.01"))
+    cash_paid = sum((Decimal(str(tx.cash_amount)) for tx in txs), Decimal("0.00")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    tds_deducted = sum((Decimal(str(tx.tds_amount)) for tx in txs), Decimal("0.00")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    total_paid = sum((Decimal(str(tx.total_settled)) for tx in txs), Decimal("0.00")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-    inv_total = Decimal(str(inv.total_amount))
+    inv_total = Decimal(str(inv.total_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    today = datetime.date.today()
+    days_overdue = 0
 
     if inv.lifecycle_status == "CANCELLED":
         outstanding_balance = Decimal("0.00")
         payment_status = "CANCELLED"
         computed_status = "CANCELLED"
     else:
-        outstanding_balance = max(Decimal("0.00"), inv_total - total_paid).quantize(Decimal("0.01"))
+        outstanding_balance = max(Decimal("0.00"), inv_total - total_paid).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         if total_paid <= Decimal("0.00"):
             payment_status = "PENDING"
-            if inv.due_date and inv.due_date < datetime.date.today():
+            if inv.due_date and inv.due_date < today:
                 computed_status = "OVERDUE"
+                days_overdue = (today - inv.due_date).days
             else:
                 computed_status = "PENDING"
         elif total_paid >= inv_total:
@@ -151,6 +166,8 @@ def _serialize_invoice(
         else:
             payment_status = "PARTIAL"
             computed_status = "PARTIAL"
+            if inv.due_date and inv.due_date < today:
+                days_overdue = (today - inv.due_date).days
 
     po_num = po.po_number if po else (inv.remarks if inv.po_id is None else None)
     po_dt = po.po_date.isoformat() if po and po.po_date else None
@@ -171,28 +188,29 @@ def _serialize_invoice(
         "executive_name": e_name,
         "currency": inv.currency,
         "exchange_rate": float(inv.exchange_rate),
-        "original_amount": float(inv.exclusive_amount),
-        "exclusive_amount": float(inv.exclusive_amount),
-        "tax_rate": float(inv.tax_rate),
-        "tax_amount": float(inv.tax_amount),
-        "total_amount": float(inv_total),
+        "original_amount": _format_money(inv.exclusive_amount),
+        "exclusive_amount": _format_money(inv.exclusive_amount),
+        "tax_rate": f"{Decimal(str(inv.tax_rate)):.4f}",
+        "tax_amount": _format_money(inv.tax_amount),
+        "total_amount": _format_money(inv_total),
         "invoice_number": inv.invoice_number,
         "invoice_date": inv.invoice_date.isoformat() if inv.invoice_date else None,
         "due_date": inv.due_date.isoformat() if inv.due_date else None,
+        "days_overdue": days_overdue,
         "remarks": inv.remarks,
-        "cgst_amount": float(inv.cgst_amount),
-        "sgst_amount": float(inv.sgst_amount),
-        "igst_amount": float(inv.igst_amount),
+        "cgst_amount": _format_money(inv.cgst_amount),
+        "sgst_amount": _format_money(inv.sgst_amount),
+        "igst_amount": _format_money(inv.igst_amount),
         "lifecycle_status": inv.lifecycle_status,
         "cancellation_reason": inv.cancellation_reason,
         "cancelled_at": inv.cancelled_at.isoformat() if inv.cancelled_at else None,
         "cancelled_by": inv.cancelled_by,
         "payment_status": payment_status,
         "computed_status": computed_status,
-        "total_cash_paid": float(cash_paid),
-        "total_tds_deducted": float(tds_deducted),
-        "total_paid": float(total_paid),
-        "outstanding_balance": float(outstanding_balance),
+        "total_cash_paid": _format_money(cash_paid),
+        "total_tds_deducted": _format_money(tds_deducted),
+        "total_paid": _format_money(total_paid),
+        "outstanding_balance": _format_money(outstanding_balance),
         "line_items": line_items,
         "payments": payments_list,
         "created_at": inv.created_at.isoformat() if inv.created_at else None,
@@ -325,7 +343,7 @@ def get_invoice(invoice_id: int, user: dict = Depends(get_current_user)):
         }
 
 
-@router.post("")
+@router.post("", status_code=201)
 def create_invoice(
     payload: InvoiceCreate,
     request: Request,
@@ -433,32 +451,32 @@ def create_invoice(
 
         if payload.items and len(payload.items) > 0:
             for item in payload.items:
-                i_excl, i_tax, i_tot = calculate_line_item(item.quantity, item.unit_price, item.tax_rate)
-                d_excl = Decimal(str(i_excl)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-                d_tax = Decimal(str(i_tax)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                qty = Decimal(str(item.quantity))
+                uprice = Decimal(str(item.unit_price))
+                trate = Decimal(str(item.tax_rate))
+
+                d_excl = (qty * uprice).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                d_tax = (d_excl * trate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
                 d_tot = (d_excl + d_tax).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
                 computed_items.append({
-                    "description": item.description.strip(),
-                    "quantity": Decimal(str(item.quantity)),
-                    "unit_price": Decimal(str(item.unit_price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                    "description": item.desc,
+                    "quantity": qty,
+                    "unit_price": uprice.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
                     "exclusive_amount": d_excl,
-                    "tax_rate": Decimal(str(item.tax_rate)),
+                    "tax_rate": trate,
                     "tax_amount": d_tax,
                     "total_amount": d_tot,
                 })
                 total_excl += d_excl
                 total_tax += d_tax
-            inv_tax_rate = Decimal(str(payload.tax_rate or 0.18))
+            inv_tax_rate = Decimal(str(payload.tax_rate or (computed_items[0]["tax_rate"] if computed_items else 0.18)))
         else:
             if payload.exclusive_amount is None:
                 raise HTTPException(status_code=400, detail="Either line items or exclusive_amount must be provided")
             d_excl = Decimal(str(payload.exclusive_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             inv_tax_rate = Decimal(str(payload.tax_rate or 0.18))
-            if payload.tax_amount is not None:
-                d_tax = Decimal(str(payload.tax_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            else:
-                d_tax = (d_excl * inv_tax_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            d_tax = (d_excl * inv_tax_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             d_tot = (d_excl + d_tax).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
             computed_items.append({
@@ -474,6 +492,31 @@ def create_invoice(
             total_tax = d_tax
 
         total_amount_val = total_excl + total_tax
+
+        # CF4C3-01: Inconsistency checks against caller-supplied amounts
+        if payload.exclusive_amount is not None and payload.items and len(payload.items) > 0:
+            supplied_excl = Decimal(str(payload.exclusive_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if abs(supplied_excl - total_excl) > Decimal("0.01"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Supplied exclusive_amount ({supplied_excl}) is inconsistent with line-item total ({total_excl})",
+                )
+
+        if payload.tax_amount is not None:
+            supplied_tax = Decimal(str(payload.tax_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if abs(supplied_tax - total_tax) > Decimal("0.01"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Supplied tax_amount ({supplied_tax}) is inconsistent with authoritative tax calculation ({total_tax})",
+                )
+
+        if payload.total_amount is not None:
+            supplied_total = Decimal(str(payload.total_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if abs(supplied_total - total_amount_val) > Decimal("0.01"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Supplied total_amount ({supplied_total}) is inconsistent with authoritative total ({total_amount_val})",
+                )
 
         # 9. Immutable Customer Snapshot
         snapshot_name = cust.billing_name

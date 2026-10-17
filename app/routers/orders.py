@@ -42,10 +42,21 @@ router = APIRouter(prefix="/api/orders", tags=["Orders"])
 
 
 class OrderItemCreate(BaseModel):
-    item_description: str = Field(min_length=1, max_length=255)
+    item_description: Optional[str] = None
+    description: Optional[str] = None
     quantity: float = Field(default=1.0, gt=0)
     unit_price: float = Field(default=0.0, ge=0.0)
     tax_rate: float = Field(default=0.18, ge=0.0, le=1.0)
+
+    @property
+    def desc(self) -> str:
+        return (self.item_description or self.description or "Standard Line Item").strip()
+
+
+def _format_money(val: Any) -> str:
+    if val is None:
+        return "0.00"
+    return f"{Decimal(str(val)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
 
 
 class OrderCreate(BaseModel):
@@ -103,15 +114,16 @@ def _serialize_order(po: PurchaseOrder, customer: Optional[Customer] = None, exe
             "po_id": it.po_id,
             "description": it.item_description,
             "quantity": float(it.quantity),
-            "unit_price": float(it.unit_price),
-            "tax_rate": float(it.tax_rate),
-            "tax_amount": float(it.tax_amount),
-            "total_amount": float(it.total_amount),
+            "unit_price": _format_money(it.unit_price),
+            "exclusive_amount": _format_money(it.exclusive_amount),
+            "tax_rate": f"{Decimal(str(it.tax_rate)):.4f}",
+            "tax_amount": _format_money(it.tax_amount),
+            "total_amount": _format_money(it.total_amount),
         }
         for it in (po.items or [])
     ]
 
-    total_amt = float(po.total_amount)
+    total_amt_dec = Decimal(str(po.total_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     is_unbilled = po.status == "UNBILLED"
 
     return {
@@ -129,11 +141,12 @@ def _serialize_order(po: PurchaseOrder, customer: Optional[Customer] = None, exe
         "executive_name": e_name,
         "currency": po.currency,
         "exchange_rate": float(po.exchange_rate),
-        "original_amount": float(po.exclusive_amount),
-        "exclusive_amount": float(po.exclusive_amount),
-        "tax_rate": float(po.tax_rate),
-        "tax_amount": float(po.tax_amount),
-        "total_amount": total_amt,
+        "original_amount": _format_money(po.exclusive_amount),
+        "exclusive_amount": _format_money(po.exclusive_amount),
+        "tax_rate": f"{Decimal(str(po.tax_rate)):.4f}",
+        "tax_amount": _format_money(po.tax_amount),
+        "total_amount": f"{total_amt_dec:.2f}",
+        "unbilled_amount": f"{total_amt_dec:.2f}" if is_unbilled else "0.00",
         "invoice_number": None,
         "invoice_date": None,
         "due_date": None,
@@ -141,10 +154,11 @@ def _serialize_order(po: PurchaseOrder, customer: Optional[Customer] = None, exe
         "status": po.status,
         "computed_status": "UNBILLED" if is_unbilled else po.status,
         "payment_status": "PENDING",
-        "total_cash_paid": 0.0,
-        "total_tds_deducted": 0.0,
-        "total_paid": 0.0,
-        "outstanding_balance": total_amt if is_unbilled else 0.0,
+        "total_cash_paid": "0.00",
+        "total_tds_deducted": "0.00",
+        "total_paid": "0.00",
+        "outstanding_balance": "0.00",
+        "recognized_ar": "0.00",
         "line_items": line_items,
         "payments": [],
         "created_at": po.created_at.isoformat() if po.created_at else None,
@@ -313,7 +327,7 @@ def create_order(item: OrderCreate, user: dict = Depends(require_sales_finance_a
 
             db_items.append(
                 PurchaseOrderItem(
-                    item_description=ri.item_description,
+                    item_description=ri.desc,
                     quantity=qty,
                     unit_price=price,
                     exclusive_amount=excl,
@@ -325,6 +339,31 @@ def create_order(item: OrderCreate, user: dict = Depends(require_sales_finance_a
 
         total_amount = total_excl + total_tax
         primary_tax_rate = db_items[0].tax_rate if db_items else Decimal("0.1800")
+
+        # CF4C3-01: Inconsistency checks against caller-supplied amounts
+        if item.exclusive_amount is not None:
+            supplied_excl = Decimal(str(item.exclusive_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if abs(supplied_excl - total_excl) > Decimal("0.01"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Supplied exclusive_amount ({supplied_excl}) is inconsistent with line-item total ({total_excl})",
+                )
+
+        if item.tax_amount is not None:
+            supplied_tax = Decimal(str(item.tax_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if abs(supplied_tax - total_tax) > Decimal("0.01"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Supplied tax_amount ({supplied_tax}) is inconsistent with calculated line-item tax ({total_tax})",
+                )
+
+        if item.total_amount is not None:
+            supplied_total = Decimal(str(item.total_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if abs(supplied_total - total_amount) > Decimal("0.01"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Supplied total_amount ({supplied_total}) is inconsistent with calculated line-item total ({total_amount})",
+                )
 
         # 6. Instantiate & persist PurchaseOrder
         new_po = PurchaseOrder(
@@ -462,7 +501,7 @@ def update_order(id: int, item: OrderUpdate, user: dict = Depends(require_sales_
 
                     po.items.append(
                         PurchaseOrderItem(
-                            item_description=ri.item_description,
+                            item_description=ri.desc,
                             quantity=qty,
                             unit_price=price,
                             exclusive_amount=excl,
@@ -562,6 +601,11 @@ def convert_order_to_invoice(id: int, item: OrderConvert, user: dict = Depends(r
 
         # 3. Check fiscal year date boundaries
         inv_date_str = item.invoice_date.strip()
+        try:
+            inv_date = datetime.date.fromisoformat(inv_date_str)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid invoice_date format. Must be YYYY-MM-DD")
+
         fy = db.scalar(select(FinancialYear).where(FinancialYear.code == po.fy_code))
         if fy and not is_date_in_fiscal_year(inv_date_str, fy.start_date.isoformat(), fy.end_date.isoformat()):
             raise HTTPException(
@@ -569,10 +613,20 @@ def convert_order_to_invoice(id: int, item: OrderConvert, user: dict = Depends(r
                 detail=f"Invoice date '{inv_date_str}' falls outside financial year '{po.fy_code}' ({fy.start_date} to {fy.end_date})",
             )
 
-        # 4. Due date calculation (Net 30 default)
-        due_date_str = item.due_date.strip() if item.due_date and item.due_date.strip() else calculate_net_30_due_date(inv_date_str)
-        if not due_date_str:
-            due_date_str = inv_date_str
+        # 4. Due date calculation (Net 30 default) and boundary validation
+        if item.due_date and item.due_date.strip():
+            try:
+                due_date_val = datetime.date.fromisoformat(item.due_date.strip())
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid due_date format. Must be YYYY-MM-DD")
+        else:
+            calc_due = calculate_net_30_due_date(inv_date_str)
+            due_date_val = datetime.date.fromisoformat(calc_due)
+
+        if due_date_val < inv_date:
+            raise HTTPException(status_code=400, detail="Due date cannot precede invoice date")
+
+        due_date_str = due_date_val.isoformat()
 
         # 5. Capture immutable customer billing snapshot
         cust = db.scalar(select(Customer).where(Customer.id == po.customer_id))
