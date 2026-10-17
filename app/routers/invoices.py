@@ -1,74 +1,220 @@
-import sqlite3
-from typing import List, Optional
+"""
+Commercial Invoices Domain Router for PostgreSQL Parity.
 
+Provides:
+- List commercial invoices with pagination, search, financial-year and lifecycle/payment status filtering.
+- Retrieve commercial invoice detail with line items and settlement history.
+- Direct commercial invoice creation with immutable customer snapshot and statutory GST split (admin, finance).
+- Edit commercial invoice metadata (remarks, due_date, executive) with row-level locking (admin, finance).
+- Cancel commercial invoice with mandatory reason and settlement protection guard (admin, finance).
+- Permanent deletion rejection protecting issued commercial invoice auditability.
+"""
+
+import datetime
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
+from sqlalchemy import func, or_, select
 
-from app.database import execute_write, log_audit, query_all, query_one, transaction
-from app.routers.auth import get_current_user, require_finance_or_admin
+from app.core.database import get_db_session
+from app.models.domain_models import (
+    CommercialInvoice,
+    CommercialInvoiceItem,
+    Customer,
+    FinancialYear,
+    PaymentTransaction,
+    PurchaseOrder,
+    User,
+)
+from app.routers.auth import (
+    get_current_user,
+    log_security_audit,
+    require_finance_or_admin,
+)
 from app.utils.financial import (
     ALLOWED_CURRENCIES,
-    calculate_invoice_totals,
     calculate_line_item,
     calculate_net_30_due_date,
     is_date_in_fiscal_year,
-    round_currency,
 )
 
 router = APIRouter(prefix="/api/invoices", tags=["Invoices"])
 
 
 class InvoiceItemCreate(BaseModel):
-    description: str
+    description: str = Field(min_length=1, max_length=255)
     quantity: float = Field(default=1.0, gt=0)
     unit_price: float = Field(default=0.0, ge=0.0)
     tax_rate: float = Field(default=0.18, ge=0.0, le=1.0)
-    tax_amount: Optional[float] = None
-    total_amount: Optional[float] = None
 
 
 class InvoiceCreate(BaseModel):
-    fy_code: str
-    order_type: Optional[str] = "PO"  # "PO" or "RECURRING"
-    po_date: Optional[str] = None
-    po_number: Optional[str] = None
+    fy_code: str = Field(min_length=1, max_length=20)
+    invoice_number: str = Field(min_length=1, max_length=50)
+    invoice_date: str  # ISO date string (YYYY-MM-DD)
+    due_date: Optional[str] = None  # Defaults to Net 30 if omitted
     customer_id: int
     executive_id: Optional[int] = None
     executive_name: Optional[str] = None
+    order_type: Optional[str] = "RECURRING"
+    po_number: Optional[str] = None
+    po_date: Optional[str] = None
     currency: Optional[str] = "INR"
     exchange_rate: Optional[float] = Field(default=1.0, gt=0)
-    original_amount: Optional[float] = Field(default=None, ge=0.0)
-    exclusive_amount: float = Field(ge=0.0)
+    exclusive_amount: Optional[float] = None
     tax_rate: Optional[float] = Field(default=0.18, ge=0.0, le=1.0)
-    tax_amount: Optional[float] = Field(default=None, ge=0.0)
-    total_amount: Optional[float] = Field(default=None, ge=0.0)
-    tax_ref: Optional[str] = None
-    invoice_number: Optional[str] = None
-    invoice_date: Optional[str] = None
-    due_date: Optional[str] = None
+    tax_amount: Optional[float] = None
+    total_amount: Optional[float] = None
     remarks: Optional[str] = None
-    items: Optional[List[InvoiceItemCreate]] = []
-
-
-class InvoiceItemUpdate(BaseModel):
-    id: Optional[int] = None
-    description: str
+    items: Optional[List[InvoiceItemCreate]] = None
 
 
 class InvoiceUpdate(BaseModel):
     remarks: Optional[str] = None
-    po_number: Optional[str] = None
-    po_date: Optional[str] = None
     due_date: Optional[str] = None
-    customer_id: Optional[int] = None
     executive_id: Optional[int] = None
-    invoice_number: Optional[str] = None
-    invoice_date: Optional[str] = None
-    items: Optional[List[InvoiceItemUpdate]] = None
 
 
 class InvoiceCancel(BaseModel):
-    reason: Optional[str] = "Operational cancellation / Customer request"
+    reason: str = Field(min_length=3, max_length=500, description="Mandatory reason for statutory cancellation")
+
+
+def _serialize_invoice(
+    inv: CommercialInvoice,
+    settlements: Optional[List[PaymentTransaction]] = None,
+    items: Optional[List[CommercialInvoiceItem]] = None,
+    po: Optional[PurchaseOrder] = None,
+    executive: Optional[User] = None,
+) -> Dict[str, Any]:
+    exec_user = executive or inv.executive
+    e_name = (exec_user.full_name or exec_user.username) if exec_user else None
+
+    # Line items
+    line_items = [
+        {
+            "id": it.id,
+            "invoice_id": it.invoice_id,
+            "description": it.item_description,
+            "quantity": float(it.quantity),
+            "unit_price": float(it.unit_price),
+            "exclusive_amount": float(it.exclusive_amount),
+            "tax_rate": float(it.tax_rate),
+            "tax_amount": float(it.tax_amount),
+            "total_amount": float(it.total_amount),
+        }
+        for it in (items if items is not None else (inv.items or []))
+    ]
+
+    # Settlements
+    txs = settlements if settlements is not None else (inv.settlements or [])
+    payments_list = [
+        {
+            "id": tx.id,
+            "invoice_id": tx.invoice_id,
+            "payment_amount": float(tx.cash_amount),
+            "cash_amount": float(tx.cash_amount),
+            "tds_amount": float(tx.tds_amount),
+            "total_settled": float(tx.total_settled),
+            "tds_section": tx.tds_section,
+            "payment_date": tx.payment_date.isoformat() if tx.payment_date else None,
+            "payment_mode": tx.payment_mode,
+            "remittance_number": tx.remittance_number,
+            "notes": tx.notes,
+            "created_at": tx.created_at.isoformat() if tx.created_at else None,
+        }
+        for tx in txs
+    ]
+
+    # Financial settlement aggregation
+    cash_paid = sum((Decimal(str(tx.cash_amount)) for tx in txs), Decimal("0.00")).quantize(Decimal("0.01"))
+    tds_deducted = sum((Decimal(str(tx.tds_amount)) for tx in txs), Decimal("0.00")).quantize(Decimal("0.01"))
+    total_paid = sum((Decimal(str(tx.total_settled)) for tx in txs), Decimal("0.00")).quantize(Decimal("0.01"))
+
+    inv_total = Decimal(str(inv.total_amount))
+
+    if inv.lifecycle_status == "CANCELLED":
+        outstanding_balance = Decimal("0.00")
+        payment_status = "CANCELLED"
+        computed_status = "CANCELLED"
+    else:
+        outstanding_balance = max(Decimal("0.00"), inv_total - total_paid).quantize(Decimal("0.01"))
+        if total_paid <= Decimal("0.00"):
+            payment_status = "PENDING"
+            if inv.due_date and inv.due_date < datetime.date.today():
+                computed_status = "OVERDUE"
+            else:
+                computed_status = "PENDING"
+        elif total_paid >= inv_total:
+            payment_status = "PAID"
+            computed_status = "PAID"
+        else:
+            payment_status = "PARTIAL"
+            computed_status = "PARTIAL"
+
+    po_num = po.po_number if po else (inv.remarks if inv.po_id is None else None)
+    po_dt = po.po_date.isoformat() if po and po.po_date else None
+
+    return {
+        "id": inv.id,
+        "fy_code": inv.fy_code,
+        "order_type": "PO" if inv.po_id else "RECURRING",
+        "po_id": inv.po_id,
+        "po_number": po_num,
+        "po_date": po_dt,
+        "customer_id": inv.customer_id,
+        "customer_name": inv.snapshot_customer_name,
+        "customer_gstin": inv.snapshot_gstin,
+        "customer_address": inv.snapshot_billing_address,
+        "customer_state": inv.snapshot_state,
+        "executive_id": inv.executive_id,
+        "executive_name": e_name,
+        "currency": inv.currency,
+        "exchange_rate": float(inv.exchange_rate),
+        "original_amount": float(inv.exclusive_amount),
+        "exclusive_amount": float(inv.exclusive_amount),
+        "tax_rate": float(inv.tax_rate),
+        "tax_amount": float(inv.tax_amount),
+        "total_amount": float(inv_total),
+        "invoice_number": inv.invoice_number,
+        "invoice_date": inv.invoice_date.isoformat() if inv.invoice_date else None,
+        "due_date": inv.due_date.isoformat() if inv.due_date else None,
+        "remarks": inv.remarks,
+        "cgst_amount": float(inv.cgst_amount),
+        "sgst_amount": float(inv.sgst_amount),
+        "igst_amount": float(inv.igst_amount),
+        "lifecycle_status": inv.lifecycle_status,
+        "cancellation_reason": inv.cancellation_reason,
+        "cancelled_at": inv.cancelled_at.isoformat() if inv.cancelled_at else None,
+        "cancelled_by": inv.cancelled_by,
+        "payment_status": payment_status,
+        "computed_status": computed_status,
+        "total_cash_paid": float(cash_paid),
+        "total_tds_deducted": float(tds_deducted),
+        "total_paid": float(total_paid),
+        "outstanding_balance": float(outstanding_balance),
+        "line_items": line_items,
+        "payments": payments_list,
+        "created_at": inv.created_at.isoformat() if inv.created_at else None,
+        "updated_at": inv.updated_at.isoformat() if inv.updated_at else None,
+    }
+
+
+def serialize_invoice(
+    inv: CommercialInvoice,
+    customer: Optional[Customer] = None,
+    executive: Optional[User] = None,
+    po: Optional[PurchaseOrder] = None,
+    settlements: Optional[List[PaymentTransaction]] = None,
+    items: Optional[List[CommercialInvoiceItem]] = None,
+) -> Dict[str, Any]:
+    return _serialize_invoice(
+        inv,
+        settlements=settlements,
+        items=items,
+        po=po,
+        executive=executive,
+    )
 
 
 @router.get("")
@@ -78,567 +224,482 @@ def list_invoices(
     search: Optional[str] = None,
     fy: Optional[str] = None,
     status: Optional[str] = None,
+    customer_id: Optional[int] = None,
     executive_id: Optional[int] = None,
     user: dict = Depends(get_current_user),
 ):
-    offset = (page - 1) * limit
-    where_clauses = ["1=1"]
-    params = []
+    """
+    List commercial invoices with pagination, text search, FY filter and settlement-aware status filter.
+    """
+    with get_db_session() as db:
+        query = select(CommercialInvoice)
 
-    if search:
-        search_pattern = f"%{search.strip()}%"
-        where_clauses.append("(po_number LIKE ? OR invoice_number LIKE ? OR customer_name LIKE ?)")
-        params.extend([search_pattern, search_pattern, search_pattern])
+        if search and search.strip():
+            term = f"%{search.strip()}%"
+            query = query.where(
+                or_(
+                    CommercialInvoice.invoice_number.ilike(term),
+                    CommercialInvoice.snapshot_customer_name.ilike(term),
+                )
+            )
 
-    if fy and fy != "ALL":
-        where_clauses.append("fy_code = ?")
-        params.append(fy)
+        if fy and fy.strip() and fy.upper() != "ALL":
+            query = query.where(CommercialInvoice.fy_code == fy.strip())
 
-    if status and status != "ALL":
-        where_clauses.append("computed_status = ?")
-        params.append(status.upper())
+        if customer_id:
+            query = query.where(CommercialInvoice.customer_id == customer_id)
 
-    if executive_id:
-        where_clauses.append("executive_id = ?")
-        params.append(executive_id)
+        if executive_id:
+            query = query.where(CommercialInvoice.executive_id == executive_id)
 
-    where_sql = " AND ".join(where_clauses)
+        # Base ordering: descending id
+        query = query.order_by(CommercialInvoice.id.desc())
 
-    count_query = f"SELECT COUNT(*) as count FROM v_invoice_summary WHERE {where_sql}"  # nosec B608
-    total_count = query_one(count_query, tuple(params))["count"]
+        # Fetch records and associated relationships
+        all_invoices = db.scalars(query).all()
 
-    data_query = f"""
-    SELECT * FROM v_invoice_summary
-    WHERE {where_sql}
-    ORDER BY id DESC
-    LIMIT ? OFFSET ?;
-    """  # nosec B608
-    params.extend([limit, offset])
-    rows = query_all(data_query, tuple(params))
+        # In-memory settlement calculation and status filtering
+        serialized_records = []
+        for inv in all_invoices:
+            # Load settlements, items, po, executive
+            settlements = db.scalars(
+                select(PaymentTransaction).where(PaymentTransaction.invoice_id == inv.id).order_by(PaymentTransaction.payment_date.asc())
+            ).all()
+            items = db.scalars(
+                select(CommercialInvoiceItem).where(CommercialInvoiceItem.invoice_id == inv.id).order_by(CommercialInvoiceItem.id.asc())
+            ).all()
+            po = db.scalar(select(PurchaseOrder).where(PurchaseOrder.id == inv.po_id)) if inv.po_id else None
+            executive = db.scalar(select(User).where(User.id == inv.executive_id))
 
-    return {
-        "page": page,
-        "limit": limit,
-        "total": total_count,
-        "total_pages": (total_count + limit - 1) // limit,
-        "data": rows,
-    }
+            ser = _serialize_invoice(inv, settlements=settlements, items=items, po=po, executive=executive)
+
+            if status and status.strip() and status.upper() != "ALL":
+                st = status.strip().upper()
+                comp_st = ser["computed_status"].upper()
+                pay_st = ser["payment_status"].upper()
+                if st == "CANCELLED" and inv.lifecycle_status != "CANCELLED":
+                    continue
+                elif st in ("PARTIAL", "PARTIALLY_PAID") and comp_st not in ("PARTIAL", "PARTIALLY_PAID"):
+                    continue
+                elif st in ("PAID", "PENDING", "OVERDUE") and comp_st != st and pay_st != st:
+                    continue
+
+            serialized_records.append(ser)
+
+        total_count = len(serialized_records)
+        offset = (page - 1) * limit
+        paginated_data = serialized_records[offset : offset + limit]
+
+        return {
+            "page": page,
+            "limit": limit,
+            "total": total_count,
+            "total_pages": (total_count + limit - 1) // limit if total_count > 0 else 1,
+            "data": paginated_data,
+        }
 
 
 @router.get("/{invoice_id}")
 def get_invoice(invoice_id: int, user: dict = Depends(get_current_user)):
-    invoice = query_one("SELECT * FROM v_invoice_summary WHERE id = ?", (invoice_id,))
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Invoice not found")
+    """Retrieve full commercial invoice detail with line items and settlement ledger."""
+    with get_db_session() as db:
+        inv = db.scalar(select(CommercialInvoice).where(CommercialInvoice.id == invoice_id))
+        if not inv:
+            raise HTTPException(status_code=404, detail="Invoice not found")
 
-    payments = query_all("SELECT * FROM payments WHERE invoice_id = ? ORDER BY payment_date ASC", (invoice_id,))
-    items = query_all("SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY id ASC", (invoice_id,))
-    return {"invoice": invoice, "payments": payments, "items": items}
+        settlements = db.scalars(
+            select(PaymentTransaction).where(PaymentTransaction.invoice_id == inv.id).order_by(PaymentTransaction.payment_date.asc())
+        ).all()
+        items = db.scalars(
+            select(CommercialInvoiceItem).where(CommercialInvoiceItem.invoice_id == inv.id).order_by(CommercialInvoiceItem.id.asc())
+        ).all()
+        po = db.scalar(select(PurchaseOrder).where(PurchaseOrder.id == inv.po_id)) if inv.po_id else None
+        executive = db.scalar(select(User).where(User.id == inv.executive_id))
+
+        ser = _serialize_invoice(inv, settlements=settlements, items=items, po=po, executive=executive)
+
+        return {
+            "invoice": ser,
+            "payments": ser["payments"],
+            "items": ser["line_items"],
+        }
 
 
 @router.post("")
-def create_invoice(item: InvoiceCreate, request: Request, user: dict = Depends(get_current_user)):
-    req_id = getattr(request.state, "request_id", None)
-
-    # Validate customer exists & fetch full details for snapshot
-    cust = query_one(
-        "SELECT id, billing_name, gst_number, billing_address, state FROM customers WHERE id = ?", (item.customer_id,)
-    )
-    if not cust:
-        raise HTTPException(status_code=400, detail="Specified customer does not exist")
-
-    # Validate FY code and invoice date boundary
-    fy_master = query_one("SELECT code, start_date, end_date FROM financial_years WHERE code = ?", (item.fy_code,))
-    if not fy_master:
-        raise HTTPException(status_code=400, detail=f"Financial year '{item.fy_code}' does not exist in master records")
-    target_date = item.invoice_date or item.po_date
-    if target_date and target_date.strip():
-        if not is_date_in_fiscal_year(target_date, fy_master["start_date"], fy_master["end_date"]):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Date '{target_date}' falls outside financial year '{item.fy_code}' ({fy_master['start_date']} to {fy_master['end_date']})",
-            )
-
-    # Validate currency
-    curr = (item.currency or "INR").upper()
-    if curr not in ALLOWED_CURRENCIES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported currency: {curr}. Must be one of {', '.join(sorted(ALLOWED_CURRENCIES))}",
-        )
-
-    # Validate exchange rate
-    rate = float(item.exchange_rate or 1.0)
-    if rate <= 0:
-        raise HTTPException(status_code=400, detail="Exchange rate must be greater than zero")
-    if curr == "INR":
-        rate = 1.0
-
-    # Line items vs manual amounts
-    if item.items and len(item.items) > 0:
-        raw_items = [it.model_dump() if hasattr(it, "model_dump") else it.dict() for it in item.items]
-        calc_excl, calc_tax, calc_tot = calculate_invoice_totals(raw_items)
-        excl = calc_excl
-        tax_amt = calc_tax
-        tot = calc_tot
-        orig = round_currency(excl / rate) if rate > 0 else excl
-    else:
-        if item.original_amount is not None and item.original_amount > 0:
-            orig = round_currency(item.original_amount)
-            excl = round_currency(orig * rate)
-        else:
-            excl = round_currency(item.exclusive_amount)
-            orig = round_currency(excl / rate) if rate > 0 else excl
-
-        t_rate = item.tax_rate if item.tax_rate is not None else 0.18
-        tax_amt = item.tax_amount if item.tax_amount is not None else round_currency(excl * t_rate)
-        tot = item.total_amount if item.total_amount is not None else round_currency(excl + tax_amt)
-
-    # Normalization & duplicate checks
-    po_no = item.po_number
-    if not po_no or not po_no.strip():
-        if (item.order_type or "").upper() == "RECURRING":
-            po_no = "Recurring / Direct Invoice"
-        else:
-            po_no = "No PO"
-    else:
-        po_no = po_no.strip()
-        # Enforce unique PO number if supplied
-        norm_po = po_no.lower()
-        if norm_po not in ("no po", "recurring / direct invoice"):
-            dup_po = query_one("SELECT id FROM invoices WHERE LOWER(TRIM(po_number)) = ?", (norm_po,))
-            if dup_po:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Purchase Order number '{po_no}' is already registered to order #{dup_po['id']}",
-                )
-
-    inv_num = item.invoice_number.strip() if item.invoice_number and item.invoice_number.strip() else None
-    if inv_num:
-        norm_inv = inv_num.lower()
-        dup_inv = query_one("SELECT id FROM invoices WHERE LOWER(TRIM(invoice_number)) = ?", (norm_inv,))
-        if dup_inv:
-            raise HTTPException(
-                status_code=400, detail=f"Invoice number '{inv_num}' is already assigned to record #{dup_inv['id']}"
-            )
-
-    # Auto-resolve executive_id
-    exec_id = item.executive_id
-    if not exec_id and item.executive_name and item.executive_name.strip():
-        ename = item.executive_name.strip()
-        u_row = query_one(
-            "SELECT id FROM users WHERE role = 'sales' AND (LOWER(full_name) = ? OR LOWER(username) = ?)",
-            (ename.lower(), ename.lower()),
-        )
-        if u_row:
-            exec_id = u_row["id"]
-
-    # Validate executive if provided directly
-    if exec_id:
-        u_check = query_one("SELECT id FROM users WHERE id = ? AND role = 'sales'", (exec_id,))
-        if not u_check:
-            raise HTTPException(status_code=400, detail="Assigned executive must be a user with role 'sales'")
-
-    # Net-30 calculation
-    due = item.due_date
-    if not due and item.invoice_date and item.invoice_date.strip():
-        due = calculate_net_30_due_date(item.invoice_date)
-
-    sql = """
-    INSERT INTO invoices (
-        fy_code, order_type, po_date, po_number, customer_id, executive_id,
-        currency, exchange_rate, original_amount,
-        exclusive_amount, tax_rate, tax_amount, total_amount,
-        tax_ref, invoice_number, invoice_date, due_date, remarks,
-        customer_name, customer_gstin, customer_address, customer_state
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
-
-    try:
-        with transaction() as conn:
-            new_id = execute_write(
-                sql,
-                (
-                    item.fy_code,
-                    item.order_type or "PO",
-                    item.po_date,
-                    po_no,
-                    item.customer_id,
-                    exec_id,
-                    curr,
-                    rate,
-                    orig,
-                    excl,
-                    item.tax_rate or 0.18,
-                    tax_amt,
-                    tot,
-                    item.tax_ref,
-                    inv_num,
-                    item.invoice_date or None,
-                    due or None,
-                    item.remarks,
-                    cust["billing_name"],
-                    cust["gst_number"],
-                    cust["billing_address"],
-                    cust["state"],
-                ),
-                conn=conn,
-            )
-
-            # Save multiple line items atomically, or create default single line item
-            if item.items and len(item.items) > 0:
-                for itm in item.items:
-                    i_excl, i_tax, i_tot = calculate_line_item(itm.quantity, itm.unit_price, itm.tax_rate)
-                    execute_write(
-                        """
-                        INSERT INTO invoice_items (invoice_id, description, quantity, unit_price, tax_rate, tax_amount, total_amount)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                        (new_id, itm.description.strip(), itm.quantity, itm.unit_price, itm.tax_rate, i_tax, i_tot),
-                        conn=conn,
-                    )
-            else:
-                execute_write(
-                    """
-                    INSERT INTO invoice_items (invoice_id, description, quantity, unit_price, tax_rate, tax_amount, total_amount)
-                    VALUES (?, ?, 1.0, ?, ?, ?, ?)
-                """,
-                    (new_id, po_no if po_no not in ("No PO", "Recurring / Direct Invoice") else "Standard Line Item", excl, item.tax_rate or 0.18, tax_amt, tot),
-                    conn=conn,
-                )
-
-            log_audit(
-                "INVOICE_CREATED",
-                "INVOICE",
-                new_id,
-                f"Created {item.order_type or 'PO'} #{new_id} ({po_no}) for customer {cust['billing_name']} (Total: INR {tot})",
-                user=user,
-                request_id=req_id,
-                conn=conn,
-            )
-    except sqlite3.IntegrityError as err:
-        err_msg = str(err).lower()
-        if "unique" in err_msg:
-            if "po_number" in err_msg or "unique_po" in err_msg:
-                raise HTTPException(status_code=400, detail=f"Purchase Order number '{po_no}' is already registered")
-            if "invoice_number" in err_msg or "unique_inv" in err_msg:
-                raise HTTPException(status_code=400, detail=f"Invoice number '{inv_num}' is already assigned")
-        raise HTTPException(status_code=400, detail=f"Database constraint error: {err}")
-
-    return {"success": True, "invoice_id": new_id, "message": "Record created successfully"}
-
-
-@router.put("/{order_id}")
-def update_invoice(
-    order_id: int, payload: InvoiceUpdate, request: Request, user: dict = Depends(require_finance_or_admin)
-):
-    """
-    Enforces Invoice Immutability:
-    Financial totals, tax rates, currencies, and line items of issued invoices are permanently immutable.
-    Only internal non-financial remarks can be modified on issued invoices.
-    """
-    req_id = getattr(request.state, "request_id", None)
-    inv = query_one("SELECT * FROM invoices WHERE id = ?", (order_id,))
-    if not inv:
-        raise HTTPException(status_code=404, detail="Order/Invoice not found")
-
-    is_issued = bool(inv["invoice_number"] and inv["invoice_number"].strip())
-
-    with transaction() as conn:
-        new_remarks = payload.remarks if payload.remarks is not None else inv["remarks"]
-        new_due = payload.due_date if payload.due_date is not None else inv["due_date"]
-        new_exec_id = payload.executive_id if payload.executive_id is not None else inv["executive_id"]
-
-        # Validate executive if changed
-        if new_exec_id:
-            u_check = query_one("SELECT id FROM users WHERE id = ? AND role = 'sales'", (new_exec_id,), conn=conn)
-            if not u_check:
-                raise HTTPException(status_code=400, detail="Assigned executive must be a user with role 'sales'")
-
-        if is_issued:
-            # Issued invoice: PO number, PO date, customer cannot be modified
-            if payload.po_number or payload.po_date or payload.customer_id:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Issued invoices are legally immutable. Commercial identifiers and customer cannot be changed.",
-                )
-            execute_write(
-                "UPDATE invoices SET remarks = ?, due_date = ?, executive_id = ?, updated_at = datetime('now') WHERE id = ?",
-                (new_remarks, new_due, new_exec_id, order_id),
-                conn=conn,
-            )
-        else:
-            # Unbilled PO: allow updating PO metadata, customer, executive, and dates before issuance
-            new_po = payload.po_number.strip() if payload.po_number else inv["po_number"]
-            if payload.po_number and new_po and new_po.lower() not in ("no po", "recurring / direct invoice"):
-                dup_po = query_one(
-                    "SELECT id FROM invoices WHERE LOWER(TRIM(po_number)) = LOWER(TRIM(?)) AND id != ?",
-                    (new_po, order_id),
-                    conn=conn,
-                )
-                if dup_po:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Purchase Order number '{new_po}' is already registered to order #{dup_po['id']}",
-                    )
-            new_po_date = payload.po_date if payload.po_date is not None else inv["po_date"]
-            new_cust_id = payload.customer_id if payload.customer_id is not None else inv["customer_id"]
-
-            cust_name = inv["customer_name"]
-            cust_gst = inv["customer_gstin"]
-            cust_addr = inv["customer_address"]
-            cust_state = inv["customer_state"]
-            if payload.customer_id is not None and payload.customer_id != inv["customer_id"]:
-                c_row = query_one(
-                    "SELECT billing_name, gst_number, billing_address, state FROM customers WHERE id = ?",
-                    (payload.customer_id,),
-                    conn=conn,
-                )
-                if not c_row:
-                    raise HTTPException(status_code=400, detail="Selected customer does not exist")
-                cust_name = c_row["billing_name"]
-                cust_gst = c_row["gst_number"]
-                cust_addr = c_row["billing_address"]
-                cust_state = c_row["state"]
-
-            execute_write(
-                """
-                UPDATE invoices
-                SET po_number = ?, po_date = ?, customer_id = ?, executive_id = ?,
-                    customer_name = ?, customer_gstin = ?, customer_address = ?, customer_state = ?,
-                    remarks = ?, due_date = ?, updated_at = datetime('now')
-                WHERE id = ?
-                """,
-                (new_po, new_po_date, new_cust_id, new_exec_id, cust_name, cust_gst, cust_addr, cust_state, new_remarks, new_due, order_id),
-                conn=conn,
-            )
-
-        # Update line item descriptions if provided
-        if payload.items is not None:
-            for itm in payload.items:
-                clean_desc = itm.description.strip()
-                if not clean_desc:
-                    continue
-                if itm.id:
-                    matched = query_one(
-                        "SELECT id FROM invoice_items WHERE id = ? AND invoice_id = ?",
-                        (itm.id, order_id),
-                        conn=conn,
-                    )
-                    if not matched:
-                        raise HTTPException(status_code=400, detail=f"Line item #{itm.id} does not belong to order #{order_id}")
-                    execute_write(
-                        "UPDATE invoice_items SET description = ? WHERE id = ? AND invoice_id = ?",
-                        (clean_desc, itm.id, order_id),
-                        conn=conn,
-                    )
-                else:
-                    # Single item fallback if invoice has exactly one line item
-                    single_item = query_one("SELECT id FROM invoice_items WHERE invoice_id = ?", (order_id,), conn=conn)
-                    if single_item:
-                        execute_write(
-                            "UPDATE invoice_items SET description = ? WHERE id = ? AND invoice_id = ?",
-                            (clean_desc, single_item["id"], order_id),
-                            conn=conn,
-                        )
-
-        log_audit(
-            "INVOICE_UPDATED",
-            "INVOICE",
-            order_id,
-            f"Updated metadata for #{order_id}",
-            user=user,
-            request_id=req_id,
-            conn=conn,
-        )
-
-    return {"success": True, "message": "Invoice updated successfully"}
-
-
-class ConvertToInvoicePayload(BaseModel):
-    invoice_number: str
-    invoice_date: str
-    due_date: Optional[str] = None
-
-
-@router.post("/{order_id}/convert-to-invoice")
-def convert_to_invoice(
-    order_id: int, payload: ConvertToInvoicePayload, request: Request, user: dict = Depends(require_finance_or_admin)
-):
-    req_id = getattr(request.state, "request_id", None)
-    inv_number = payload.invoice_number.strip()
-    if not inv_number:
-        raise HTTPException(status_code=400, detail="Invoice number is required")
-
-    with transaction() as conn:
-        inv = query_one(
-            "SELECT id, fy_code, customer_id, invoice_number, po_number, total_amount, payment_status FROM invoices WHERE id = ?",
-            (order_id,),
-            conn=conn,
-        )
-        if not inv:
-            raise HTTPException(status_code=404, detail="Order not found")
-
-        if inv.get("payment_status") == "CANCELLED":
-            raise HTTPException(status_code=400, detail="Cannot convert a cancelled order to an invoice")
-
-        # Validate invoice date against order's FY
-        fy_master = query_one(
-            "SELECT code, start_date, end_date FROM financial_years WHERE code = ?", (inv["fy_code"],), conn=conn
-        )
-        if fy_master and payload.invoice_date and payload.invoice_date.strip():
-            if not is_date_in_fiscal_year(payload.invoice_date, fy_master["start_date"], fy_master["end_date"]):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invoice date '{payload.invoice_date}' does not fall within financial year '{inv['fy_code']}' ({fy_master['start_date']} to {fy_master['end_date']})",
-                )
-
-        # Prevent duplicate conversion
-        if inv["invoice_number"] and inv["invoice_number"].strip():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Order #{order_id} has already been converted to Invoice #{inv['invoice_number']}",
-            )
-
-        # Prevent duplicate invoice number across the system
-        dup = query_one(
-            "SELECT id FROM invoices WHERE LOWER(TRIM(invoice_number)) = LOWER(TRIM(?)) AND id != ?",
-            (inv_number, order_id),
-            conn=conn,
-        )
-        if dup:
-            raise HTTPException(
-                status_code=400, detail=f"Invoice number '{inv_number}' is already assigned to record #{dup['id']}"
-            )
-
-        due = payload.due_date
-        if not due and payload.invoice_date:
-            due = calculate_net_30_due_date(payload.invoice_date)
-
-        cust = query_one(
-            "SELECT billing_name, gst_number, billing_address, state FROM customers WHERE id = ?",
-            (inv["customer_id"],),
-            conn=conn,
-        )
-        cust_name = cust["billing_name"] if cust else "Unknown Customer"
-        cust_gst = cust["gst_number"] if cust else None
-        cust_addr = cust["billing_address"] if cust else None
-        cust_state = cust["state"] if cust else None
-
-        execute_write(
-            """
-            UPDATE invoices
-            SET invoice_number = ?, invoice_date = ?, due_date = ?,
-                customer_name = COALESCE(customer_name, ?),
-                customer_gstin = COALESCE(customer_gstin, ?),
-                customer_address = COALESCE(customer_address, ?),
-                customer_state = COALESCE(customer_state, ?),
-                updated_at = datetime('now')
-            WHERE id = ?
-        """,
-            (inv_number, payload.invoice_date, due, cust_name, cust_gst, cust_addr, cust_state, order_id),
-            conn=conn,
-        )
-
-        log_audit(
-            "PO_CONVERTED_TO_INVOICE",
-            "INVOICE",
-            order_id,
-            f"Converted PO #{order_id} to Invoice #{inv_number} (Due: {due})",
-            user=user,
-            request_id=req_id,
-            conn=conn,
-        )
-
-    return {"success": True, "message": f"PO #{order_id} converted to Invoice {inv_number}"}
-
-
-@router.post("/{order_id}/cancel")
-def cancel_invoice(
-    order_id: int,
-    payload: Optional[InvoiceCancel] = None,
-    request: Request = None,
+def create_invoice(
+    payload: InvoiceCreate,
+    request: Request,
     user: dict = Depends(require_finance_or_admin),
 ):
+    """
+    Direct Commercial Invoice creation (Finance/Admin).
+    Applies immutable customer snapshot, calculates statutory GST allocation, and enforces FY date boundaries.
+    """
     req_id = getattr(request.state, "request_id", None) if request else None
-    reason = payload.reason if payload and payload.reason else "Operational cancellation"
-    with transaction() as conn:
-        inv = query_one(
-            "SELECT id, invoice_number, po_number, payment_status FROM invoices WHERE id = ?", (order_id,), conn=conn
+
+    with get_db_session() as db:
+        # 1. Validate Customer
+        cust = db.scalar(select(Customer).where(Customer.id == payload.customer_id))
+        if not cust:
+            raise HTTPException(status_code=400, detail="Specified customer does not exist")
+        if not cust.is_active:
+            raise HTTPException(status_code=400, detail="Cannot issue invoice to an inactive customer")
+
+        # 2. Validate Financial Year
+        fy_master = db.scalar(select(FinancialYear).where(FinancialYear.code == payload.fy_code))
+        if not fy_master:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Financial year '{payload.fy_code}' does not exist in master records",
+            )
+        if not fy_master.is_active:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Financial year '{payload.fy_code}' is locked or inactive",
+            )
+
+        # 3. Validate Invoice Date
+        try:
+            inv_date = datetime.date.fromisoformat(payload.invoice_date.strip())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid invoice_date format. Must be YYYY-MM-DD")
+
+        if not is_date_in_fiscal_year(payload.invoice_date, fy_master.start_date.isoformat(), fy_master.end_date.isoformat()):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invoice date '{payload.invoice_date}' falls outside financial year '{payload.fy_code}' ({fy_master.start_date} to {fy_master.end_date})",
+            )
+
+        # 4. Validate Currency & Exchange Rate
+        curr = (payload.currency or "INR").upper().strip()
+        if curr not in ALLOWED_CURRENCIES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported currency: {curr}. Must be one of {', '.join(sorted(ALLOWED_CURRENCIES))}",
+            )
+        rate = Decimal(str(payload.exchange_rate or 1.0))
+        if rate <= 0:
+            raise HTTPException(status_code=400, detail="Exchange rate must be greater than zero")
+        if curr == "INR":
+            rate = Decimal("1.000000")
+
+        # 5. Check Duplicate Invoice Number (case-insensitive)
+        inv_num = payload.invoice_number.strip()
+        dup_inv = db.scalar(select(CommercialInvoice).where(CommercialInvoice.invoice_number.ilike(inv_num)))
+        if dup_inv:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invoice number '{inv_num}' is already assigned to record #{dup_inv.id}",
+            )
+
+        # 6. Resolve Executive
+        exec_id = payload.executive_id
+        if not exec_id and payload.executive_name and payload.executive_name.strip():
+            ename = payload.executive_name.strip().lower()
+            exec_user = db.scalar(
+                select(User).where(
+                    User.role == "sales",
+                    or_(func.lower(User.full_name) == ename, func.lower(User.username) == ename),
+                )
+            )
+            if exec_user:
+                exec_id = exec_user.id
+
+        if exec_id:
+            exec_check = db.scalar(select(User).where(User.id == exec_id, User.role == "sales"))
+            if not exec_check:
+                raise HTTPException(status_code=400, detail="Assigned executive must be an active sales executive")
+        else:
+            # Default to current user if not specified
+            exec_id = user["id"]
+
+        # 7. Calculate Due Date (Net-30 default)
+        if payload.due_date and payload.due_date.strip():
+            try:
+                due_date_val = datetime.date.fromisoformat(payload.due_date.strip())
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid due_date format. Must be YYYY-MM-DD")
+        else:
+            calc_due = calculate_net_30_due_date(payload.invoice_date)
+            due_date_val = datetime.date.fromisoformat(calc_due)
+
+        if due_date_val < inv_date:
+            raise HTTPException(status_code=400, detail="Due date cannot precede invoice date")
+
+        # 8. Calculate Line Items & Financial Totals
+        computed_items = []
+        total_excl = Decimal("0.00")
+        total_tax = Decimal("0.00")
+
+        if payload.items and len(payload.items) > 0:
+            for item in payload.items:
+                i_excl, i_tax, i_tot = calculate_line_item(item.quantity, item.unit_price, item.tax_rate)
+                d_excl = Decimal(str(i_excl)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                d_tax = Decimal(str(i_tax)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                d_tot = (d_excl + d_tax).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+                computed_items.append({
+                    "description": item.description.strip(),
+                    "quantity": Decimal(str(item.quantity)),
+                    "unit_price": Decimal(str(item.unit_price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                    "exclusive_amount": d_excl,
+                    "tax_rate": Decimal(str(item.tax_rate)),
+                    "tax_amount": d_tax,
+                    "total_amount": d_tot,
+                })
+                total_excl += d_excl
+                total_tax += d_tax
+            inv_tax_rate = Decimal(str(payload.tax_rate or 0.18))
+        else:
+            if payload.exclusive_amount is None:
+                raise HTTPException(status_code=400, detail="Either line items or exclusive_amount must be provided")
+            d_excl = Decimal(str(payload.exclusive_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            inv_tax_rate = Decimal(str(payload.tax_rate or 0.18))
+            if payload.tax_amount is not None:
+                d_tax = Decimal(str(payload.tax_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            else:
+                d_tax = (d_excl * inv_tax_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            d_tot = (d_excl + d_tax).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+            computed_items.append({
+                "description": payload.remarks or "Standard Line Item",
+                "quantity": Decimal("1.0000"),
+                "unit_price": d_excl,
+                "exclusive_amount": d_excl,
+                "tax_rate": inv_tax_rate,
+                "tax_amount": d_tax,
+                "total_amount": d_tot,
+            })
+            total_excl = d_excl
+            total_tax = d_tax
+
+        total_amount_val = total_excl + total_tax
+
+        # 9. Immutable Customer Snapshot
+        snapshot_name = cust.billing_name
+        snapshot_gstin = cust.gst_number
+        snapshot_addr = cust.billing_address or "Address on file"
+        snapshot_state = cust.state or "Karnataka"
+
+        # 10. Statutory GST Allocation (CGST/SGST vs IGST)
+        is_intra = snapshot_state.strip().lower() in ("karnataka", "ka", "29")
+        if is_intra:
+            cgst = (total_tax / Decimal("2")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            sgst = (total_tax - cgst).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            igst = Decimal("0.00")
+        else:
+            cgst = Decimal("0.00")
+            sgst = Decimal("0.00")
+            igst = total_tax
+
+        # 11. Create CommercialInvoice
+        new_inv = CommercialInvoice(
+            po_id=None,
+            fy_code=payload.fy_code,
+            customer_id=cust.id,
+            executive_id=exec_id,
+            invoice_number=inv_num,
+            invoice_date=inv_date,
+            due_date=due_date_val,
+            currency=curr,
+            exchange_rate=rate,
+            exclusive_amount=total_excl,
+            tax_rate=inv_tax_rate,
+            tax_amount=total_tax,
+            total_amount=total_amount_val,
+            snapshot_customer_name=snapshot_name,
+            snapshot_gstin=snapshot_gstin,
+            snapshot_billing_address=snapshot_addr,
+            snapshot_state=snapshot_state,
+            cgst_amount=cgst,
+            sgst_amount=sgst,
+            igst_amount=igst,
+            lifecycle_status="ISSUED",
+            remarks=payload.remarks,
+        )
+        db.add(new_inv)
+        db.flush()
+
+        # 12. Create CommercialInvoiceItems
+        for itm in computed_items:
+            db_item = CommercialInvoiceItem(
+                invoice_id=new_inv.id,
+                item_description=itm["description"],
+                quantity=itm["quantity"],
+                unit_price=itm["unit_price"],
+                exclusive_amount=itm["exclusive_amount"],
+                tax_rate=itm["tax_rate"],
+                tax_amount=itm["tax_amount"],
+                total_amount=itm["total_amount"],
+            )
+            db.add(db_item)
+        db.flush()
+
+        # 13. Atomic Security Audit Log
+        log_security_audit(
+            "COMMERCIAL_INVOICE_CREATED",
+            "COMMERCIAL_INVOICE",
+            str(new_inv.id),
+            user_id=user["id"],
+            username=user["username"],
+            details={
+                "invoice_number": inv_num,
+                "customer_id": cust.id,
+                "total_amount": float(total_amount_val),
+                "cgst_amount": float(cgst),
+                "sgst_amount": float(sgst),
+                "igst_amount": float(igst),
+            },
+            request_id=req_id,
+            db=db,
+        )
+        db.commit()
+
+        return {
+            "success": True,
+            "id": new_inv.id,
+            "invoice_number": inv_num,
+            "message": f"Invoice #{inv_num} created successfully",
+        }
+
+
+@router.put("/{invoice_id}")
+def update_invoice_metadata(
+    invoice_id: int,
+    payload: InvoiceUpdate,
+    request: Request,
+    user: dict = Depends(require_finance_or_admin),
+):
+    """
+    Update non-financial metadata on an issued invoice (remarks, due_date, executive_id).
+    Financial amounts, customer snapshot, line items and GST splits are immutable.
+    """
+    req_id = getattr(request.state, "request_id", None) if request else None
+
+    with get_db_session() as db:
+        inv = db.scalar(
+            select(CommercialInvoice).where(CommercialInvoice.id == invoice_id).with_for_update()
         )
         if not inv:
             raise HTTPException(status_code=404, detail="Invoice not found")
 
-        if inv["payment_status"] == "CANCELLED":
-            raise HTTPException(status_code=400, detail="Invoice is already cancelled")
+        if inv.lifecycle_status == "CANCELLED":
+            raise HTTPException(status_code=400, detail="Cannot edit metadata of a cancelled invoice")
 
-        pay_count = query_one("SELECT COUNT(*) as count FROM payments WHERE invoice_id = ?", (order_id,), conn=conn)[
-            "count"
-        ]
-        if pay_count > 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Cannot cancel invoice with existing payments. All payments must be deleted/reversed first.",
-            )
+        changes = {}
 
-        execute_write(
-            "UPDATE invoices SET payment_status = 'CANCELLED', remarks = ?, updated_at = datetime('now') WHERE id = ?",
-            (f"[CANCELLED: {reason}]", order_id),
-            conn=conn,
-        )
-        log_audit(
-            "INVOICE_CANCELLED",
-            "INVOICE",
-            order_id,
-            f"Cancelled invoice #{order_id} ({inv['invoice_number'] or inv['po_number']}). Reason: {reason}",
-            user=user,
+        if payload.remarks is not None:
+            changes["remarks"] = {"old": inv.remarks, "new": payload.remarks}
+            inv.remarks = payload.remarks
+
+        if payload.due_date is not None:
+            try:
+                new_due = datetime.date.fromisoformat(payload.due_date.strip())
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid due_date format. Must be YYYY-MM-DD")
+            if new_due < inv.invoice_date:
+                raise HTTPException(status_code=400, detail="Due date cannot precede invoice date")
+            changes["due_date"] = {"old": inv.due_date.isoformat(), "new": payload.due_date}
+            inv.due_date = new_due
+
+        if payload.executive_id is not None:
+            exec_check = db.scalar(select(User).where(User.id == payload.executive_id, User.role == "sales"))
+            if not exec_check:
+                raise HTTPException(status_code=400, detail="Assigned executive must be a sales executive")
+            changes["executive_id"] = {"old": inv.executive_id, "new": payload.executive_id}
+            inv.executive_id = payload.executive_id
+
+        inv.updated_at = datetime.datetime.now(datetime.timezone.utc)
+        db.flush()
+
+        log_security_audit(
+            "COMMERCIAL_INVOICE_METADATA_UPDATED",
+            "COMMERCIAL_INVOICE",
+            str(inv.id),
+            user_id=user["id"],
+            username=user["username"],
+            details={"changes": changes},
             request_id=req_id,
-            conn=conn,
+            db=db,
         )
-    return {"success": True, "message": f"Invoice #{order_id} successfully cancelled"}
+        db.commit()
+
+        return {"success": True, "message": f"Invoice #{inv.invoice_number} metadata updated successfully"}
 
 
-@router.delete("/{order_id}")
-def delete_invoice(order_id: int, request: Request, user: dict = Depends(require_finance_or_admin)):
-    req_id = getattr(request.state, "request_id", None)
-    with transaction() as conn:
-        inv = query_one(
-            "SELECT id, po_number, invoice_number, total_amount, payment_status FROM invoices WHERE id = ?",
-            (order_id,),
-            conn=conn,
+@router.post("/{invoice_id}/cancel")
+def cancel_invoice(
+    invoice_id: int,
+    payload: InvoiceCancel,
+    request: Request,
+    user: dict = Depends(require_finance_or_admin),
+):
+    """
+    Statutory Invoice Cancellation (Finance/Admin).
+    Enforces row lock, mandatory reason, and settlement guard (zero recorded payment settlements).
+    """
+    req_id = getattr(request.state, "request_id", None) if request else None
+
+    with get_db_session() as db:
+        inv = db.scalar(
+            select(CommercialInvoice).where(CommercialInvoice.id == invoice_id).with_for_update()
         )
         if not inv:
-            raise HTTPException(status_code=404, detail="Order/Invoice not found")
+            raise HTTPException(status_code=404, detail="Invoice not found")
 
-        pay_count = query_one("SELECT COUNT(*) as count FROM payments WHERE invoice_id = ?", (order_id,), conn=conn)[
-            "count"
-        ]
-        if pay_count > 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Cannot delete invoice with existing payment records. Reversal/credit note required to preserve financial audit history.",
-            )
+        if inv.lifecycle_status == "CANCELLED":
+            raise HTTPException(status_code=400, detail="Invoice is already cancelled")
 
-        # Protect issued invoices from physical deletion: require cancellation workflow
-        if inv["invoice_number"] and inv["invoice_number"].strip():
-            raise HTTPException(
-                status_code=400,
-                detail="Issued commercial invoices cannot be permanently deleted. Use the cancellation workflow (POST /api/invoices/{id}/cancel) instead.",
-            )
-
-        label = inv["po_number"] or f"#{order_id}"
-
-        execute_write("DELETE FROM invoice_items WHERE invoice_id = ?", (order_id,), conn=conn)
-        execute_write("DELETE FROM invoices WHERE id = ?", (order_id,), conn=conn)
-
-        log_audit(
-            "INVOICE_DELETED",
-            "INVOICE",
-            order_id,
-            f"Deleted unbilled PO {label} (Total: {inv['total_amount']})",
-            user=user,
-            request_id=req_id,
-            conn=conn,
+        # Settlement guard: check if any payments or settlements are recorded
+        settlement_count = db.scalar(
+            select(func.count(PaymentTransaction.id)).where(PaymentTransaction.invoice_id == invoice_id)
         )
+        if settlement_count and settlement_count > 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot cancel invoice with recorded settlements. Settlements must be reversed or cleared first.",
+            )
 
-    return {"success": True, "message": f"Record {label} deleted successfully"}
+        inv.lifecycle_status = "CANCELLED"
+        inv.cancellation_reason = payload.reason.strip()
+        inv.cancelled_at = datetime.datetime.now(datetime.timezone.utc)
+        inv.cancelled_by = user["id"]
+        inv.remarks = f"{inv.remarks}\n[CANCELLED: {payload.reason.strip()}]" if inv.remarks else f"[CANCELLED: {payload.reason.strip()}]"
+        inv.updated_at = datetime.datetime.now(datetime.timezone.utc)
+        db.flush()
+
+        log_security_audit(
+            "COMMERCIAL_INVOICE_CANCELLED",
+            "COMMERCIAL_INVOICE",
+            str(inv.id),
+            user_id=user["id"],
+            username=user["username"],
+            details={
+                "invoice_number": inv.invoice_number,
+                "reason": payload.reason.strip(),
+            },
+            request_id=req_id,
+            db=db,
+        )
+        db.commit()
+
+        return {
+            "success": True,
+            "message": f"Invoice #{inv.invoice_number} successfully cancelled",
+            "lifecycle_status": "CANCELLED",
+        }
+
+
+@router.delete("/{invoice_id}")
+def delete_invoice(
+    invoice_id: int,
+    user: dict = Depends(require_finance_or_admin),
+):
+    """
+    Physical deletion of issued commercial invoices is strictly prohibited.
+    Statutory accounting standards require cancellation workflow.
+    """
+    raise HTTPException(
+        status_code=400,
+        detail="Issued commercial invoices cannot be permanently deleted. Use the cancellation workflow (POST /api/invoices/{id}/cancel) instead.",
+    )
