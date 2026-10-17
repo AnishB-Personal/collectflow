@@ -218,4 +218,10 @@ def upsert_sales_target(
         db.commit()
         db.refresh(target_record)
 
-        return _serialize_target(target_record, target_user)
+        serialized = _serialize_target(target_record, target_user)
+        return {
+            "success": True,
+            "message": f"Sales target for {target_user.full_name or target_user.username} ({fy_code}) successfully configured.",
+            "target": serialized,
+            **serialized,
+        }

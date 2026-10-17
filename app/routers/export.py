@@ -25,7 +25,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
-from sqlalchemy import select
+from pydantic import BaseModel
+from sqlalchemy import func, or_, select
 
 from app.core.database import get_db_session
 from app.models.domain_models import (
@@ -43,6 +44,12 @@ router = APIRouter(prefix="/api/export", tags=["Export"])
 
 EXCEL_HEADER_FILL = "1F4E79"
 EXCEL_CURRENCY_FORMAT = '"₹"#,##0.00'
+
+
+class ExportTokenRequest(BaseModel):
+    format: Optional[str] = None
+    fy: Optional[str] = None
+    scope: Optional[str] = None
 
 AUTHORITATIVE_COLUMNS = [
     "FY",
@@ -87,20 +94,26 @@ def sanitize_formula_injection(val: Any) -> Any:
 @router.post("/token")
 def create_export_token(
     request: Request,
+    payload: Optional[ExportTokenRequest] = None,
     user: dict = Depends(require_finance_or_admin),
 ):
     """
     Generate a short-lived, single-use export ticket:
     - Admin and finance only.
     - 256 bits CSPRNG entropy.
+    - Bound to format, FY, and scope.
     - Stored as SHA-256 hash in export_tickets table (raw secret never stored or logged).
     - Expires in 5 minutes (300 seconds).
-    - Atomically consumed on download.
+    - Atomically consumed on download under PostgreSQL row lock.
     """
     ticket_secret = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(ticket_secret.encode("utf-8")).hexdigest()
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     expires_at = now_utc + datetime.timedelta(minutes=5)
+
+    req_format = payload.format.lower().strip() if payload and payload.format else None
+    req_fy = payload.fy.strip() if payload and payload.fy else None
+    req_scope = payload.scope.lower().strip() if payload and payload.scope else None
 
     with get_db_session() as db:
         ticket_record = ExportTicket(
@@ -109,6 +122,9 @@ def create_export_token(
             created_at=now_utc,
             expires_at=expires_at,
             used=False,
+            format=req_format,
+            fy_code=req_fy,
+            scope=req_scope,
         )
         db.add(ticket_record)
 
@@ -122,6 +138,9 @@ def create_export_token(
                 "expires_in": 300,
                 "issued_to": user["username"],
                 "role": user["role"],
+                "format": req_format,
+                "fy": req_fy,
+                "scope": req_scope,
             },
             ip_address=request.client.host if request.client else None,
             request_id=getattr(request.state, "request_id", None),
@@ -129,7 +148,15 @@ def create_export_token(
         db.add(audit_entry)
         db.commit()
 
-    return {"ticket": ticket_secret, "token": ticket_secret, "expires_in": 300}
+    return {
+        "ticket": ticket_secret,
+        "token": ticket_secret,
+        "expires_in": 300,
+        "expires_at": expires_at.isoformat(),
+        "format": req_format,
+        "fy": req_fy,
+        "scope": req_scope,
+    }
 
 
 def authenticate_and_consume_export_ticket(
@@ -138,21 +165,18 @@ def authenticate_and_consume_export_ticket(
     authorization: Optional[str] = Header(None),
 ) -> dict:
     """
-    Authenticates export requests via:
-    1. Direct Bearer Authorization header (Admin or Finance).
-    2. Single-use short-lived ticket (atomic consumption under row lock).
+    Authenticates export requests:
+    - If a single-use ticket is provided, it is strictly validated, checked against bindings
+      (format, fy, scope, user), and atomically consumed under PostgreSQL row lock (SELECT FOR UPDATE).
+    - Bearer authorization headers CANNOT bypass ticket consumption when downloading with a ticket.
+    - If ticket is omitted, direct Bearer header is permitted only for programmatic admin/finance access.
     """
-    # 1. Direct Bearer header authentication
-    if authorization and authorization.startswith("Bearer "):
-        user = get_current_user(authorization=authorization, bearer_creds=None)
-        if user.get("role") not in ("admin", "finance"):
-            raise HTTPException(
-                status_code=403,
-                detail="Export generation requires admin or finance privileges.",
-            )
-        return user
+    req_path = request.url.path.lower()
+    req_format = "excel" if "excel" in req_path else "csv" if "csv" in req_path else None
+    req_fy = request.query_params.get("fy")
+    req_scope = request.query_params.get("scope")
 
-    # 2. Single-use export ticket
+    # When ticket is provided, strict validation & atomic consumption is mandatory
     if ticket and ticket.strip():
         token_hash = hashlib.sha256(ticket.strip().encode("utf-8")).hexdigest()
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -187,9 +211,6 @@ def authenticate_and_consume_export_ticket(
                     detail="Invalid, expired, or already consumed export ticket.",
                 )
 
-            # Atomically mark as consumed
-            ticket_row.used = True
-
             owner = db.query(User).filter(User.id == ticket_row.user_id).first()
             if not owner or owner.role not in ("admin", "finance"):
                 raise HTTPException(
@@ -197,13 +218,55 @@ def authenticate_and_consume_export_ticket(
                     detail="Export generation requires admin or finance privileges.",
                 )
 
+            # User binding: If Bearer header is present, ensure caller matches ticket owner
+            if authorization and authorization.startswith("Bearer "):
+                bearer_user = get_current_user(authorization=authorization, bearer_creds=None)
+                if bearer_user.get("id") != ticket_row.user_id:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Export ticket was issued to a different user.",
+                    )
+
+            # Format binding check
+            if ticket_row.format and req_format:
+                if ticket_row.format.lower() != req_format.lower():
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Export ticket is bound to format '{ticket_row.format}', cannot download as '{req_format}'.",
+                    )
+
+            # FY binding check
+            if ticket_row.fy_code and ticket_row.fy_code.upper() not in ("ALL", "ALL FY"):
+                if req_fy and req_fy.upper() not in ("ALL", "ALL FY") and req_fy.upper() != ticket_row.fy_code.upper():
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Export ticket is bound to financial year '{ticket_row.fy_code}'.",
+                    )
+
+            # Scope binding check
+            if ticket_row.scope and ticket_row.scope.lower() not in ("all", ""):
+                if req_scope and req_scope.lower() not in ("all", "") and req_scope.lower() != ticket_row.scope.lower():
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Export ticket is bound to scope '{ticket_row.scope}'.",
+                    )
+
+            # Atomically mark as consumed under row lock
+            ticket_row.used = True
+
             audit_entry = AuditLog(
                 user_id=owner.id,
                 username=owner.username,
                 action="EXPORT_DOWNLOAD_COMPLETED",
                 entity_type="export_ticket",
                 entity_id=token_hash[:16],
-                details={"download_by": owner.username, "role": owner.role},
+                details={
+                    "download_by": owner.username,
+                    "role": owner.role,
+                    "format": req_format,
+                    "fy": req_fy,
+                    "scope": req_scope,
+                },
                 ip_address=request.client.host if request.client else None,
                 request_id=getattr(request.state, "request_id", None),
             )
@@ -216,6 +279,16 @@ def authenticate_and_consume_export_ticket(
                 "role": owner.role,
                 "full_name": owner.full_name,
             }
+
+    # Direct Bearer header fallback (when ticket is explicitly not provided)
+    if authorization and authorization.startswith("Bearer "):
+        user = get_current_user(authorization=authorization, bearer_creds=None)
+        if user.get("role") not in ("admin", "finance"):
+            raise HTTPException(
+                status_code=403,
+                detail="Export generation requires admin or finance privileges.",
+            )
+        return user
 
     raise HTTPException(
         status_code=401,
@@ -238,8 +311,10 @@ def _compile_export_records(
     records: List[Dict[str, Any]] = []
 
     with get_db_session() as db:
-        # Preload settlements
+        # Preload settlements as of ref_date
         pay_stmt = select(PaymentTransaction)
+        if as_of_date:
+            pay_stmt = pay_stmt.where(PaymentTransaction.payment_date <= ref_date)
         all_payments = db.execute(pay_stmt).scalars().all()
         invoice_settlements: Dict[int, Dict[str, Decimal]] = {}
         for p in all_payments:
@@ -256,22 +331,40 @@ def _compile_export_records(
 
         # 1. Commercial Invoices
         inv_stmt = (
-            select(CommercialInvoice, Customer, User)
+            select(CommercialInvoice, Customer, User, PurchaseOrder)
             .join(Customer, CommercialInvoice.customer_id == Customer.id)
             .join(User, CommercialInvoice.executive_id == User.id)
+            .outerjoin(PurchaseOrder, CommercialInvoice.po_id == PurchaseOrder.id)
             .order_by(CommercialInvoice.id.desc())
         )
         if fy and fy.upper() not in ("ALL", "ALL FY"):
             inv_stmt = inv_stmt.where(CommercialInvoice.fy_code == fy)
 
+        if as_of_date:
+            inv_stmt = inv_stmt.where(
+                CommercialInvoice.invoice_date <= ref_date,
+                or_(
+                    CommercialInvoice.lifecycle_status == "ISSUED",
+                    (CommercialInvoice.lifecycle_status == "CANCELLED")
+                    & (func.date(CommercialInvoice.cancelled_at) > ref_date),
+                ),
+            )
+
         inv_rows = db.execute(inv_stmt).all()
 
-        for inv, cust, exec_user in inv_rows:
+        for inv, cust, exec_user, po in inv_rows:
             st = invoice_settlements.get(
                 inv.id,
                 {"cash": Decimal("0.00"), "tds": Decimal("0.00"), "total": Decimal("0.00")},
             )
-            is_cancelled = inv.lifecycle_status == "CANCELLED"
+
+            # Cancellation status as of ref_date
+            if as_of_date and inv.lifecycle_status == "CANCELLED":
+                canc_dt = inv.cancelled_at.date() if inv.cancelled_at else None
+                is_cancelled = canc_dt is not None and canc_dt <= ref_date
+            else:
+                is_cancelled = inv.lifecycle_status == "CANCELLED"
+
             tot_amt = Decimal("0.00") if is_cancelled else _quantize_2dec(inv.total_amount)
             excl_amt = Decimal("0.00") if is_cancelled else _quantize_2dec(inv.exclusive_amount)
             tax_amt = Decimal("0.00") if is_cancelled else _quantize_2dec(inv.tax_amount)
@@ -294,19 +387,20 @@ def _compile_export_records(
                 else "PENDING"
             )
 
-            po_number = f"PO-{inv.id}"
+            po_number = po.po_number if (po and po.po_number) else "—"
+            po_date_str = str(po.po_date) if (po and po.po_date) else str(inv.invoice_date)
 
             records.append(
                 {
-                    "FY": inv.fy_code,
-                    "PO Date": str(inv.invoice_date),
-                    "PO Number": po_number,
-                    "Customer Name": cust.billing_name,
-                    "Executive": exec_user.full_name or exec_user.username,
+                    "FY": sanitize_formula_injection(inv.fy_code),
+                    "PO Date": str(po_date_str),
+                    "PO Number": sanitize_formula_injection(po_number),
+                    "Customer Name": sanitize_formula_injection(cust.billing_name),
+                    "Executive": sanitize_formula_injection(exec_user.full_name or exec_user.username),
                     "Exclusive Amount (₹)": float(excl_amt),
                     "Tax Amount (₹)": float(tax_amt),
                     "Total Invoiced (₹)": float(tot_amt),
-                    "Invoice Number": inv.invoice_number,
+                    "Invoice Number": sanitize_formula_injection(inv.invoice_number),
                     "Invoice Date": str(inv.invoice_date),
                     "Due Date": str(inv.due_date),
                     "Cash Received (₹)": float(st["cash"]),
@@ -329,17 +423,19 @@ def _compile_export_records(
             )
             if fy and fy.upper() not in ("ALL", "ALL FY"):
                 po_stmt = po_stmt.where(PurchaseOrder.fy_code == fy)
+            if as_of_date:
+                po_stmt = po_stmt.where(PurchaseOrder.po_date <= ref_date)
 
             po_rows = db.execute(po_stmt).all()
 
             for po, cust, exec_user in po_rows:
                 records.append(
                     {
-                        "FY": po.fy_code,
+                        "FY": sanitize_formula_injection(po.fy_code),
                         "PO Date": str(po.po_date),
-                        "PO Number": po.po_number,
-                        "Customer Name": cust.billing_name,
-                        "Executive": exec_user.full_name or exec_user.username,
+                        "PO Number": sanitize_formula_injection(po.po_number),
+                        "Customer Name": sanitize_formula_injection(cust.billing_name),
+                        "Executive": sanitize_formula_injection(exec_user.full_name or exec_user.username),
                         "Exclusive Amount (₹)": float(_quantize_2dec(po.exclusive_amount)),
                         "Tax Amount (₹)": float(_quantize_2dec(po.tax_amount)),
                         "Total Invoiced (₹)": 0.00,  # Unbilled PO has 0 recognized invoiced value

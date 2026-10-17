@@ -254,6 +254,7 @@ class CommercialInvoice(Base):
 
     customer = relationship("Customer")
     executive = relationship("User", foreign_keys=[executive_id])
+    po = relationship("PurchaseOrder")
     items = relationship("CommercialInvoiceItem", back_populates="invoice", cascade="all, delete-orphan")
     settlements = relationship("PaymentTransaction", back_populates="invoice")
 
@@ -386,6 +387,9 @@ class ExportTicket(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     used = Column(Boolean, nullable=False, default=False)
+    format = Column(String(20), nullable=True)
+    fy_code = Column(String(20), nullable=True)
+    scope = Column(String(20), nullable=True)
 
     __table_args__ = (
         Index("idx_export_tickets_expires", "expires_at", "used"),

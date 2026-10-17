@@ -412,3 +412,150 @@ def test_export_csv_matching_columns_and_escaping(admin_headers):
     assert headers[7] == "Total Invoiced (₹)"
     assert headers[14] == "Balance Outstanding (₹)"
     assert headers[16] == "Days Overdue"
+
+
+# ---------------------------------------------------------------------------
+# 4. Acceptance Area Regressions (CF4C5-01, CF4C5-02, CF4C5-03)
+# ---------------------------------------------------------------------------
+
+def test_targets_upsert_payload_contract_regression(admin_headers):
+    """
+    CF4C5-01 Regression: Ensure backend rejects outdated/mismatched payload
+    missing 'yearly_target' (e.g. sending only 'target_amount') with HTTP 422,
+    and succeeds when 'yearly_target' is provided, persistently updating PostgreSQL.
+    """
+    with get_db_session() as db:
+        sales_user = db.query(User).filter(User.role == "sales").first()
+        assert sales_user is not None
+        uid = sales_user.id
+
+    # Previous mismatched payload sent { "fy_code": ..., "target_amount": ... } without yearly_target
+    mismatched_payload = {
+        "fy_code": "FY 2026-27",
+        "target_amount": 5500000.00,
+    }
+    res_mismatched = client.post(
+        f"/api/targets/{uid}",
+        headers=admin_headers,
+        json=mismatched_payload,
+    )
+    assert res_mismatched.status_code == 422
+    assert "yearly_target" in str(res_mismatched.json())
+
+    # Correct contract payload includes yearly_target
+    aligned_payload = {
+        "fy_code": "FY 2026-27",
+        "yearly_target": 5500000.00,
+    }
+    res_aligned = client.post(
+        f"/api/targets/{uid}",
+        headers=admin_headers,
+        json=aligned_payload,
+    )
+    assert res_aligned.status_code == 200
+    res_data = res_aligned.json()
+    assert res_data["yearly_target"] == "5500000.00"
+    assert "target" in res_data
+    assert res_data["target"]["yearly_target"] == "5500000.00"
+
+    # Verify persistent update in PostgreSQL
+    with get_db_session() as db:
+        updated = db.query(SalesTarget).filter(
+            SalesTarget.user_id == uid,
+            SalesTarget.fy_code == "FY 2026-27"
+        ).first()
+        assert updated is not None
+        assert updated.yearly_target == Decimal("5500000.00")
+
+        # Restore baseline
+        updated.yearly_target = Decimal("7500000.00")
+        db.commit()
+
+
+def test_reporting_summary_reconciled_fields(admin_headers):
+    """
+    CF4C5-02 Regression: Verify ReportingSummaryDTO exposes both canonical and alias fields
+    (total_invoices, active_invoices_count, unbilled_count, active_orders_count, collection_rate_pct,
+    settlement_ratio_pct, total_exclusive, total_tax).
+    """
+    res = client.get("/api/reporting/summary?fy=FY%202026-27", headers=admin_headers)
+    assert res.status_code == 200
+    data = res.json()
+
+    # Canonical & alias field pairs
+    assert "total_invoices" in data
+    assert "active_invoices_count" in data
+    assert data["total_invoices"] == data["active_invoices_count"]
+
+    assert "unbilled_count" in data
+    assert "active_orders_count" in data
+    assert data["unbilled_count"] == data["active_orders_count"]
+
+    assert "collection_rate_pct" in data
+    assert "settlement_ratio_pct" in data
+
+    assert "total_exclusive" in data
+    assert "total_tax" in data
+    assert "total_invoiced" in data
+
+
+def test_reporting_historical_cancellation_as_of_date(admin_headers):
+    """
+    CF4C5-02 Regression: Invoices issued on or before as-of date but cancelled later
+    must be accounted for in historical operational reports as of that date.
+    """
+    as_of = "2026-04-30"
+    res_as_of = client.get(f"/api/reporting/summary?as_of_date={as_of}", headers=admin_headers)
+    assert res_as_of.status_code == 200
+    data = res_as_of.json()
+    assert int(data["total_invoices"]) > 0
+
+
+def test_export_ticket_bearer_cannot_bypass_and_bindings(admin_headers, finance_headers):
+    """
+    CF4C5-03 Regression:
+    1. Bearer token CANNOT bypass single-use ticket consumption or ticket reuse rejection.
+    2. Ticket is bound to format, FY, and scope.
+    3. Genuine linked PO numbers used, never PO-{inv.id}.
+    """
+    # 1. Generate ticket bound to excel, FY 2026-27, scope all
+    res_tok = client.post(
+        "/api/export/token",
+        headers=admin_headers,
+        json={"format": "excel", "fy": "FY 2026-27", "scope": "all"},
+    )
+    assert res_tok.status_code == 200
+    ticket = res_tok.json()["ticket"]
+
+    # Format mismatch check: ticket bound to excel cannot download csv
+    res_mismatch = client.get(
+        f"/api/export/csv?ticket={ticket}&fy=FY%202026-27&scope=all",
+        headers=admin_headers,
+    )
+    assert res_mismatch.status_code == 400
+    assert "bound to format" in res_mismatch.json()["detail"]
+
+    # First download with matching ticket succeeds (even when Bearer header is also provided)
+    res_dl1 = client.get(
+        f"/api/export/excel?ticket={ticket}&fy=FY%202026-27&scope=all",
+        headers=admin_headers,
+    )
+    assert res_dl1.status_code == 200
+
+    # Replay of the ticket WITH Bearer header MUST FAIL with 401 (Bearer token cannot bypass consumption)
+    res_dl2 = client.get(
+        f"/api/export/excel?ticket={ticket}&fy=FY%202026-27&scope=all",
+        headers=admin_headers,
+    )
+    assert res_dl2.status_code == 401
+    assert "already consumed" in res_dl2.json()["detail"]
+
+    # Verify genuine PO number format in Excel
+    wb = openpyxl.load_workbook(io.BytesIO(res_dl1.content))
+    ws = wb.active
+    po_col_idx = 3  # "PO Number" is 3rd column
+    po_values = [ws.cell(row=r, column=po_col_idx).value for r in range(2, ws.max_row + 1)]
+    for po_val in po_values:
+        if po_val and po_val != "—":
+            # Must NOT be synthetic PO-{id}
+            assert not (isinstance(po_val, str) and po_val.startswith("PO-") and po_val[3:].isdigit())

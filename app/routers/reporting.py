@@ -69,19 +69,30 @@ def get_reporting_summary(
     target_date = _parse_as_of_date(as_of_date) if as_of_date else None
 
     with get_db_session() as db:
-        # 1. Issued non-cancelled commercial invoices
-        inv_stmt = select(CommercialInvoice).where(
-            CommercialInvoice.lifecycle_status == "ISSUED"
-        )
+        # 1. Issued commercial invoices (accounting for as-of-date and cancellations after as_of_date)
+        if target_date:
+            inv_stmt = select(CommercialInvoice).where(
+                CommercialInvoice.invoice_date <= target_date,
+                or_(
+                    CommercialInvoice.lifecycle_status == "ISSUED",
+                    (CommercialInvoice.lifecycle_status == "CANCELLED")
+                    & (func.date(CommercialInvoice.cancelled_at) > target_date),
+                ),
+            )
+        else:
+            inv_stmt = select(CommercialInvoice).where(
+                CommercialInvoice.lifecycle_status == "ISSUED"
+            )
+
         if fy and fy.upper() not in ("ALL", "ALL FY"):
             inv_stmt = inv_stmt.where(CommercialInvoice.fy_code == fy)
-        if target_date:
-            inv_stmt = inv_stmt.where(CommercialInvoice.invoice_date <= target_date)
 
         invoices = db.execute(inv_stmt).scalars().all()
         invoice_ids = [inv.id for inv in invoices]
 
         total_invoiced = sum((_quantize_2dec(inv.total_amount) for inv in invoices), Decimal("0.00"))
+        total_exclusive = sum((_quantize_2dec(inv.exclusive_amount) for inv in invoices), Decimal("0.00"))
+        total_tax = sum((_quantize_2dec(inv.tax_amount) for inv in invoices), Decimal("0.00"))
         total_invoices_count = len(invoices)
 
         # 2. Settlements for matching invoices
@@ -147,7 +158,10 @@ def get_reporting_summary(
             "fy_code": fy or "ALL",
             "as_of_date": str(target_date or datetime.date.today()),
             "total_invoices": total_invoices_count,
+            "active_invoices_count": total_invoices_count,
             "total_invoiced": _format_money(total_invoiced),
+            "total_exclusive": _format_money(total_exclusive),
+            "total_tax": _format_money(total_tax),
             "total_cash": _format_money(total_cash),
             "total_tds": _format_money(total_tds),
             "total_settled": _format_money(total_settled),
@@ -155,7 +169,10 @@ def get_reporting_summary(
             "total_overdue": _format_money(total_overdue),
             "unbilled_orders_value": _format_money(unbilled_orders_value),
             "unbilled_count": unbilled_count,
+            "active_orders_count": unbilled_count,
             "collection_rate_pct": f"{rate_val:.1f}",
+            "settlement_ratio_pct": rate_val,
+            "collection_efficiency_pct": rate_val,
         }
 
 
@@ -181,11 +198,18 @@ def get_ar_aging_report(
 
     with get_db_session() as db:
         stmt = (
-            select(CommercialInvoice, Customer, User)
+            select(CommercialInvoice, Customer, User, PurchaseOrder)
             .join(Customer, CommercialInvoice.customer_id == Customer.id)
             .join(User, CommercialInvoice.executive_id == User.id)
-            .where(CommercialInvoice.lifecycle_status == "ISSUED")
+            .outerjoin(PurchaseOrder, CommercialInvoice.po_id == PurchaseOrder.id)
             .where(CommercialInvoice.invoice_date <= target_date)
+            .where(
+                or_(
+                    CommercialInvoice.lifecycle_status == "ISSUED",
+                    (CommercialInvoice.lifecycle_status == "CANCELLED")
+                    & (func.date(CommercialInvoice.cancelled_at) > target_date),
+                )
+            )
         )
 
         if fy and fy.upper() not in ("ALL", "ALL FY"):
@@ -207,7 +231,7 @@ def get_ar_aging_report(
         total_overdue = Decimal("0.00")
 
         # Preload settlements for matching invoices
-        invoice_ids = [inv.id for inv, _, _ in results]
+        invoice_ids = [inv.id for inv, _, _, _ in results]
         invoice_settled_map: Dict[int, Decimal] = {}
         if invoice_ids:
             pay_stmt = select(PaymentTransaction).where(
@@ -219,7 +243,7 @@ def get_ar_aging_report(
                     p.invoice_id, Decimal("0.00")
                 ) + _quantize_2dec(p.total_settled)
 
-        for inv, cust, exec_user in results:
+        for inv, cust, exec_user, po in results:
             settled = invoice_settled_map.get(inv.id, Decimal("0.00"))
             outstanding = max(Decimal("0.00"), _quantize_2dec(inv.total_amount) - settled)
 
@@ -252,7 +276,7 @@ def get_ar_aging_report(
                 {
                     "id": inv.id,
                     "invoice_number": inv.invoice_number,
-                    "po_number": f"PO-{inv.id}",
+                    "po_number": po.po_number if (po and po.po_number) else "—",
                     "customer_name": cust.billing_name,
                     "executive_name": exec_user.full_name or exec_user.username,
                     "fy_code": inv.fy_code,
