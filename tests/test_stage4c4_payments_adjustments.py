@@ -55,59 +55,55 @@ def _get_token(username: str = "sandbox_admin", password: str = "AdminPass123!")
 def cleanup_test_records():
     def _do_cleanup():
         with get_db_session() as db:
-            # Delete child transactions first to satisfy FK parent_transaction_id constraint
+            test_inv_ids = db.scalars(
+                select(CommercialInvoice.id).where(
+                    CommercialInvoice.invoice_number.ilike("INV-TEST-4C4-%")
+                )
+            ).all()
+
+            # 1. Delete ALL child payment transactions associated with test invoices OR test patterns
+            cond = (
+                PaymentTransaction.notes.ilike("%TEST-S4C4%")
+                | PaymentTransaction.notes.ilike("%Reversal of Payment%")
+                | PaymentTransaction.remittance_number.ilike("UTR-%")
+                | PaymentTransaction.idempotency_key.ilike("idem-%")
+            )
+            if test_inv_ids:
+                cond = cond | PaymentTransaction.invoice_id.in_(test_inv_ids)
+
             child_txs = db.scalars(
                 select(PaymentTransaction).where(
                     PaymentTransaction.parent_transaction_id.is_not(None),
-                    (
-                        PaymentTransaction.notes.ilike("%TEST-S4C4%")
-                        | PaymentTransaction.remittance_number.ilike("UTR-TEST-%")
-                        | PaymentTransaction.idempotency_key.ilike("idem-test-%")
-                    ),
+                    cond,
                 )
             ).all()
             for tx in child_txs:
                 db.delete(tx)
             db.flush()
 
-            # Delete remaining root test transactions
+            # 2. Delete ALL root payment transactions associated with test invoices OR test patterns
+            root_cond = (
+                PaymentTransaction.notes.ilike("%TEST-S4C4%")
+                | PaymentTransaction.remittance_number.ilike("UTR-%")
+                | PaymentTransaction.idempotency_key.ilike("idem-%")
+            )
+            if test_inv_ids:
+                root_cond = root_cond | PaymentTransaction.invoice_id.in_(test_inv_ids)
+
             root_txs = db.scalars(
-                select(PaymentTransaction).where(
-                    PaymentTransaction.notes.ilike("%TEST-S4C4%")
-                    | PaymentTransaction.remittance_number.ilike("UTR-TEST-%")
-                    | PaymentTransaction.idempotency_key.ilike("idem-test-%")
-                )
+                select(PaymentTransaction).where(root_cond)
             ).all()
             for tx in root_txs:
                 db.delete(tx)
             db.flush()
 
-            # Clean test invoices
+            # 3. Clean test invoices and items
             test_invs = db.scalars(
                 select(CommercialInvoice).where(
                     CommercialInvoice.invoice_number.ilike("INV-TEST-4C4-%")
                 )
             ).all()
             for inv in test_invs:
-                # delete child settlements first
-                c_txs = db.scalars(
-                    select(PaymentTransaction).where(
-                        PaymentTransaction.invoice_id == inv.id,
-                        PaymentTransaction.parent_transaction_id.is_not(None),
-                    )
-                ).all()
-                for tx in c_txs:
-                    db.delete(tx)
-                db.flush()
-
-                # delete root settlements
-                r_txs = db.scalars(
-                    select(PaymentTransaction).where(PaymentTransaction.invoice_id == inv.id)
-                ).all()
-                for tx in r_txs:
-                    db.delete(tx)
-                db.flush()
-
                 items = db.scalars(
                     select(CommercialInvoiceItem).where(CommercialInvoiceItem.invoice_id == inv.id)
                 ).all()
@@ -723,3 +719,330 @@ def test_synthetic_baseline_reconciliation():
     assert match["total_tds_deducted"] == "9000.00"
     assert match["total_paid"] == "209000.00"
     assert match["outstanding_balance"] == "322000.00"
+
+
+def test_concurrent_payment_correction_deterministic():
+    """
+    CF4C4-01: Two simultaneous threads attempting to correct the exact same payment.
+    Under row-level lock and supersession check, exactly one must succeed and one must fail
+    with HTTP 400 ('already been reversed or corrected'), writing exactly one REVERSAL event.
+    """
+    token_admin = _get_token("sandbox_admin", "AdminPass123!")
+    headers = {"Authorization": f"Bearer {token_admin}"}
+
+    inv_id = _create_test_invoice(Decimal("100000.00"), "INV-TEST-4C4-CONCUR-CORR")
+
+    # Record initial payment of 50,000
+    pay_res = client.post(
+        "/api/payments",
+        json={
+            "invoice_id": inv_id,
+            "payment_amount": "50000.00",
+            "tds_amount": "0.00",
+            "payment_date": "2026-04-18",
+            "payment_mode": "NEFT",
+            "remittance_number": "UTR-TEST-CONCUR-ORIG",
+            "notes": "TEST-S4C4 Initial payment for concurrent correction",
+        },
+        headers=headers,
+    )
+    assert pay_res.status_code == 200
+    orig_pid = pay_res.json()["payment_id"]
+
+    def _attempt_correction(worker_id: str):
+        c = TestClient(app)
+        return c.post(
+            f"/api/payments/{orig_pid}/correct",
+            json={
+                "reason": f"Concurrent correction attempt by worker {worker_id}",
+                "corrected_payment_amount": "40000.00" if worker_id == "A" else "30000.00",
+                "corrected_tds_amount": "0.00",
+                "corrected_payment_date": "2026-04-19",
+                "corrected_payment_mode": "NEFT",
+                "corrected_remittance_number": f"UTR-CORR-{worker_id}",
+                "notes": f"Replacement by {worker_id}",
+            },
+            headers=headers,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(_attempt_correction, "A")
+        f2 = executor.submit(_attempt_correction, "B")
+        r1 = f1.result()
+        r2 = f2.result()
+
+    statuses = sorted([r1.status_code, r2.status_code])
+    assert statuses == [200, 400], f"Expected exactly one 200 and one 400, got: {statuses}. R1: {r1.text}, R2: {r2.text}"
+
+    failed_resp = r1 if r1.status_code == 400 else r2
+    assert "already been reversed or corrected" in failed_resp.text
+
+    # Verify database state has exactly 1 REVERSAL child transaction
+    with get_db_session() as db:
+        reversals = db.scalars(
+            select(PaymentTransaction).where(
+                PaymentTransaction.parent_transaction_id == orig_pid,
+                PaymentTransaction.transaction_type == "REVERSAL",
+            )
+        ).all()
+        assert len(reversals) == 1, f"Expected exactly 1 reversal row, found {len(reversals)}"
+
+
+def test_correction_date_backdating_rejected():
+    """
+    CF4C4-01: Reversals/corrections cannot be backdated before the original payment date.
+    Attempting to correct with corrected_payment_date < orig.payment_date must be rejected with HTTP 400.
+    """
+    token_admin = _get_token("sandbox_admin", "AdminPass123!")
+    headers = {"Authorization": f"Bearer {token_admin}"}
+
+    inv_id = _create_test_invoice(Decimal("60000.00"), "INV-TEST-4C4-BACKDATE")
+
+    pay_res = client.post(
+        "/api/payments",
+        json={
+            "invoice_id": inv_id,
+            "payment_amount": "30000.00",
+            "tds_amount": "0.00",
+            "payment_date": "2026-04-20",
+            "payment_mode": "NEFT",
+            "remittance_number": "UTR-BACKDATE-ORIG",
+            "notes": "Original payment on 2026-04-20",
+        },
+        headers=headers,
+    )
+    assert pay_res.status_code == 200
+    orig_pid = pay_res.json()["payment_id"]
+
+    # Attempt to backdate correction to 2026-04-15 (before original payment date)
+    corr_res = client.post(
+        f"/api/payments/{orig_pid}/correct",
+        json={
+            "reason": "Attempting to backdate correction into prior period",
+            "corrected_payment_amount": "25000.00",
+            "corrected_payment_date": "2026-04-15",
+            "corrected_payment_mode": "NEFT",
+            "notes": "Backdated replacement",
+        },
+        headers=headers,
+    )
+    assert corr_res.status_code == 400
+    assert "cannot be earlier than original payment date" in corr_res.text
+
+
+def test_date_based_reconciliation_integrity():
+    """
+    CF4C4-01: Verify date-based reconciliation visibility.
+    Original payment on 2026-04-18, Full reversal on 2026-04-22.
+    - As of 2026-04-20 (prior to reversal): net settlement reflects ₹40,000.00.
+    - As of 2026-04-25 (after reversal): net settlement reflects ₹0.00.
+    """
+    token_admin = _get_token("sandbox_admin", "AdminPass123!")
+    headers = {"Authorization": f"Bearer {token_admin}"}
+
+    inv_id = _create_test_invoice(Decimal("80000.00"), "INV-TEST-4C4-DATE-RECON")
+
+    pay_res = client.post(
+        "/api/payments",
+        json={
+            "invoice_id": inv_id,
+            "payment_amount": "40000.00",
+            "tds_amount": "0.00",
+            "payment_date": "2026-04-18",
+            "payment_mode": "NEFT",
+            "remittance_number": "UTR-DATE-RECON-ORIG",
+        },
+        headers=headers,
+    )
+    assert pay_res.status_code == 200
+    orig_pid = pay_res.json()["payment_id"]
+
+    corr_res = client.post(
+        f"/api/payments/{orig_pid}/correct",
+        json={
+            "reason": "Statutory full reversal for date reconciliation test",
+            "corrected_payment_amount": "0.00",
+            "corrected_tds_amount": "0.00",
+            "corrected_payment_date": "2026-04-22",
+        },
+        headers=headers,
+    )
+    assert corr_res.status_code == 200
+
+    # Query ledger as of 2026-04-20 (before reversal date)
+    res_t1 = client.get(f"/api/payments?invoice_id={inv_id}&date_to=2026-04-20", headers=headers)
+    assert res_t1.status_code == 200
+    data_t1 = res_t1.json()
+    assert len(data_t1["data"]) == 1
+    assert data_t1["summary"]["total_settled"] == "40000.00"
+
+    # Query ledger as of 2026-04-25 (after reversal date)
+    res_t2 = client.get(f"/api/payments?invoice_id={inv_id}&date_to=2026-04-25", headers=headers)
+    assert res_t2.status_code == 200
+    data_t2 = res_t2.json()
+    assert len(data_t2["data"]) == 2
+    assert data_t2["summary"]["total_settled"] == "0.00"
+
+
+def test_idempotency_full_canonical_comparison():
+    """
+    CF4C4-02: Complete canonical request comparison for idempotency key reuse.
+    Changing ANY parameter (invoice, cash, tds, tds_section, date, mode, remittance, notes)
+    must reject reuse with HTTP 409 Conflict.
+    """
+    token_admin = _get_token("sandbox_admin", "AdminPass123!")
+    headers = {"Authorization": f"Bearer {token_admin}"}
+
+    inv_id = _create_test_invoice(Decimal("75000.00"), "INV-TEST-4C4-IDEM-FULL")
+    inv_id2 = _create_test_invoice(Decimal("75000.00"), "INV-TEST-4C4-IDEM-FULL-2")
+    key = f"idem-canonical-{uuid.uuid4()}"
+
+    base_payload = {
+        "invoice_id": inv_id,
+        "payment_amount": "20000.00",
+        "tds_amount": "1000.00",
+        "tds_section": "194C",
+        "payment_date": "2026-04-18",
+        "payment_mode": "NEFT",
+        "remittance_number": "UTR-CANONICAL-01",
+        "notes": "Canonical settlement notes",
+        "idempotency_key": key,
+    }
+
+    # 1. Initial submission
+    res1 = client.post("/api/payments", json=base_payload, headers=headers)
+    assert res1.status_code == 200
+    orig_pid = res1.json()["payment_id"]
+
+    # 2. Identical replay succeeds with 200
+    res_replay = client.post("/api/payments", json=base_payload, headers=headers)
+    assert res_replay.status_code == 200
+    assert res_replay.json()["payment_id"] == orig_pid
+    assert res_replay.json()["idempotent_replay"] is True
+
+    # 3. Test every canonical field alteration returns 409
+    field_mutations = [
+        ("invoice_id", inv_id2),
+        ("payment_amount", "25000.00"),
+        ("tds_amount", "2000.00"),
+        ("tds_section", "194J"),
+        ("payment_date", "2026-04-19"),
+        ("payment_mode", "RTGS"),
+        ("remittance_number", "UTR-CANONICAL-MODIFIED"),
+        ("notes", "Different notes"),
+    ]
+
+    for field, new_val in field_mutations:
+        mutated = dict(base_payload)
+        mutated[field] = new_val
+        res_conflict = client.post("/api/payments", json=mutated, headers=headers)
+        assert res_conflict.status_code == 409, f"Expected 409 when altering '{field}', got {res_conflict.status_code}: {res_conflict.text}"
+        assert "Conflicting reuse of idempotency key" in res_conflict.text
+
+
+def test_concurrent_idempotent_submissions():
+    """
+    CF4C4-02: Concurrent duplicate-key requests must resolve safely without 500 errors
+    or duplicate database rows. Both threads return HTTP 200 with matching payment_id.
+    """
+    token_admin = _get_token("sandbox_admin", "AdminPass123!")
+    headers = {"Authorization": f"Bearer {token_admin}"}
+
+    inv_id = _create_test_invoice(Decimal("50000.00"), "INV-TEST-4C4-IDEM-CONCUR")
+    key = f"idem-concur-{uuid.uuid4()}"
+
+    payload = {
+        "invoice_id": inv_id,
+        "payment_amount": "25000.00",
+        "tds_amount": "0.00",
+        "payment_date": "2026-04-20",
+        "payment_mode": "NEFT",
+        "remittance_number": "UTR-IDEM-CONCUR",
+        "notes": "Concurrent duplicate key test",
+        "idempotency_key": key,
+    }
+
+    def _submit():
+        c = TestClient(app)
+        return c.post("/api/payments", json=payload, headers=headers)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(_submit)
+        f2 = executor.submit(_submit)
+        r1 = f1.result()
+        r2 = f2.result()
+
+    assert r1.status_code == 200, f"R1 failed: {r1.status_code} {r1.text}"
+    assert r2.status_code == 200, f"R2 failed: {r2.status_code} {r2.text}"
+    assert r1.json()["payment_id"] == r2.json()["payment_id"]
+
+    # Verify exactly 1 payment transaction in DB
+    with get_db_session() as db:
+        txs = db.scalars(
+            select(PaymentTransaction).where(PaymentTransaction.idempotency_key == key)
+        ).all()
+        assert len(txs) == 1
+
+
+def test_ledger_retains_history_for_cancelled_invoice():
+    """
+    CF4C4-03: Payments and reversals associated with a cancelled invoice are retained
+    and retrievable from GET /api/payments with invoice_lifecycle_status == 'CANCELLED'
+    and is_superseded correctly marked.
+    """
+    token_admin = _get_token("sandbox_admin", "AdminPass123!")
+    headers = {"Authorization": f"Bearer {token_admin}"}
+
+    inv_id = _create_test_invoice(Decimal("50000.00"), "INV-TEST-4C4-CANCEL-HIST")
+
+    # Record settlement
+    pay_res = client.post(
+        "/api/payments",
+        json={
+            "invoice_id": inv_id,
+            "payment_amount": "50000.00",
+            "payment_date": "2026-04-18",
+            "payment_mode": "NEFT",
+            "remittance_number": "UTR-CANCEL-HIST-01",
+        },
+        headers=headers,
+    )
+    assert pay_res.status_code == 200
+    orig_pid = pay_res.json()["payment_id"]
+
+    # Reverse settlement
+    corr_res = client.post(
+        f"/api/payments/{orig_pid}/correct",
+        json={
+            "reason": "Reversing settlement to allow invoice cancellation",
+            "corrected_payment_amount": "0.00",
+            "corrected_tds_amount": "0.00",
+            "corrected_payment_date": "2026-04-19",
+        },
+        headers=headers,
+    )
+    assert corr_res.status_code == 200
+
+    # Cancel invoice
+    cancel_res = client.post(
+        f"/api/invoices/{inv_id}/cancel",
+        json={"reason": "Statutory cancellation after full reversal"},
+        headers=headers,
+    )
+    assert cancel_res.status_code == 200
+
+    # Query payments ledger for this invoice
+    ledger_res = client.get(f"/api/payments?invoice_id={inv_id}", headers=headers)
+    assert ledger_res.status_code == 200
+    data = ledger_res.json()["data"]
+    assert len(data) == 2, f"Expected 2 payment rows for cancelled invoice, got {len(data)}"
+
+    orig_item = next(p for p in data if p["id"] == orig_pid)
+    assert orig_item["transaction_type"] == "PAYMENT"
+    assert orig_item["is_superseded"] is True
+    assert orig_item["invoice_lifecycle_status"] == "CANCELLED"
+
+    rev_item = next(p for p in data if p["parent_transaction_id"] == orig_pid)
+    assert rev_item["transaction_type"] == "REVERSAL"
+    assert rev_item["invoice_lifecycle_status"] == "CANCELLED"
+

@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.core.database import get_db_session
 from app.models.domain_models import (
@@ -176,6 +177,13 @@ def list_payments(
         )
 
         rows = db.execute(paginated_stmt).all()
+        superseded_ids = set(
+            db.scalars(
+                select(PaymentTransaction.parent_transaction_id).where(
+                    PaymentTransaction.parent_transaction_id.is_not(None)
+                )
+            ).all()
+        )
         data = []
         for tx, inv, cust in rows:
             data.append({
@@ -183,6 +191,7 @@ def list_payments(
                 "invoice_id": tx.invoice_id,
                 "parent_transaction_id": tx.parent_transaction_id,
                 "transaction_type": tx.transaction_type,
+                "is_superseded": tx.id in superseded_ids,
                 "cash_amount": _format_money(tx.cash_amount),
                 "payment_amount": _format_money(tx.cash_amount),
                 "tds_amount": _format_money(tx.tds_amount),
@@ -196,6 +205,7 @@ def list_payments(
                 "recorded_by": tx.recorded_by,
                 "created_at": tx.created_at.isoformat() if tx.created_at else None,
                 "invoice_number": inv.invoice_number,
+                "invoice_lifecycle_status": inv.lifecycle_status,
                 "customer_id": cust.id,
                 "customer_name": cust.billing_name,
                 "fy_code": inv.fy_code,
@@ -252,44 +262,59 @@ def record_payment(
     remit = item.remittance_number.strip() if item.remittance_number else None
 
     with get_db_session() as db:
-        # Check idempotency replay under transaction
+        # Validate TDS section if TDS amount > 0
+        tds_sec_code = None
+        if tds > Decimal("0.00"):
+            tds_sec_code = _normalize_and_validate_tds_section(item.tds_section, db)
+
+        def _is_canonical_match(tx: PaymentTransaction) -> bool:
+            tx_notes = (tx.notes or "").strip() or None
+            item_notes = (item.notes or "").strip() or None
+            tx_remit = (tx.remittance_number or "").strip() or None
+            item_remit = remit or None
+            tx_tds_sec = (tx.tds_section or "").strip() or None
+            item_tds_sec = (tds_sec_code or "").strip() or None
+            return (
+                tx.invoice_id == item.invoice_id
+                and _quantize_2dec(tx.cash_amount) == pay_amt
+                and _quantize_2dec(tx.tds_amount) == tds
+                and tx_tds_sec == item_tds_sec
+                and tx.payment_date == parsed_date
+                and tx.payment_mode == mode
+                and tx_remit == item_remit
+                and tx_notes == item_notes
+            )
+
+        def _replay_response(tx: PaymentTransaction) -> Dict[str, Any]:
+            inv_match = db.scalar(
+                select(CommercialInvoice).where(CommercialInvoice.id == tx.invoice_id)
+            )
+            summary = (
+                serialize_invoice(inv_match, settlements=inv_match.settlements)
+                if inv_match
+                else None
+            )
+            return {
+                "success": True,
+                "payment_id": tx.id,
+                "idempotent_replay": True,
+                "message": "Payment recorded (idempotent replay)",
+                "summary": summary,
+                "invoice_summary": summary,
+            }
+
+        # Check idempotency replay (fast-path if already committed)
         if idem_key:
             existing = db.scalar(
                 select(PaymentTransaction).where(PaymentTransaction.idempotency_key == idem_key)
             )
             if existing:
-                is_match = (
-                    existing.invoice_id == item.invoice_id
-                    and _quantize_2dec(existing.cash_amount) == pay_amt
-                    and _quantize_2dec(existing.tds_amount) == tds
-                    and existing.payment_mode == mode
-                )
-                if not is_match:
+                if not _is_canonical_match(existing):
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
                         detail=f"Conflicting reuse of idempotency key '{idem_key}' with different payload",
                     )
-                inv_match = db.scalar(
-                    select(CommercialInvoice).where(CommercialInvoice.id == existing.invoice_id)
-                )
-                summary = (
-                    serialize_invoice(inv_match, settlements=inv_match.settlements)
-                    if inv_match
-                    else None
-                )
-                return {
-                    "success": True,
-                    "payment_id": existing.id,
-                    "idempotent_replay": True,
-                    "message": "Payment recorded (idempotent replay)",
-                    "summary": summary,
-                    "invoice_summary": summary,
-                }
-
-        # Validate TDS section if TDS amount > 0
-        tds_sec_code = None
-        if tds > Decimal("0.00"):
-            tds_sec_code = _normalize_and_validate_tds_section(item.tds_section, db)
+                return _replay_response(existing)
 
         # Lock invoice for update
         inv = db.scalar(
@@ -308,16 +333,30 @@ def record_payment(
         if inv.lifecycle_status == "CANCELLED":
             raise HTTPException(status_code=400, detail="Cannot record payments against a CANCELLED invoice")
 
+        # Re-check idempotency under invoice row lock (in case concurrent thread committed while waiting for lock)
+        if idem_key:
+            existing_locked = db.scalar(
+                select(PaymentTransaction).where(PaymentTransaction.idempotency_key == idem_key)
+            )
+            if existing_locked:
+                if not _is_canonical_match(existing_locked):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Conflicting reuse of idempotency key '{idem_key}' with different payload",
+                    )
+                return _replay_response(existing_locked)
+
         # Duplicate remittance check on active payments for this invoice
         if remit:
-            dup = db.scalar(
-                select(PaymentTransaction.id).where(
-                    PaymentTransaction.invoice_id == item.invoice_id,
-                    PaymentTransaction.remittance_number == remit,
-                    PaymentTransaction.cash_amount == pay_amt,
-                    PaymentTransaction.transaction_type == "PAYMENT",
-                )
+            dup_cond = (
+                (PaymentTransaction.invoice_id == item.invoice_id)
+                & (PaymentTransaction.remittance_number == remit)
+                & (PaymentTransaction.cash_amount == pay_amt)
+                & (PaymentTransaction.transaction_type == "PAYMENT")
             )
+            if idem_key:
+                dup_cond = dup_cond & (PaymentTransaction.idempotency_key != idem_key)
+            dup = db.scalar(select(PaymentTransaction.id).where(dup_cond))
             if dup:
                 raise HTTPException(
                     status_code=400,
@@ -383,7 +422,23 @@ def record_payment(
             request_id=req_id,
             db=db,
         )
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            if idem_key and ("idempotency_key" in str(exc).lower() or "unique" in str(exc).lower()):
+                existing = db.scalar(
+                    select(PaymentTransaction).where(PaymentTransaction.idempotency_key == idem_key)
+                )
+                if existing:
+                    if _is_canonical_match(existing):
+                        return _replay_response(existing)
+                    else:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Conflicting reuse of idempotency key '{idem_key}' with different payload",
+                        )
+            raise
 
         db.refresh(inv)
         updated_summary = serialize_invoice(inv, settlements=inv.settlements)
@@ -432,8 +487,11 @@ def correct_payment(
     corr_remit = item.corrected_remittance_number.strip() if item.corrected_remittance_number else None
 
     with get_db_session() as db:
+        # First row-lock the original payment transaction
         orig = db.scalar(
-            select(PaymentTransaction).where(PaymentTransaction.id == payment_id)
+            select(PaymentTransaction)
+            .where(PaymentTransaction.id == payment_id)
+            .with_for_update()
         )
         if not orig:
             raise HTTPException(status_code=404, detail="Payment record not found")
@@ -441,9 +499,22 @@ def correct_payment(
         if orig.transaction_type != "PAYMENT":
             raise HTTPException(status_code=400, detail="Only original PAYMENT transactions can be corrected")
 
-        # Check supersession / prior reversal
+        # Row-lock the associated commercial invoice BEFORE checking supersession or balances
+        inv = db.scalar(
+            select(CommercialInvoice)
+            .where(CommercialInvoice.id == orig.invoice_id)
+            .with_for_update()
+        )
+        if not inv:
+            raise HTTPException(status_code=404, detail="Associated commercial invoice not found")
+
+        if inv.lifecycle_status == "CANCELLED":
+            raise HTTPException(status_code=400, detail="Cannot correct payments against a CANCELLED invoice")
+
+        # Check supersession / prior reversal WHILE HOLDING BOTH INVOICE AND PAYMENT LOCKS
         existing_child = db.scalar(
-            select(PaymentTransaction.id).where(PaymentTransaction.parent_transaction_id == payment_id)
+            select(PaymentTransaction.id)
+            .where(PaymentTransaction.parent_transaction_id == payment_id)
         )
         if existing_child:
             raise HTTPException(
@@ -451,20 +522,17 @@ def correct_payment(
                 detail=f"Payment #{payment_id} has already been reversed or corrected and cannot be modified again",
             )
 
+        # Ensure correction/reversal posting dates cannot rewrite previously established settlement history through backdating
+        if corr_date < orig.payment_date:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Correction posting date ({corr_date.isoformat()}) cannot be earlier than original payment date ({orig.payment_date.isoformat()})",
+            )
+
         # Validate replacement TDS section if TDS > 0
         corr_tds_sec = None
         if corr_tds > Decimal("0.00"):
             corr_tds_sec = _normalize_and_validate_tds_section(item.corrected_tds_section, db)
-
-        # Row lock the invoice
-        inv = db.scalar(
-            select(CommercialInvoice).where(CommercialInvoice.id == orig.invoice_id).with_for_update()
-        )
-        if not inv:
-            raise HTTPException(status_code=404, detail="Associated commercial invoice not found")
-
-        if inv.lifecycle_status == "CANCELLED":
-            raise HTTPException(status_code=400, detail="Cannot correct payments against a CANCELLED invoice")
 
         # Current total settled on invoice
         current_settled_row = db.execute(
