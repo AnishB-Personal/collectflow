@@ -75,13 +75,14 @@ async def security_and_observability_middleware(request: Request, call_next):
     return response
 
 
-# Stage 4C.3 Router inclusion & Legacy SQLite quarantine
+# Stage 4C.4 Router inclusion & Legacy SQLite quarantine
 app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(settings.router)
 app.include_router(customers.router)
 app.include_router(orders.router)
 app.include_router(invoices.router)
+app.include_router(payments.router)
 
 env_mode = os.environ.get("COLLECTFLOW_ENV", "integration").lower()
 is_mock_legacy_mode = env_mode in ("mock", "sqlite_legacy")
@@ -89,22 +90,20 @@ is_mock_legacy_mode = env_mode in ("mock", "sqlite_legacy")
 if is_mock_legacy_mode:
     # Mount legacy SQLite Phase 1-3 routers for legacy tests only
     app.include_router(dashboard.router)
-    app.include_router(payments.router)
     app.include_router(export.router)
 else:
-    # Under PostgreSQL (Stage 4C.3 integration), explicitly quarantine legacy SQLite endpoints
+    # Under PostgreSQL (Stage 4C.4 integration), explicitly quarantine legacy SQLite endpoints
     from fastapi import APIRouter
     quarantined = APIRouter()
 
     @quarantined.api_route("/api/dashboard/{path:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
-    @quarantined.api_route("/api/payments/{path:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
     @quarantined.api_route("/api/export/{path:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
     async def quarantined_endpoint(request: Request, path: str = ""):
         return JSONResponse(
             status_code=501,
             content={
-                "detail": "Endpoint deferred to Stage 4C.4/4C.5 under PostgreSQL architecture.",
-                "stage": "Stage 4C.3 Active Scope: Auth, Customers, Statutory Reference Data, Orders & Invoices",
+                "detail": "Endpoint deferred to Stage 4C.5 under PostgreSQL architecture.",
+                "stage": "Stage 4C.4 Active Scope: Auth, Customers, Statutory Reference Data, Orders, Invoices, Payments & Adjustments",
             },
         )
 

@@ -693,11 +693,28 @@ def cancel_invoice(
         if inv.lifecycle_status == "CANCELLED":
             raise HTTPException(status_code=400, detail="Invoice is already cancelled")
 
-        # Settlement guard: check if any payments or settlements are recorded
-        settlement_count = db.scalar(
-            select(func.count(PaymentTransaction.id)).where(PaymentTransaction.invoice_id == invoice_id)
-        )
-        if settlement_count and settlement_count > 0:
+        # Settlement guard: check if active positive net settlement exists
+        net_settled = db.scalar(
+            select(func.coalesce(func.sum(PaymentTransaction.total_settled), 0)).where(
+                PaymentTransaction.invoice_id == invoice_id
+            )
+        ) or Decimal("0.00")
+        net_cash = db.scalar(
+            select(func.coalesce(func.sum(PaymentTransaction.cash_amount), 0)).where(
+                PaymentTransaction.invoice_id == invoice_id
+            )
+        ) or Decimal("0.00")
+        net_tds = db.scalar(
+            select(func.coalesce(func.sum(PaymentTransaction.tds_amount), 0)).where(
+                PaymentTransaction.invoice_id == invoice_id
+            )
+        ) or Decimal("0.00")
+
+        net_settled_dec = Decimal(str(net_settled)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        net_cash_dec = Decimal(str(net_cash)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        net_tds_dec = Decimal(str(net_tds)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        if net_settled_dec > Decimal("0.00") or net_cash_dec > Decimal("0.00") or net_tds_dec > Decimal("0.00"):
             raise HTTPException(
                 status_code=400,
                 detail="Cannot cancel invoice with recorded settlements. Settlements must be reversed or cleared first.",
