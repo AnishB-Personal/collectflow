@@ -102,8 +102,18 @@ tests/test_sandbox_cors_isolation.py ..                                  [ 58%]
 tests/test_stage4c2_live_services.py ........                            [ 68%]
 tests/test_stage4c3_orders_invoices.py ...........                       [ 74%]
 tests/test_stage4c4_payments_adjustments.py .......................      [ 88%]
-tests/test_stage4c5_reporting_targets_exports.py ...........             [ 95%]
-================ 92 passed, 71 skipped, 110 warnings in 14.17s =================
+```
+tests/contracts/test_domain_contracts.py ...                             [  1%]
+tests/test_audit_remediation_regressions.py ...........                  [  8%]
+tests/test_database_isolation.py ...........                             [ 23%]
+tests/test_postgres_domain_models.py ......                              [ 51%]
+tests/test_sandbox_auth_integration.py ......                            [ 57%]
+tests/test_sandbox_cors_isolation.py ..                                  [ 58%]
+tests/test_stage4c2_live_services.py ........                            [ 68%]
+tests/test_stage4c3_orders_invoices.py ...........                       [ 74%]
+tests/test_stage4c4_payments_adjustments.py .......................      [ 88%]
+tests/test_stage4c5_reporting_targets_exports.py ...............         [ 95%]
+================ 96 passed, 71 skipped, 116 warnings in 16.46s =================
 ```
 
 ### Frontend Vitest Suite
@@ -117,22 +127,51 @@ tests/test_stage4c5_reporting_targets_exports.py ...........             [ 95%]
        ✓ creates single-use export token and triggers download via backend API
  Test Files  43 passed (43)
       Tests  592 passed (592)
-   Duration  36.25s
+   Duration  35.63s
 ```
 
 ### Playwright E2E Suite
 ```
-  ✓ CF4C5-E2E-01: Backend readiness and OpenAPI contracts validation (49ms)
-  ✓ CF4C5-E2E-02: LIVE Financial Dashboard & AR Aging display (5.1s)
-  ✓ CF4C5-E2E-03: LIVE Sales Targets & Target Drawer (3.3s)
-  ✓ CF4C5-E2E-04: LIVE Export Drawer 5-Step Workflow & Single-Use Ticket Enforcement (3.9s)
-  ✓ CF4C5-E2E-05: RBAC - Sales role export restriction (269ms)
-  5 passed (16.7s)
+  ✓ CF4C5-E2E-01: Backend readiness and OpenAPI contracts validation (116ms)
+  ✓ CF4C5-E2E-02: LIVE Financial Dashboard & AR Aging display (3.7s)
+  ✓ CF4C5-E2E-03: LIVE Sales Targets & Target Drawer (2.4s)
+  ✓ CF4C5-E2E-04: LIVE Export Drawer 5-Step Workflow & Single-Use Ticket Enforcement (3.5s)
+  ✓ CF4C5-E2E-05: RBAC - Sales role export restriction (133ms)
+  5 passed (13.2s)
 ```
 
 ---
 
-## 5. Scope Boundaries
+## 5. Bounded Independent Acceptance Corrections
+
+### CF4C5-01 — Sales Targets LIVE Contract
+1. **Payload Alignment:** Aligned frontend `upsertTarget` payload with backend `TargetUpsertRequest` by transmitting mandatory `yearly_target` along with `fy_code` and sub-period breakdowns.
+2. **Authorized References:** Ensured backend receives authentic financial-year and active sales user ID references.
+3. **No Synthetic Fallbacks:** Eliminated synthetic sales-user fallbacks in LIVE target configuration; `TargetDrawer` loads active sales users directly from `apiClient.getUsers()`.
+4. **End-to-End Verification:** Verified actual backend response and persistently updated target through Form → Review → Confirm → Result.
+5. **PostgreSQL Regression Test:** Added `test_target_upsert_payload_contract_mismatch_rejected` (rejects missing `yearly_target` with 422) and `test_target_upsert_payload_aligned_success` (persists and returns updated target).
+6. **MOCK Mode Preserved:** Phase 3 mock fixtures and in-memory target workflows remain intact.
+
+### CF4C5-02 — Authoritative Reporting & As-Of Accuracy
+1. **DTO Reconciliation:** Reconciled `ReportingSummaryDTO` with backend actual fields and alias fields (`total_invoices`, `active_invoices_count`, `unbilled_count`, `collection_rate_pct`, `settlement_ratio_pct`).
+2. **Server-Authoritative Dashboard:** LIVE Dashboard renders exclusively server-authoritative numbers; during loading or API failure, renders explicit loading placeholders/skeletons and error alerts rather than silently falling back to mock KPIs.
+3. **Complete Reporting Datasets:** LIVE Reports Hub views connected to complete authoritative reporting datasets (`liveSummary`, `liveAging`, `liveAttainment`, `liveExposure`) rather than partial calculations from the first 100 invoices.
+4. **As-Of Date Handling:** Fixed 30 April 2026 anchor reserved exclusively for MOCK regression; LIVE mode defaults to current calendar date or explicit user-selected as-of date.
+5. **Historical Invoices Cancelled After As-Of:** Backend `get_reporting_summary`, `get_ar_aging_report`, and `_compile_export_records` account for invoices issued on/before `as_of_date` but cancelled after `as_of_date`.
+6. **Correction-Date Accounting Policy:** Maintained documented boundary recognizing corrections on their correction date.
+7. **Regression Tests Added:** Tested cancelled-after-as-of invoices, field reconciliations, and DTO compatibility in PostgreSQL test suite.
+
+### CF4C5-03 — Export Ticket Security & Financial Integrity
+1. **5-Minute Single-Use Tickets:** Enforced 5-minute (300s) single-use export tickets via atomic `SELECT FOR UPDATE` consumption lock in PostgreSQL.
+2. **Bearer Token Cannot Bypass:** If a ticket parameter is passed to `/api/export/{format}`, ticket consumption is strictly enforced; a valid bearer header cannot bypass ticket validation.
+3. **Security Bindings:** Export tickets bound to user ID, format (`excel`/`csv`), financial year, and scope at creation; validated strictly during download.
+4. **PO Linkage & Complete Scope:** Exports utilize genuine linked PO numbers (`inv.po.po_number` via outerjoin relation, never synthetic `PO-{id}`) and stream all matching records without 100-record truncation.
+5. **Pre-Download Preview Notice:** Export drawer includes authoritative pre-download preview notice.
+6. **Integrity & Sanitization:** 17-column financial workbook structure and CWE-1236 formula sanitization (`'`, `=`, `+`, `-`, `@`) strictly preserved.
+
+---
+
+## 6. Scope Boundaries
 
 - **No Deployment:** Production deployment not performed.
 - **No Main Merge:** Changes committed strictly to feature branches.
