@@ -166,10 +166,12 @@ def get_current_user(
 ) -> dict:
     """Dependency returning authenticated user dict from PostgreSQL session with HTTPBearer OpenAPI integration."""
     raw_token = None
-    if bearer_creds and bearer_creds.credentials:
+    if bearer_creds and hasattr(bearer_creds, "credentials") and bearer_creds.credentials:
         raw_token = bearer_creds.credentials.strip()
     elif authorization and authorization.startswith("Bearer "):
         raw_token = authorization.split(" ")[1].strip()
+    elif authorization:
+        raw_token = authorization.strip()
 
     if not raw_token:
         raise HTTPException(status_code=401, detail="Authentication required")
