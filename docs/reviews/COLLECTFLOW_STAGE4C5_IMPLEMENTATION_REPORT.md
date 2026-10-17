@@ -102,16 +102,6 @@ tests/test_sandbox_cors_isolation.py ..                                  [ 58%]
 tests/test_stage4c2_live_services.py ........                            [ 68%]
 tests/test_stage4c3_orders_invoices.py ...........                       [ 74%]
 tests/test_stage4c4_payments_adjustments.py .......................      [ 88%]
-```
-tests/contracts/test_domain_contracts.py ...                             [  1%]
-tests/test_audit_remediation_regressions.py ...........                  [  8%]
-tests/test_database_isolation.py ...........                             [ 23%]
-tests/test_postgres_domain_models.py ......                              [ 51%]
-tests/test_sandbox_auth_integration.py ......                            [ 57%]
-tests/test_sandbox_cors_isolation.py ..                                  [ 58%]
-tests/test_stage4c2_live_services.py ........                            [ 68%]
-tests/test_stage4c3_orders_invoices.py ...........                       [ 74%]
-tests/test_stage4c4_payments_adjustments.py .......................      [ 88%]
 tests/test_stage4c5_reporting_targets_exports.py ...............         [ 95%]
 ================ 96 passed, 71 skipped, 116 warnings in 16.46s =================
 ```
