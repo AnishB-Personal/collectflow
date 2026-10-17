@@ -16,6 +16,7 @@ Validates against live PostgreSQL database:
 import datetime
 from decimal import Decimal
 import re
+import uuid
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -560,11 +561,11 @@ def test_cf4c3_01_monetary_tax_integrity_and_serialization():
     assert MONEY_REGEX.match(po_data["total_amount"])
     assert MONEY_REGEX.match(po_data["outstanding_balance"])
     assert MONEY_REGEX.match(po_data["unbilled_amount"])
-    assert po_data["exclusive_amount"] == "334.45"
+    assert po_data["exclusive_amount"] == "334.46"
     assert po_data["tax_amount"] == "60.20"
-    assert po_data["total_amount"] == "394.65"
+    assert po_data["total_amount"] == "394.66"
     assert po_data["outstanding_balance"] == "0.00"
-    assert po_data["unbilled_amount"] == "394.65"
+    assert po_data["unbilled_amount"] == "394.66"
 
     # Line item serialization check
     li = po_data["line_items"][0]
@@ -771,4 +772,154 @@ def test_cf4c3_04_conversion_due_date_boundaries():
     )
     assert net30_resp.status_code in (200, 201), net30_resp.text
     assert net30_resp.json()["due_date"] == "2026-07-31"  # 30 days after 2026-07-01
+
+
+def test_cf4c3_01_boundary_one_paise_zero_rated_and_unit_price_reconciliation():
+    token_admin = _get_token("sandbox_admin", "AdminPass123!")
+    headers = {"Authorization": f"Bearer {token_admin}"}
+    suffix = uuid.uuid4().hex[:6].upper()
+
+    # 1. Reject one-paise discrepancies between supplied and calculated totals
+    # Base: qty=1, price=1000.00, rate=0.18 -> excl=1000.00, tax=180.00, tot=1180.00
+    # A) +0.01 paise discrepancy on total
+    resp_plus_paise = client.post(
+        "/api/orders",
+        json={
+            "fy_code": "FY 2026-27",
+            "po_number": f"PO-PAISE-P-{suffix}",
+            "po_date": "2026-06-01",
+            "customer_id": 1,
+            "total_amount": 1180.01,
+            "items": [{"item_description": "Task", "quantity": 1.0, "unit_price": 1000.0, "tax_rate": 0.18}],
+        },
+        headers=headers,
+    )
+    assert resp_plus_paise.status_code == 400
+    assert "inconsistent" in resp_plus_paise.json()["detail"].lower()
+
+    # B) -0.01 paise discrepancy on total
+    resp_minus_paise = client.post(
+        "/api/orders",
+        json={
+            "fy_code": "FY 2026-27",
+            "po_number": f"PO-PAISE-M-{suffix}",
+            "po_date": "2026-06-01",
+            "customer_id": 1,
+            "total_amount": 1179.99,
+            "items": [{"item_description": "Task", "quantity": 1.0, "unit_price": 1000.0, "tax_rate": 0.18}],
+        },
+        headers=headers,
+    )
+    assert resp_minus_paise.status_code == 400
+    assert "inconsistent" in resp_minus_paise.json()["detail"].lower()
+
+    # C) One-paise tax discrepancy on invoice
+    resp_inv_paise = client.post(
+        "/api/invoices",
+        json={
+            "fy_code": "FY 2026-27",
+            "invoice_number": f"INV-PAISE-T-{suffix}",
+            "invoice_date": "2026-06-01",
+            "customer_id": 1,
+            "exclusive_amount": 1000.00,
+            "tax_amount": 180.01,  # Calculated is 180.00
+        },
+        headers=headers,
+    )
+    assert resp_inv_paise.status_code == 400
+    assert "inconsistent" in resp_inv_paise.json()["detail"].lower()
+
+    zero_inv_id = None
+    try:
+        # 2. Preserve valid zero-rated GST rather than defaulting to 18%
+        # A) On Purchase Order
+        resp_zero_po = client.post(
+            "/api/orders",
+            json={
+                "fy_code": "FY 2026-27",
+                "po_number": f"PO-ZERO-{suffix}",
+                "po_date": "2026-06-01",
+                "customer_id": 1,
+                "exclusive_amount": 50000.00,
+                "tax_rate": 0.0,
+            },
+            headers=headers,
+        )
+        assert resp_zero_po.status_code == 201
+        zero_po_data = resp_zero_po.json()
+        assert zero_po_data["tax_rate"] == "0.0000"
+        assert zero_po_data["tax_amount"] == "0.00"
+        assert zero_po_data["exclusive_amount"] == "50000.00"
+        assert zero_po_data["total_amount"] == "50000.00"
+
+        # B) On Direct Commercial Invoice
+        resp_zero_inv = client.post(
+            "/api/invoices",
+            json={
+                "fy_code": "FY 2026-27",
+                "invoice_number": f"INV-ZERO-{suffix}",
+                "invoice_date": "2026-06-01",
+                "customer_id": 1,
+                "exclusive_amount": 75000.00,
+                "tax_rate": 0.0,
+            },
+            headers=headers,
+        )
+        assert resp_zero_inv.status_code == 201
+        zero_inv_id = resp_zero_inv.json()["id"]
+        zero_inv_get = client.get(f"/api/invoices/{zero_inv_id}", headers=headers).json()["invoice"]
+        assert zero_inv_get["tax_rate"] == "0.0000"
+        assert zero_inv_get["tax_amount"] == "0.00"
+        assert zero_inv_get["exclusive_amount"] == "75000.00"
+        assert zero_inv_get["total_amount"] == "75000.00"
+        assert zero_inv_get["cgst_amount"] == "0.00"
+        assert zero_inv_get["sgst_amount"] == "0.00"
+        assert zero_inv_get["igst_amount"] == "0.00"
+
+        # 3. Unit price excess precision normalization and exact line-item total reconciliation
+        # Supply unit_price with excess precision (e.g. 100.555 -> normalizes to 100.56)
+        # Quantity 10 * 100.56 = 1005.60
+        resp_excess_prec = client.post(
+            "/api/orders",
+            json={
+                "fy_code": "FY 2026-27",
+                "po_number": f"PO-PREC-{suffix}",
+                "po_date": "2026-06-01",
+                "customer_id": 1,
+                "items": [
+                    {
+                        "item_description": "Precision Item",
+                        "quantity": 10.0,
+                        "unit_price": 100.555,  # Normalizes to 100.56
+                        "tax_rate": 0.18,
+                    }
+                ],
+            },
+            headers=headers,
+        )
+        assert resp_excess_prec.status_code == 201
+        prec_po_data = resp_excess_prec.json()
+        li = prec_po_data["line_items"][0]
+        assert li["unit_price"] == "100.56"
+        assert li["exclusive_amount"] == "1005.60"
+        # Reconciles exactly: 10 * 100.56 == 1005.60
+        assert Decimal(li["quantity"]) * Decimal(li["unit_price"]) == Decimal(li["exclusive_amount"])
+        assert li["tax_amount"] == "181.01"  # 1005.60 * 0.18 = 181.008 -> 181.01
+        assert li["total_amount"] == "1186.61"
+    finally:
+        with get_db_session() as db:
+            if zero_inv_id:
+                for it in db.scalars(select(CommercialInvoiceItem).where(CommercialInvoiceItem.invoice_id == zero_inv_id)).all():
+                    db.delete(it)
+                inv_row = db.scalar(select(CommercialInvoice).where(CommercialInvoice.id == zero_inv_id))
+                if inv_row:
+                    db.delete(inv_row)
+            for p_num in [f"PO-ZERO-{suffix}", f"PO-PREC-{suffix}"]:
+                p_row = db.scalar(select(PurchaseOrder).where(PurchaseOrder.po_number == p_num))
+                if p_row:
+                    for it in db.scalars(select(PurchaseOrderItem).where(PurchaseOrderItem.po_id == p_row.id)).all():
+                        db.delete(it)
+                    db.delete(p_row)
+            db.commit()
+
 

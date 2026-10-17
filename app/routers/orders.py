@@ -305,7 +305,7 @@ def create_order(item: OrderCreate, user: dict = Depends(require_sales_finance_a
                     item_description=f"Purchase Order {po_num}",
                     quantity=1.0,
                     unit_price=item.exclusive_amount or 0.0,
-                    tax_rate=item.tax_rate or 0.18,
+                    tax_rate=item.tax_rate if item.tax_rate is not None else 0.18,
                 )
             ]
 
@@ -315,7 +315,7 @@ def create_order(item: OrderCreate, user: dict = Depends(require_sales_finance_a
 
         for ri in raw_items:
             qty = Decimal(str(ri.quantity))
-            price = Decimal(str(ri.unit_price))
+            price = Decimal(str(ri.unit_price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             rate = Decimal(str(ri.tax_rate))
 
             excl = (qty * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -338,12 +338,12 @@ def create_order(item: OrderCreate, user: dict = Depends(require_sales_finance_a
             )
 
         total_amount = total_excl + total_tax
-        primary_tax_rate = db_items[0].tax_rate if db_items else Decimal("0.1800")
+        primary_tax_rate = db_items[0].tax_rate if db_items else (Decimal(str(item.tax_rate)) if item.tax_rate is not None else Decimal("0.1800"))
 
-        # CF4C3-01: Inconsistency checks against caller-supplied amounts
+        # CF4C3-01: Inconsistency checks against caller-supplied amounts (strictly 0 tolerance after quantization)
         if item.exclusive_amount is not None:
             supplied_excl = Decimal(str(item.exclusive_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            if abs(supplied_excl - total_excl) > Decimal("0.01"):
+            if supplied_excl != total_excl:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Supplied exclusive_amount ({supplied_excl}) is inconsistent with line-item total ({total_excl})",
@@ -351,7 +351,7 @@ def create_order(item: OrderCreate, user: dict = Depends(require_sales_finance_a
 
         if item.tax_amount is not None:
             supplied_tax = Decimal(str(item.tax_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            if abs(supplied_tax - total_tax) > Decimal("0.01"):
+            if supplied_tax != total_tax:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Supplied tax_amount ({supplied_tax}) is inconsistent with calculated line-item tax ({total_tax})",
@@ -359,7 +359,7 @@ def create_order(item: OrderCreate, user: dict = Depends(require_sales_finance_a
 
         if item.total_amount is not None:
             supplied_total = Decimal(str(item.total_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            if abs(supplied_total - total_amount) > Decimal("0.01"):
+            if supplied_total != total_amount:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Supplied total_amount ({supplied_total}) is inconsistent with calculated line-item total ({total_amount})",
@@ -489,7 +489,7 @@ def update_order(id: int, item: OrderUpdate, user: dict = Depends(require_sales_
 
                 for ri in raw_items:
                     qty = Decimal(str(ri.quantity))
-                    price = Decimal(str(ri.unit_price))
+                    price = Decimal(str(ri.unit_price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
                     rate = Decimal(str(ri.tax_rate))
 
                     excl = (qty * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)

@@ -452,7 +452,7 @@ def create_invoice(
         if payload.items and len(payload.items) > 0:
             for item in payload.items:
                 qty = Decimal(str(item.quantity))
-                uprice = Decimal(str(item.unit_price))
+                uprice = Decimal(str(item.unit_price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
                 trate = Decimal(str(item.tax_rate))
 
                 d_excl = (qty * uprice).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -462,7 +462,7 @@ def create_invoice(
                 computed_items.append({
                     "description": item.desc,
                     "quantity": qty,
-                    "unit_price": uprice.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                    "unit_price": uprice,
                     "exclusive_amount": d_excl,
                     "tax_rate": trate,
                     "tax_amount": d_tax,
@@ -470,12 +470,12 @@ def create_invoice(
                 })
                 total_excl += d_excl
                 total_tax += d_tax
-            inv_tax_rate = Decimal(str(payload.tax_rate or (computed_items[0]["tax_rate"] if computed_items else 0.18)))
+            inv_tax_rate = Decimal(str(payload.tax_rate if payload.tax_rate is not None else (computed_items[0]["tax_rate"] if computed_items else 0.18)))
         else:
             if payload.exclusive_amount is None:
                 raise HTTPException(status_code=400, detail="Either line items or exclusive_amount must be provided")
             d_excl = Decimal(str(payload.exclusive_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            inv_tax_rate = Decimal(str(payload.tax_rate or 0.18))
+            inv_tax_rate = Decimal(str(payload.tax_rate if payload.tax_rate is not None else 0.18))
             d_tax = (d_excl * inv_tax_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             d_tot = (d_excl + d_tax).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
@@ -493,10 +493,10 @@ def create_invoice(
 
         total_amount_val = total_excl + total_tax
 
-        # CF4C3-01: Inconsistency checks against caller-supplied amounts
+        # CF4C3-01: Inconsistency checks against caller-supplied amounts (strictly 0 tolerance after quantization)
         if payload.exclusive_amount is not None and payload.items and len(payload.items) > 0:
             supplied_excl = Decimal(str(payload.exclusive_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            if abs(supplied_excl - total_excl) > Decimal("0.01"):
+            if supplied_excl != total_excl:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Supplied exclusive_amount ({supplied_excl}) is inconsistent with line-item total ({total_excl})",
@@ -504,7 +504,7 @@ def create_invoice(
 
         if payload.tax_amount is not None:
             supplied_tax = Decimal(str(payload.tax_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            if abs(supplied_tax - total_tax) > Decimal("0.01"):
+            if supplied_tax != total_tax:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Supplied tax_amount ({supplied_tax}) is inconsistent with authoritative tax calculation ({total_tax})",
@@ -512,7 +512,7 @@ def create_invoice(
 
         if payload.total_amount is not None:
             supplied_total = Decimal(str(payload.total_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            if abs(supplied_total - total_amount_val) > Decimal("0.01"):
+            if supplied_total != total_amount_val:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Supplied total_amount ({supplied_total}) is inconsistent with authoritative total ({total_amount_val})",
