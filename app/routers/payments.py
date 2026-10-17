@@ -119,6 +119,7 @@ def list_payments(
     transaction_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    search: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
     with get_db_session() as db:
@@ -138,6 +139,14 @@ def list_payments(
             stmt = stmt.where(PaymentTransaction.payment_mode == payment_mode.upper())
         if transaction_type:
             stmt = stmt.where(PaymentTransaction.transaction_type == transaction_type.upper())
+        if search and search.strip():
+            pat = f"%{search.strip()}%"
+            stmt = stmt.where(
+                PaymentTransaction.remittance_number.ilike(pat)
+                | CommercialInvoice.invoice_number.ilike(pat)
+                | Customer.billing_name.ilike(pat)
+                | PaymentTransaction.notes.ilike(pat)
+            )
         if date_from:
             try:
                 d_from = datetime.date.fromisoformat(date_from)
@@ -399,34 +408,34 @@ def record_payment(
             recorded_by=user["id"],
             created_at=datetime.datetime.now(datetime.timezone.utc),
         )
-        db.add(new_tx)
-        db.flush()
-
-        log_security_audit(
-            "PAYMENT_RECORDED",
-            "PAYMENT",
-            str(new_tx.id),
-            user_id=user["id"],
-            username=user["username"],
-            details={
-                "invoice_id": inv.id,
-                "invoice_number": inv.invoice_number,
-                "cash_amount": str(pay_amt),
-                "tds_amount": str(tds),
-                "total_settled": str(total_settling),
-                "payment_mode": mode,
-                "payment_date": parsed_date.isoformat(),
-                "remittance_number": remit,
-                "tds_section": tds_sec_code,
-            },
-            request_id=req_id,
-            db=db,
-        )
         try:
+            db.add(new_tx)
+            db.flush()
+
+            log_security_audit(
+                "PAYMENT_RECORDED",
+                "PAYMENT",
+                str(new_tx.id),
+                user_id=user["id"],
+                username=user["username"],
+                details={
+                    "invoice_id": inv.id,
+                    "invoice_number": inv.invoice_number,
+                    "cash_amount": str(pay_amt),
+                    "tds_amount": str(tds),
+                    "total_settled": str(total_settling),
+                    "payment_mode": mode,
+                    "payment_date": parsed_date.isoformat(),
+                    "remittance_number": remit,
+                    "tds_section": tds_sec_code,
+                },
+                request_id=req_id,
+                db=db,
+            )
             db.commit()
         except IntegrityError as exc:
             db.rollback()
-            if idem_key and ("idempotency_key" in str(exc).lower() or "unique" in str(exc).lower()):
+            if idem_key and ("idempotency_key" in str(exc).lower() or "unique" in str(exc).lower() or "payment_transactions" in str(exc).lower()):
                 existing = db.scalar(
                     select(PaymentTransaction).where(PaymentTransaction.idempotency_key == idem_key)
                 )
@@ -438,6 +447,10 @@ def record_payment(
                             status_code=status.HTTP_409_CONFLICT,
                             detail=f"Conflicting reuse of idempotency key '{idem_key}' with different payload",
                         )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Conflicting reuse of idempotency key '{idem_key}' with different payload",
+                )
             raise
 
         db.refresh(inv)

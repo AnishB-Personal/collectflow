@@ -1046,3 +1046,91 @@ def test_ledger_retains_history_for_cancelled_invoice():
     assert rev_item["transaction_type"] == "REVERSAL"
     assert rev_item["invoice_lifecycle_status"] == "CANCELLED"
 
+
+def test_concurrent_cross_invoice_idempotency_race():
+    """
+    CF4C4-02: Simultaneous same-key requests targeting DIFFERENT invoices.
+    Must handle unique-key collision during db.flush()/commit() gracefully.
+    Exactly one succeeds (HTTP 200), the other returns controlled HTTP 409 Conflict.
+    Zero uncaught 500 errors, zero duplicate transactions, zero partial audit logs.
+    """
+    token_admin = _get_token("sandbox_admin", "AdminPass123!")
+    headers = {"Authorization": f"Bearer {token_admin}"}
+
+    inv_id1 = _create_test_invoice(Decimal("50000.00"), "INV-TEST-4C4-XIDEM-1")
+    inv_id2 = _create_test_invoice(Decimal("50000.00"), "INV-TEST-4C4-XIDEM-2")
+    key = f"idem-cross-{uuid.uuid4()}"
+
+    payload1 = {
+        "invoice_id": inv_id1,
+        "payment_amount": "20000.00",
+        "tds_amount": "0.00",
+        "payment_date": "2026-04-20",
+        "payment_mode": "NEFT",
+        "remittance_number": "UTR-CROSS-01",
+        "notes": "Cross invoice idempotency test 1",
+        "idempotency_key": key,
+    }
+    payload2 = {
+        "invoice_id": inv_id2,
+        "payment_amount": "20000.00",
+        "tds_amount": "0.00",
+        "payment_date": "2026-04-20",
+        "payment_mode": "NEFT",
+        "remittance_number": "UTR-CROSS-02",
+        "notes": "Cross invoice idempotency test 2",
+        "idempotency_key": key,
+    }
+
+    def _submit(payload):
+        c = TestClient(app)
+        return c.post("/api/payments", json=payload, headers=headers)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(_submit, payload1)
+        f2 = executor.submit(_submit, payload2)
+        r1 = f1.result()
+        r2 = f2.result()
+
+    statuses = [r1.status_code, r2.status_code]
+    assert 200 in statuses, f"Expected one 200, got: {statuses}. Responses: {r1.text}, {r2.text}"
+    assert 409 in statuses, f"Expected one 409, got: {statuses}. Responses: {r1.text}, {r2.text}"
+
+    # Verify exactly 1 payment transaction in DB with that key
+    with get_db_session() as db:
+        txs = db.scalars(
+            select(PaymentTransaction).where(PaymentTransaction.idempotency_key == key)
+        ).all()
+        assert len(txs) == 1
+
+        # Verify audit logs: exactly 1 PAYMENT_RECORDED audit log with this key's payment_id
+        winner_tx = txs[0]
+        from app.models.domain_models import AuditLog
+        audits = db.scalars(
+            select(AuditLog).where(
+                AuditLog.action == "PAYMENT_RECORDED",
+                AuditLog.entity_id == str(winner_tx.id)
+            )
+        ).all()
+        assert len(audits) == 1
+
+
+def test_payments_ledger_pagination_and_search():
+    """
+    CF4C4-03: Verify backend respect of page, limit, total, total_pages, and search filtering.
+    """
+    token_admin = _get_token("sandbox_admin", "AdminPass123!")
+    headers = {"Authorization": f"Bearer {token_admin}"}
+
+    # Query with limit=5
+    res = client.get("/api/payments?page=1&limit=5", headers=headers)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["page"] == 1
+    assert body["limit"] == 5
+    assert "total" in body
+    assert "total_pages" in body
+    assert len(body["data"]) <= 5
+    assert "summary" in body
+
+

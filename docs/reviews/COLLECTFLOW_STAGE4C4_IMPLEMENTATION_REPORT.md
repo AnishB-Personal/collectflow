@@ -143,3 +143,20 @@ Running 3 tests using 1 worker
 - **Currency Scope:** Strictly INR; unsupported currencies fail safely with HTTP 400.
 - **Stage 4C.5 Quarantine:** Reports, exports, and aging analytics quarantine scoped to Stage 4C.5.
 - **Main Branch Cleanliness:** Feature branches remain isolated on `feature/phase4-stage4c4-payments-adjustments`. Neither branch has been merged to `main`.
+
+---
+
+## 6. Final Focused Acceptance Closure (CF4C4-02 & CF4C4-03)
+
+### A. CF4C4-02: Cross-Invoice Idempotency Race Closure
+- **Flush-time Unique Collision Protection:** Encapsulated `db.add()`, `db.flush()`, security audit logging, and `db.commit()` in `app/routers/payments.py` within an `IntegrityError` handler.
+- **Controlled 409 Conflict:** When concurrent requests reuse an identical idempotency key targeting different invoices, unique key collisions during `db.flush()` trigger a clean rollback and return a controlled HTTP 409 Conflict with zero uncaught exceptions, zero duplicate payment records, and zero orphaned audit entries.
+- **PostgreSQL Concurrency Regression Suite:** Verified with multithreaded test `test_concurrent_cross_invoice_idempotency_race` asserting concurrent status codes `[200, 409]`, exact single database transaction, and single audit log record.
+
+### B. CF4C4-03: Complete LIVE Ledger Retrieval Closure
+- **Authoritative Server Pagination:** Wired `apiClient.getPayments` parameters (`page`, `limit`, `fy`, `payment_mode`, `search`) directly to the backend endpoint, respecting `total` and `total_pages` metadata across all transaction volumes.
+- **Explicit Loading & API Failure States:** Implemented explicit accessible loading (`role="status"`) and failure (`role="alert"` with Retry action) states. Completely eliminated silent fallback to incomplete invoice-embedded records.
+- **Full Historical Visibility & Invariants:** Verified retention of transactions associated with cancelled invoices, signed negative amounts for reversals, badges (`PAYMENT`, `REVERSAL`, `SUPERSEDED`, `Cancelled`), correction eligibility gating, and unchanged MOCK mode operation.
+
+### C. Stage 4C.5 Accounting Policy Limitation Recording
+- **Correction-Date Accounting Policy Limitation:** In Stage 4C.4, payment corrections and reversals record both their business event date (`payment_date`) and their authoritative transaction timestamp (`created_at`). When evaluating point-in-time AR aging, revenue recognition, and tax ledger reconciliations across closed financial periods, statutory accounting policies distinguish between prior-period restatement and current-period adjustment upon discovery. In Stage 4C.4, no speculative accounting policy is invented; instead, the dual-date audit trail is persisted deterministically in PostgreSQL and recorded as an explicit input requirement for the Stage 4C.5 reporting engine plan.
