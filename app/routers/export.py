@@ -101,19 +101,47 @@ def create_export_token(
     Generate a short-lived, single-use export ticket:
     - Admin and finance only.
     - 256 bits CSPRNG entropy.
-    - Bound to format, FY, and scope.
+    - Strictly bound to format, FY, and scope.
     - Stored as SHA-256 hash in export_tickets table (raw secret never stored or logged).
     - Expires in 5 minutes (300 seconds).
     - Atomically consumed on download under PostgreSQL row lock.
     """
+    if not payload:
+        raise HTTPException(
+            status_code=400,
+            detail="Export ticket request requires payload with explicit 'format', 'fy', and 'scope'.",
+        )
+
+    # 1. Format
+    if not payload.format or not payload.format.strip():
+        req_format = "excel"
+    else:
+        req_format = payload.format.lower().strip()
+    if req_format not in ("excel", "csv"):
+        raise HTTPException(status_code=400, detail="Invalid export format. Allowed formats: 'excel', 'csv'.")
+
+    # 2. FY
+    if not payload.fy or not payload.fy.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Export ticket requires an explicit financial year (e.g. 'FY 2026-27') or explicit 'ALL'. Unscoped tickets are prohibited.",
+        )
+    raw_fy = payload.fy.strip()
+    req_fy = "ALL" if raw_fy.upper() in ("ALL", "ALL FY", "ALL FINANCIAL YEARS") else raw_fy
+
+    # 3. Scope
+    if not payload.scope or not payload.scope.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Export ticket requires an explicit scope (e.g. 'all', 'outstanding'). Unscoped tickets are prohibited.",
+        )
+    raw_scope = payload.scope.strip().lower()
+    req_scope = "all" if raw_scope in ("all", "all_records", "all records", "all invoices") else raw_scope
+
     ticket_secret = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(ticket_secret.encode("utf-8")).hexdigest()
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     expires_at = now_utc + datetime.timedelta(minutes=5)
-
-    req_format = payload.format.lower().strip() if payload and payload.format else None
-    req_fy = payload.fy.strip() if payload and payload.fy else None
-    req_scope = payload.scope.lower().strip() if payload and payload.scope else None
 
     with get_db_session() as db:
         ticket_record = ExportTicket(
@@ -166,134 +194,167 @@ def authenticate_and_consume_export_ticket(
 ) -> dict:
     """
     Authenticates export requests:
-    - If a single-use ticket is provided, it is strictly validated, checked against bindings
-      (format, fy, scope, user), and atomically consumed under PostgreSQL row lock (SELECT FOR UPDATE).
-    - Bearer authorization headers CANNOT bypass ticket consumption when downloading with a ticket.
-    - If ticket is omitted, direct Bearer header is permitted only for programmatic admin/finance access.
+    - Every download requires a valid single-use export ticket; bearer authorization alone
+      CANNOT bypass ticket validation.
+    - User identity and admin/finance RBAC checks enforced.
+    - Format, FY and scope validated against exact canonical values recorded at issuance.
+    - Atomically consumed under PostgreSQL row lock (SELECT FOR UPDATE).
     """
+    if not ticket or not ticket.strip():
+        raise HTTPException(
+            status_code=401,
+            detail="Export download requires a valid single-use export ticket. Bearer authorization alone cannot bypass ticket requirement.",
+        )
+
     req_path = request.url.path.lower()
     req_format = "excel" if "excel" in req_path else "csv" if "csv" in req_path else None
     req_fy = request.query_params.get("fy")
     req_scope = request.query_params.get("scope")
 
-    # When ticket is provided, strict validation & atomic consumption is mandatory
-    if ticket and ticket.strip():
-        token_hash = hashlib.sha256(ticket.strip().encode("utf-8")).hexdigest()
-        now = datetime.datetime.now(datetime.timezone.utc)
+    token_hash = hashlib.sha256(ticket.strip().encode("utf-8")).hexdigest()
+    now = datetime.datetime.now(datetime.timezone.utc)
 
-        with get_db_session() as db:
-            ticket_row = (
-                db.query(ExportTicket)
-                .filter(ExportTicket.token_hash == token_hash)
-                .with_for_update()
-                .first()
+    with get_db_session() as db:
+        ticket_row = (
+            db.query(ExportTicket)
+            .filter(ExportTicket.token_hash == token_hash)
+            .with_for_update()
+            .first()
+        )
+
+        if not ticket_row:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid, expired, or already consumed export ticket.",
             )
 
-            if not ticket_row:
+        if ticket_row.used:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid, expired, or already consumed export ticket.",
+            )
+
+        exp_time = ticket_row.expires_at
+        if exp_time.tzinfo is None:
+            exp_time = exp_time.replace(tzinfo=datetime.timezone.utc)
+
+        if exp_time < now:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid, expired, or already consumed export ticket.",
+            )
+
+        owner = db.query(User).filter(User.id == ticket_row.user_id).first()
+        if not owner or owner.role not in ("admin", "finance"):
+            raise HTTPException(
+                status_code=403,
+                detail="Export generation requires admin or finance privileges.",
+            )
+
+        # User binding: If Bearer header is present, ensure caller matches ticket owner
+        if authorization and authorization.startswith("Bearer "):
+            bearer_user = get_current_user(authorization=authorization, bearer_creds=None)
+            if bearer_user.get("id") != ticket_row.user_id:
                 raise HTTPException(
-                    status_code=401,
-                    detail="Invalid, expired, or already consumed export ticket.",
+                    status_code=403,
+                    detail="Export ticket was issued to a different user.",
                 )
-
-            if ticket_row.used:
-                raise HTTPException(
-                    status_code=401,
-                    detail="Invalid, expired, or already consumed export ticket.",
-                )
-
-            exp_time = ticket_row.expires_at
-            if exp_time.tzinfo is None:
-                exp_time = exp_time.replace(tzinfo=datetime.timezone.utc)
-
-            if exp_time < now:
-                raise HTTPException(
-                    status_code=401,
-                    detail="Invalid, expired, or already consumed export ticket.",
-                )
-
-            owner = db.query(User).filter(User.id == ticket_row.user_id).first()
-            if not owner or owner.role not in ("admin", "finance"):
+            if bearer_user.get("role") not in ("admin", "finance"):
                 raise HTTPException(
                     status_code=403,
                     detail="Export generation requires admin or finance privileges.",
                 )
 
-            # User binding: If Bearer header is present, ensure caller matches ticket owner
-            if authorization and authorization.startswith("Bearer "):
-                bearer_user = get_current_user(authorization=authorization, bearer_creds=None)
-                if bearer_user.get("id") != ticket_row.user_id:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="Export ticket was issued to a different user.",
-                    )
+        # Format binding check
+        if ticket_row.format and req_format:
+            if ticket_row.format.lower() != req_format.lower():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Export ticket is bound to format '{ticket_row.format}', cannot download as '{req_format}'.",
+                )
 
-            # Format binding check
-            if ticket_row.format and req_format:
-                if ticket_row.format.lower() != req_format.lower():
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Export ticket is bound to format '{ticket_row.format}', cannot download as '{req_format}'.",
-                    )
+        # FY binding check against exact canonical values
+        raw_dl_fy = req_fy.strip() if req_fy and req_fy.strip() else None
+        dl_fy_canon = ("ALL" if raw_dl_fy.upper() in ("ALL", "ALL FY") else raw_dl_fy) if raw_dl_fy else None
 
-            # FY binding check
-            if ticket_row.fy_code and ticket_row.fy_code.upper() not in ("ALL", "ALL FY"):
-                if req_fy and req_fy.upper() not in ("ALL", "ALL FY") and req_fy.upper() != ticket_row.fy_code.upper():
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Export ticket is bound to financial year '{ticket_row.fy_code}'.",
-                    )
+        if ticket_row.fy_code == "ALL":
+            if dl_fy_canon != "ALL":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Export ticket was issued for financial year 'ALL'. Request must specify fy='ALL'.",
+                )
+        else:
+            if not dl_fy_canon:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Export ticket is bound to financial year '{ticket_row.fy_code}'. Missing 'fy' parameter.",
+                )
+            if dl_fy_canon == "ALL":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Export ticket is bound to financial year '{ticket_row.fy_code}', cannot request scope 'ALL'.",
+                )
+            if dl_fy_canon.upper() != ticket_row.fy_code.upper():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Export ticket is bound to financial year '{ticket_row.fy_code}', cannot request '{dl_fy_canon}'.",
+                )
 
-            # Scope binding check
-            if ticket_row.scope and ticket_row.scope.lower() not in ("all", ""):
-                if req_scope and req_scope.lower() not in ("all", "") and req_scope.lower() != ticket_row.scope.lower():
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Export ticket is bound to scope '{ticket_row.scope}'.",
-                    )
+        # Scope binding check against exact canonical values
+        raw_dl_scope = req_scope.strip().lower() if req_scope and req_scope.strip() else None
+        dl_scope_canon = ("all" if raw_dl_scope in ("all", "all_records", "all records") else raw_dl_scope) if raw_dl_scope else None
 
-            # Atomically mark as consumed under row lock
-            ticket_row.used = True
+        if ticket_row.scope == "all":
+            if dl_scope_canon != "all":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Export ticket was issued for scope 'all'. Request must specify scope='all'.",
+                )
+        else:
+            if not dl_scope_canon:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Export ticket is bound to scope '{ticket_row.scope}'. Missing 'scope' parameter.",
+                )
+            if dl_scope_canon in ("all", "all_records", "all records"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Export ticket is bound to scope '{ticket_row.scope}', cannot request 'all'.",
+                )
+            if dl_scope_canon != ticket_row.scope.lower():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Export ticket is bound to scope '{ticket_row.scope}', cannot request '{dl_scope_canon}'.",
+                )
 
-            audit_entry = AuditLog(
-                user_id=owner.id,
-                username=owner.username,
-                action="EXPORT_DOWNLOAD_COMPLETED",
-                entity_type="export_ticket",
-                entity_id=token_hash[:16],
-                details={
-                    "download_by": owner.username,
-                    "role": owner.role,
-                    "format": req_format,
-                    "fy": req_fy,
-                    "scope": req_scope,
-                },
-                ip_address=request.client.host if request.client else None,
-                request_id=getattr(request.state, "request_id", None),
-            )
-            db.add(audit_entry)
-            db.commit()
+        # Atomically mark as consumed under row lock
+        ticket_row.used = True
 
-            return {
-                "id": owner.id,
-                "username": owner.username,
+        audit_entry = AuditLog(
+            user_id=owner.id,
+            username=owner.username,
+            action="EXPORT_DOWNLOAD_COMPLETED",
+            entity_type="export_ticket",
+            entity_id=token_hash[:16],
+            details={
+                "download_by": owner.username,
                 "role": owner.role,
-                "full_name": owner.full_name,
-            }
+                "format": req_format,
+                "fy": dl_fy_canon,
+                "scope": dl_scope_canon,
+            },
+            ip_address=request.client.host if request.client else None,
+            request_id=getattr(request.state, "request_id", None),
+        )
+        db.add(audit_entry)
+        db.commit()
 
-    # Direct Bearer header fallback (when ticket is explicitly not provided)
-    if authorization and authorization.startswith("Bearer "):
-        user = get_current_user(authorization=authorization, bearer_creds=None)
-        if user.get("role") not in ("admin", "finance"):
-            raise HTTPException(
-                status_code=403,
-                detail="Export generation requires admin or finance privileges.",
-            )
-        return user
-
-    raise HTTPException(
-        status_code=401,
-        detail="Export requires Authorization header or a valid single-use ticket.",
-    )
+        return {
+            "id": owner.id,
+            "username": owner.username,
+            "role": owner.role,
+            "full_name": owner.full_name,
+        }
 
 
 def _compile_export_records(

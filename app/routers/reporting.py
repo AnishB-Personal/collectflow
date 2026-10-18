@@ -543,22 +543,32 @@ def get_customer_exposure_report(
                 {
                     "customer_id": c.id,
                     "customer_name": c.billing_name,
+                    "billing_name": c.billing_name,
                     "gstin": c.gst_number or "—",
                     "state": c.state or "—",
                     "total_orders": len(c_invoices) + len(c_pos),
                     "total_billed": _format_money(c_billed),
+                    "total_invoiced": _format_money(c_billed),
                     "total_cash": _format_money(c_cash),
                     "total_tds": _format_money(c_tds),
                     "total_settled": _format_money(c_settled),
                     "outstanding_balance": _format_money(c_outstanding),
                     "unbilled_value": _format_money(c_unbilled),
+                    "unbilled_orders_value": _format_money(c_unbilled),
                     "overdue_exposure": _format_money(c_overdue),
+                    "overdue_balance": _format_money(c_overdue),
                 }
             )
 
         return {
+            "as_of_date": target_date.isoformat(),
+            "fy_code": fy or "ALL",
+            "total_outstanding": _format_money(tot_outstanding),
             "rows": rows,
+            "customers": rows,
             "summary": {
+                "as_of_date": target_date.isoformat(),
+                "fy_code": fy or "ALL",
                 "total_billed": _format_money(tot_billed),
                 "total_cash": _format_money(tot_cash),
                 "total_tds": _format_money(tot_tds),

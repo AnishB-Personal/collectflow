@@ -178,40 +178,55 @@ def test_targets_upsert_validation_and_audit(admin_headers, sales_headers, finan
 
 def test_targets_preserved_on_user_deactivation(admin_headers):
     """Historical targets must be retained even when a user is deactivated."""
-    with get_db_session() as db:
-        # Create a test sales user
-        import uuid
-        unique_suffix = uuid.uuid4().hex[:8]
-        test_user = User(
-            username=f"deact_sales_{unique_suffix}",
-            password_hash="argon2id_hash_placeholder",
-            role="sales",
-            full_name=f"Deactivated Rep {unique_suffix}",
-            is_active=False,  # Deactivated
-        )
-        db.add(test_user)
-        db.flush()
+    deactivated_uid = None
+    target_id = None
+    try:
+        with get_db_session() as db:
+            # Create a test sales user
+            import uuid
+            unique_suffix = uuid.uuid4().hex[:8]
+            test_user = User(
+                username=f"deact_sales_{unique_suffix}",
+                password_hash="argon2id_hash_placeholder",
+                role="sales",
+                full_name=f"Deactivated Rep {unique_suffix}",
+                is_active=False,  # Deactivated
+            )
+            db.add(test_user)
+            db.flush()
 
-        test_target = SalesTarget(
-            user_id=test_user.id,
-            fy_code="FY 2026-27",
-            yearly_target=Decimal("3500000.00"),
-            half_yearly_target=Decimal("1750000.00"),
-            quarterly_target=Decimal("875000.00"),
-            monthly_target=Decimal("291666.67"),
-            monthly_bottom_line=Decimal("200000.00"),
-            yearly_bottom_line=Decimal("2500000.00"),
-        )
-        db.add(test_target)
-        db.commit()
-        deactivated_uid = test_user.id
+            test_target = SalesTarget(
+                user_id=test_user.id,
+                fy_code="FY 2026-27",
+                yearly_target=Decimal("3500000.00"),
+                half_yearly_target=Decimal("1750000.00"),
+                quarterly_target=Decimal("875000.00"),
+                monthly_target=Decimal("291666.67"),
+                monthly_bottom_line=Decimal("200000.00"),
+                yearly_bottom_line=Decimal("2500000.00"),
+            )
+            db.add(test_target)
+            db.commit()
+            deactivated_uid = test_user.id
+            target_id = test_target.id
 
-    res = client.get(f"/api/targets?fy=FY%202026-27&user_id={deactivated_uid}", headers=admin_headers)
-    assert res.status_code == 200
-    records = res.json()
-    assert len(records) == 1
-    assert records[0]["yearly_target"] == "3500000.00"
-    assert "Deactivated Rep" in records[0]["executive_name"]
+        res = client.get(f"/api/targets?fy=FY%202026-27&user_id={deactivated_uid}", headers=admin_headers)
+        assert res.status_code == 200
+        records = res.json()
+        assert len(records) == 1
+        assert records[0]["yearly_target"] == "3500000.00"
+        assert "Deactivated Rep" in records[0]["executive_name"]
+    finally:
+        if deactivated_uid:
+            with get_db_session() as db:
+                if target_id:
+                    t = db.query(SalesTarget).filter(SalesTarget.id == target_id).first()
+                    if t:
+                        db.delete(t)
+                u = db.query(User).filter(User.id == deactivated_uid).first()
+                if u:
+                    db.delete(u)
+                db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -312,27 +327,32 @@ def test_reporting_customer_exposure(admin_headers):
 # ---------------------------------------------------------------------------
 
 def test_export_token_rbac(admin_headers, finance_headers, sales_headers, viewer_headers):
+    payload = {"format": "excel", "fy": "ALL", "scope": "all"}
     # Admin and Finance can generate export tokens
-    res_admin = client.post("/api/export/token", headers=admin_headers)
+    res_admin = client.post("/api/export/token", headers=admin_headers, json=payload)
     assert res_admin.status_code == 200
     data_admin = res_admin.json()
     assert "ticket" in data_admin
     assert data_admin["expires_in"] == 300
 
-    res_fin = client.post("/api/export/token", headers=finance_headers)
+    res_fin = client.post("/api/export/token", headers=finance_headers, json=payload)
     assert res_fin.status_code == 200
 
     # Sales and Viewer are blocked from requesting tokens
-    res_sales = client.post("/api/export/token", headers=sales_headers)
+    res_sales = client.post("/api/export/token", headers=sales_headers, json=payload)
     assert res_sales.status_code == 403
 
-    res_viewer = client.post("/api/export/token", headers=viewer_headers)
+    res_viewer = client.post("/api/export/token", headers=viewer_headers, json=payload)
     assert res_viewer.status_code == 403
 
 
 def test_export_ticket_single_use_consumption(admin_headers):
     # Request ticket
-    res_tok = client.post("/api/export/token", headers=admin_headers)
+    res_tok = client.post(
+        "/api/export/token",
+        headers=admin_headers,
+        json={"format": "excel", "fy": "ALL", "scope": "all"},
+    )
     assert res_tok.status_code == 200
     ticket = res_tok.json()["ticket"]
 
@@ -344,7 +364,7 @@ def test_export_ticket_single_use_consumption(admin_headers):
         assert t_row.used is False
 
     # First download with ticket succeeds
-    res_dl1 = client.get(f"/api/export/excel?ticket={ticket}")
+    res_dl1 = client.get(f"/api/export/excel?ticket={ticket}&fy=ALL&scope=all")
     assert res_dl1.status_code == 200
     assert res_dl1.headers["content-type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -354,14 +374,22 @@ def test_export_ticket_single_use_consumption(admin_headers):
         assert t_row_after.used is True
 
     # Replay of the same ticket must be rejected with 401
-    res_dl2 = client.get(f"/api/export/excel?ticket={ticket}")
+    res_dl2 = client.get(f"/api/export/excel?ticket={ticket}&fy=ALL&scope=all")
     assert res_dl2.status_code == 401
     assert "already consumed" in res_dl2.json()["detail"]
 
 
 def test_export_excel_17_columns_and_formula_injection(admin_headers):
-    # Direct bearer header export
-    res = client.get("/api/export/excel?fy=FY%202026-27&scope=all", headers=admin_headers)
+    # Request ticket
+    res_tok = client.post(
+        "/api/export/token",
+        headers=admin_headers,
+        json={"format": "excel", "fy": "FY 2026-27", "scope": "all"},
+    )
+    assert res_tok.status_code == 200
+    ticket = res_tok.json()["ticket"]
+
+    res = client.get(f"/api/export/excel?ticket={ticket}&fy=FY%202026-27&scope=all", headers=admin_headers)
     assert res.status_code == 200
 
     # Parse Excel workbook with openpyxl
@@ -399,7 +427,15 @@ def test_export_excel_17_columns_and_formula_injection(admin_headers):
 
 
 def test_export_csv_matching_columns_and_escaping(admin_headers):
-    res = client.get("/api/export/csv?fy=FY%202026-27&scope=all", headers=admin_headers)
+    res_tok = client.post(
+        "/api/export/token",
+        headers=admin_headers,
+        json={"format": "csv", "fy": "FY 2026-27", "scope": "all"},
+    )
+    assert res_tok.status_code == 200
+    ticket = res_tok.json()["ticket"]
+
+    res = client.get(f"/api/export/csv?ticket={ticket}&fy=FY%202026-27&scope=all", headers=admin_headers)
     assert res.status_code == 200
     assert "text/csv" in res.headers["content-type"]
 
@@ -559,3 +595,243 @@ def test_export_ticket_bearer_cannot_bypass_and_bindings(admin_headers, finance_
         if po_val and po_val != "—":
             # Must NOT be synthetic PO-{id}
             assert not (isinstance(po_val, str) and po_val.startswith("PO-") and po_val[3:].isdigit())
+
+
+def test_export_strict_ticket_enforcement_matrix(admin_headers, finance_headers):
+    """
+    CF4C5-03: Strict Export Ticket Enforcement Matrix:
+    1. Missing ticket with valid bearer token -> 401
+    2. Ticket scoped to one FY but download omits FY -> 400
+    3. Ticket scoped to one FY but download requests ALL -> 400
+    4. Ticket scoped to outstanding but download requests all -> 400
+    5. Cross-user ticket use -> 403
+    6. Correct matching parameters and one successful download -> 200
+    7. Subsequent replay rejection -> 401
+    """
+    # 1. Missing ticket with valid bearer token must return 401
+    res_no_ticket = client.get("/api/export/excel?fy=FY%202026-27&scope=all", headers=admin_headers)
+    assert res_no_ticket.status_code == 401
+    assert "single-use export ticket" in res_no_ticket.json()["detail"]
+
+    # 2. Ticket scoped to one FY but download omits FY
+    res_tok_fy = client.post(
+        "/api/export/token",
+        headers=admin_headers,
+        json={"format": "excel", "fy": "FY 2026-27", "scope": "all"},
+    )
+    assert res_tok_fy.status_code == 200
+    ticket_fy = res_tok_fy.json()["ticket"]
+
+    res_omit_fy = client.get(
+        f"/api/export/excel?ticket={ticket_fy}&scope=all",
+        headers=admin_headers,
+    )
+    assert res_omit_fy.status_code == 400
+    assert "Missing 'fy' parameter" in res_omit_fy.json()["detail"]
+
+    # 3. Ticket scoped to one FY but download requests ALL
+    res_tok_scoped = client.post(
+        "/api/export/token",
+        headers=admin_headers,
+        json={"format": "excel", "fy": "FY 2026-27", "scope": "all"},
+    )
+    assert res_tok_scoped.status_code == 200
+    ticket_scoped = res_tok_scoped.json()["ticket"]
+
+    res_req_all_fy = client.get(
+        f"/api/export/excel?ticket={ticket_scoped}&fy=ALL&scope=all",
+        headers=admin_headers,
+    )
+    assert res_req_all_fy.status_code == 400
+    assert "cannot request scope 'ALL'" in res_req_all_fy.json()["detail"]
+
+    # 4. Ticket scoped to outstanding but download requests all
+    res_tok_out = client.post(
+        "/api/export/token",
+        headers=admin_headers,
+        json={"format": "excel", "fy": "FY 2026-27", "scope": "outstanding"},
+    )
+    assert res_tok_out.status_code == 200
+    ticket_out = res_tok_out.json()["ticket"]
+
+    res_req_all_scope = client.get(
+        f"/api/export/excel?ticket={ticket_out}&fy=FY%202026-27&scope=all",
+        headers=admin_headers,
+    )
+    assert res_req_all_scope.status_code == 400
+    assert "cannot request 'all'" in res_req_all_scope.json()["detail"]
+
+    # 5. Cross-user ticket use (admin issues ticket, finance attempts download with finance bearer)
+    res_tok_user_a = client.post(
+        "/api/export/token",
+        headers=admin_headers,
+        json={"format": "excel", "fy": "FY 2026-27", "scope": "all"},
+    )
+    assert res_tok_user_a.status_code == 200
+    ticket_user_a = res_tok_user_a.json()["ticket"]
+
+    res_cross_user = client.get(
+        f"/api/export/excel?ticket={ticket_user_a}&fy=FY%202026-27&scope=all",
+        headers=finance_headers,
+    )
+    assert res_cross_user.status_code == 403
+    assert "different user" in res_cross_user.json()["detail"]
+
+    # 6. Correct matching parameters and one successful download
+    res_tok_valid = client.post(
+        "/api/export/token",
+        headers=finance_headers,
+        json={"format": "excel", "fy": "FY 2026-27", "scope": "outstanding"},
+    )
+    assert res_tok_valid.status_code == 200
+    ticket_valid = res_tok_valid.json()["ticket"]
+
+    res_dl_success = client.get(
+        f"/api/export/excel?ticket={ticket_valid}&fy=FY%202026-27&scope=outstanding",
+        headers=finance_headers,
+    )
+    assert res_dl_success.status_code == 200
+    assert "openxmlformats" in res_dl_success.headers["content-type"]
+
+    # 7. Subsequent replay rejection
+    res_replay = client.get(
+        f"/api/export/excel?ticket={ticket_valid}&fy=FY%202026-27&scope=outstanding",
+        headers=finance_headers,
+    )
+    assert res_replay.status_code == 401
+    assert "already consumed" in res_replay.json()["detail"]
+
+
+def test_customer_exposure_api_contract(admin_headers):
+    """
+    CF4C5-02 API Contract test for customer exposure:
+    Verifies top-level { rows, summary, as_of_date, fy_code, total_outstanding }
+    and row fields.
+    """
+    res = client.get("/api/reporting/customer-exposure?fy=FY%202026-27", headers=admin_headers)
+    assert res.status_code == 200
+    data = res.json()
+
+    # Top level contracts
+    assert "rows" in data
+    assert "summary" in data
+    assert "as_of_date" in data
+    assert "fy_code" in data
+    assert "total_outstanding" in data
+
+    # Summary structure
+    summary = data["summary"]
+    assert "total_billed" in summary
+    assert "total_cash" in summary
+    assert "total_tds" in summary
+    assert "total_settled" in summary
+    assert "total_outstanding" in summary
+    assert "total_overdue" in summary
+    assert "customer_count" in summary
+    assert Decimal(summary["total_cash"]) + Decimal(summary["total_tds"]) == Decimal(summary["total_settled"])
+
+    # Row contract
+    for row in data["rows"]:
+        assert "customer_id" in row
+        assert "customer_name" in row
+        assert "total_billed" in row
+        assert "total_cash" in row
+        assert "total_tds" in row
+        assert "total_settled" in row
+        assert "outstanding_balance" in row
+        assert Decimal(row["total_cash"]) + Decimal(row["total_tds"]) == Decimal(row["total_settled"])
+
+
+def test_reporting_over_100_invoices_pagination_and_totals(admin_headers):
+    """
+    CF4C5-02 Regression:
+    Seeds > 100 invoices into PostgreSQL, verifies:
+    1. /api/invoices returns total > 100 with accurate total_pages.
+    2. Server-side pagination across pages 1, 2, 3 works without truncation.
+    3. Global reporting summary totals reconcile all invoices across PostgreSQL without 100-invoice truncation.
+    """
+    new_invoice_numbers = []
+    temp_cust_id = None
+    with get_db_session() as db:
+        admin_user = db.query(User).filter(User.username == "sandbox_admin").first()
+        assert admin_user is not None
+
+        timestamp_prefix = int(datetime.datetime.now().timestamp() * 1000)
+        temp_cust = Customer(
+            billing_name=f"Bulk Invoices Test Customer {timestamp_prefix}",
+            billing_address="123 Bulk Test St",
+            state="Karnataka",
+            gst_number="29AAACH9999A1Z9",
+        )
+        db.add(temp_cust)
+        db.commit()
+        db.refresh(temp_cust)
+        temp_cust_id = temp_cust.id
+
+        # Seed 105 additional invoices to guarantee > 100 invoices
+        for i in range(105):
+            inv_num = f"INV-BULK-{timestamp_prefix}-{i:04d}"
+            new_invoice_numbers.append(inv_num)
+            inv = CommercialInvoice(
+                fy_code="FY 2026-27",
+                customer_id=temp_cust_id,
+                executive_id=admin_user.id,
+                invoice_number=inv_num,
+                invoice_date=datetime.date(2026, 4, 10),
+                due_date=datetime.date(2026, 4, 25),
+                exclusive_amount=Decimal("1000.00"),
+                tax_rate=Decimal("0.1800"),
+                tax_amount=Decimal("180.00"),
+                total_amount=Decimal("1180.00"),
+                snapshot_customer_name=temp_cust.billing_name,
+                snapshot_billing_address=temp_cust.billing_address,
+                snapshot_state=temp_cust.state,
+                cgst_amount=Decimal("90.00"),
+                sgst_amount=Decimal("90.00"),
+                igst_amount=Decimal("0.00"),
+                lifecycle_status="ISSUED",
+            )
+            db.add(inv)
+        db.commit()
+
+        total_in_db = db.query(CommercialInvoice).count()
+        assert total_in_db >= 105
+
+    try:
+        # Verify pagination with limit=50
+        res_p1 = client.get("/api/invoices?page=1&limit=50", headers=admin_headers)
+        assert res_p1.status_code == 200
+        p1_data = res_p1.json()
+        assert p1_data["total"] >= 105
+        assert p1_data["total_pages"] >= 3
+        assert len(p1_data["data"]) == 50
+
+        res_p2 = client.get("/api/invoices?page=2&limit=50", headers=admin_headers)
+        assert res_p2.status_code == 200
+        p2_data = res_p2.json()
+        assert len(p2_data["data"]) == 50
+
+        res_p3 = client.get("/api/invoices?page=3&limit=50", headers=admin_headers)
+        assert res_p3.status_code == 200
+        p3_data = res_p3.json()
+        assert len(p3_data["data"]) >= 5
+
+        # Verify reporting summary computes totals over all >100 invoices
+        res_summary = client.get("/api/reporting/summary", headers=admin_headers)
+        assert res_summary.status_code == 200
+        s_data = res_summary.json()
+        assert int(s_data["total_invoices"]) >= 105
+        # Total invoiced must account for all invoices in DB
+        assert Decimal(s_data["total_invoiced"]) >= Decimal("1180.00") * Decimal(str(len(new_invoice_numbers)))
+    finally:
+        # Clean up seeded bulk invoices and temporary customer
+        with get_db_session() as db:
+            for inv_num in new_invoice_numbers:
+                row = db.query(CommercialInvoice).filter(CommercialInvoice.invoice_number == inv_num).first()
+                if row:
+                    db.delete(row)
+            if temp_cust_id:
+                c_row = db.query(Customer).filter(Customer.id == temp_cust_id).first()
+                if c_row:
+                    db.delete(c_row)
+            db.commit()

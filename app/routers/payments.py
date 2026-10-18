@@ -111,7 +111,7 @@ class PaymentCorrection(BaseModel):
 @router.get("")
 def list_payments(
     page: int = Query(1, ge=1),
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=2000),
     fy: Optional[str] = None,
     invoice_id: Optional[int] = None,
     customer_id: Optional[int] = None,

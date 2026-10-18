@@ -238,7 +238,7 @@ def serialize_invoice(
 @router.get("")
 def list_invoices(
     page: int = Query(1, ge=1),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=2000),
     search: Optional[str] = None,
     fy: Optional[str] = None,
     status: Optional[str] = None,
