@@ -22,6 +22,7 @@ Populates:
    - FY 2026-27 target for sandbox_sales (₹75,00,000)
 """
 
+import os
 import sys
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -56,12 +57,23 @@ ph = PasswordHasher()
 def seed_fixtures(reset: bool = False):
     with get_db_session() as db:
         if reset:
-            db_name = (db.bind.url.database or "").lower()
-            if db_name not in {"collectflow_dev", "collectflow_test", "collectflow_sandbox", "collectflow_integration"}:
+            env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
+            db_name = (db.bind.url.database or "").strip().lower()
+            host = (db.bind.url.host or "").strip().lower()
+
+            if host not in {"127.0.0.1", "localhost", "::1"}:
                 raise RuntimeError(
-                    f"CRITICAL SAFETY ABORT: Database reset is strictly forbidden on non-test database '{db_name}'."
+                    f"CRITICAL SAFETY ABORT: Destructive reset forbidden on non-loopback host '{host}'."
                 )
-            print(f"Resetting database '{db_name}' to pure baseline fixtures...")
+
+            if env_mode != "test" or db_name != "collectflow_test":
+                raise RuntimeError(
+                    f"CRITICAL SAFETY ABORT: Destructive baseline reset is strictly restricted to test environment only. "
+                    f"Requires BOTH COLLECTFLOW_ENV='test' (got '{env_mode}') and database name 'collectflow_test' (got '{db_name}'). "
+                    f"Reset attempts against development ('collectflow_dev'), sandbox ('collectflow_sandbox'), "
+                    f"integration ('collectflow_integration'), or production databases are strictly rejected."
+                )
+            print(f"Resetting database '{db_name}' (env='{env_mode}') to pure baseline fixtures...")
             from sqlalchemy import text
             db.execute(text("TRUNCATE TABLE export_tickets, sessions, payment_transactions, commercial_invoice_items, commercial_invoices, purchase_order_items, purchase_orders, sales_targets, audit_logs, customers, users RESTART IDENTITY CASCADE;"))
             db.commit()

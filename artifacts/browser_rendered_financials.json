@@ -1,0 +1,24 @@
+{
+  "captured_at": "2026-10-18T09:37:13.350Z",
+  "source": "Playwright Headless Chromium DOM",
+  "frontend_url": "http://127.0.0.1:3000",
+  "invoiced_gross": "531000.00",
+  "exclusive_amount": "450000.00",
+  "tax_amount": "81000.00",
+  "cash_amount": "200000.00",
+  "tds_amount": "9000.00",
+  "total_settled": "209000.00",
+  "total_outstanding": "322000.00",
+  "unbilled_po_gross": "295000.00",
+  "unbilled_recognized_ar": "0.00",
+  "annual_target": "7500000.00",
+  "raw_dom_values": {
+    "invoiced_gross_kpi": "₹5,31,000",
+    "outstanding_kpi": "₹3,22,000",
+    "total_settled_kpi": "₹2,09,000",
+    "cash_kpi": "₹2,00,000",
+    "tds_kpi": "₹9,000",
+    "exclusive_kpi": "₹4,50,000",
+    "annual_target_kpi": "₹75,00,000"
+  }
+}
