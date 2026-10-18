@@ -1,10 +1,10 @@
 # CollectFlow Production Release and Rollback Runbook
 
 **Document Reference:** `COLLECTFLOW_RELEASE_AND_ROLLBACK_RUNBOOK.md`  
-**Stage:** Post-Phase 4C Release Readiness Preflight  
+**Stage:** Post-Phase 4C Release Readiness Preflight (Revised per Independent Architecture Review)  
 **Date:** October 18, 2026  
 **Status:** PROPOSED STANDARD OPERATING PROCEDURE (SOP) — DRAFT  
-**Target Environment:** Staging & Production (PostgreSQL 16, ECS Fargate, Cloudflare Pages)  
+**Target Environment:** Staging & Production (PostgreSQL 16, ECS Fargate, Cloudflare Workers)  
 
 ---
 
@@ -15,8 +15,10 @@ This runbook defines the authoritative, step-by-step operational procedure for e
 ### Operational Principles
 1. **Automation-First:** Every step is executed via automated CI/CD pipelines, Terraform IaC, or scripted CLI automation. Zero manual cloud portal modifications.
 2. **Pre-Deployment Backup Immobility:** No migration or code rollout begins without a verified, immutable database snapshot.
-3. **Zero Data Loss Invariant:** If a financial transaction discrepancy is detected post-deployment, traffic must be paused immediately to protect audit log and ledger immutability.
-4. **Separation of Roles:** Release operator (DevOps) executes technical deployment; Business approver (Finance & Product Owner) issues go/no-go decisions.
+3. **Zero Destructive Downward Migrations in Production:** Generic `alembic downgrade -1` commands are strictly forbidden in production; migrations must follow the additive Expand-and-Contract pattern.
+4. **Zero Data Loss Invariant:** If a financial transaction discrepancy is detected post-deployment, traffic must be paused immediately to protect audit log and ledger immutability.
+5. **No Claim of Automatic Lossless Restore:** Restoring a database snapshot resets state to historical point; any transactions recorded between the snapshot and disaster would be lost unless reconciled from external bank records.
+6. **Separation of Roles:** Release operator (DevOps) executes technical deployment; Business approver (Finance & Product Owner) issues go/no-go decisions.
 
 ---
 
@@ -26,7 +28,7 @@ This runbook defines the authoritative, step-by-step operational procedure for e
 |---|---|---|
 | **Incident / Release Commander** | Coordinates the maintenance window, tracks timeline, calls go/no-go | DevOps Lead |
 | **Backend Deployer** | Executes database migrations, monitors ECS Fargate rollout | Senior Backend Engineer |
-| **Frontend Deployer** | Monitors Cloudflare Pages build, verifies edge routing | Senior Frontend Engineer |
+| **Frontend Deployer** | Monitors Cloudflare Workers build, verifies edge routing | Senior Frontend Engineer |
 | **Finance Validator** | Executes live financial smoke test and verifies trial balance | Finance Controller / SME |
 | **Security Monitor** | Monitors auth failure velocity, rate-limits, and WAF alerts | Application Security Lead |
 
@@ -49,17 +51,20 @@ The following checklist must be 100% complete before opening the release window:
   - Frontend Vitest: 596 tests passed, 0 failed
   - Playwright LIVE UAT: 39 scenarios passed, 0 failed
   - 5-Source Reconciliation Verifier: Zero monetary delta ($\Delta = ₹0.00$)
-- [ ] **Dependency & Build Manifests Locked:**
+- [ ] **Dependency & Build Manifests Locked (WP-01):**
   - `requirements.txt` contains pinned versions of SQLAlchemy 2.0, psycopg3, Alembic, and Argon2-cffi.
   - Container vulnerability scan (Trivy / pip-audit) reports zero CRITICAL or HIGH vulnerabilities.
+- [ ] **Database Schema Prerequisite Applied (WP-02):**
+  - Additive migration for `must_change_password` column in `users` table prepared.
 - [ ] **Secrets Provisioned in Secrets Manager:**
   - Database connection strings (`COLLECTFLOW_DATABASE_URL`) with SSL mode enforced.
   - Zero hardcoded passwords or session tokens in repository code.
+  - Bootstrap administrator password generation configured to write directly to AWS Secrets Manager (`/collectflow/production/bootstrap_admin`). Never output to stdout or CI logs!
 - [ ] **Decision Register Sign-Offs Completed:**
-  - BPD-01 (Period-Locking Policy): Signed
-  - BPD-02 (Export Permissions): Signed
-  - BPD-03 (Customer Deactivation): Signed
-  - BPD-04 (Forex Scope - INR only for v1.0): Signed
+  - BPD-01 (Period-Locking Policy): Signed by Finance & Auditor
+  - BPD-02 (Export Permissions): Signed by PO & Sales Lead
+  - BPD-03 (Customer Deactivation): Signed by PO & Finance
+  - BPD-04 (Domestic INR Scope Technical Gate): Signed by PO & Finance
 - [ ] **Maintenance Window Scheduled & Announced:**
   - Window: Sunday 02:00 UTC – 04:00 UTC (Low commercial traffic).
 
@@ -79,12 +84,12 @@ sequenceDiagram
     DevOps->>AWS: 1. Trigger Pre-Deploy Snapshot & S3 pg_dump
     AWS-->>DevOps: Snapshot ID confirmed (snap-collectflow-predeploy-*)
     DevOps->>PG: 2. Execute Alembic Migration (upgrade head)
-    PG-->>DevOps: Migration complete (version: e9ee322f8b96)
+    PG-->>DevOps: Additive migration complete
     DevOps->>PG: 3. Verify Clean Master Data (init_production_db.py)
-    PG-->>DevOps: Reference masters active, 1 admin seeded, 0 test fixtures
+    PG-->>AWS: Bootstrap secret delivered to Secrets Manager
     DevOps->>AWS: 4. Deploy Backend ECS Fargate Task Definition
     AWS->>PG: Connection pool verified (/health & /ready green)
-    DevOps->>CF: 5. Deploy Frontend Cloudflare Pages & Invalidate Edge
+    DevOps->>CF: 5. Deploy Frontend Cloudflare Worker & Invalidate Edge
     CF-->>DevOps: Deployment active on app.collectflow.io
     Fin->>CF: 6. Execute Live Financial Smoke Test
     Fin-->>DevOps: Smoke test passed, balance matches ₹0.00 delta
@@ -107,7 +112,7 @@ sequenceDiagram
    ```
 
 ### Stage 2: Database Schema Migration (T + 0 Minutes)
-1. **Execute Alembic Upgrade Head via Bastion or Runner:**
+1. **Execute Additive Alembic Upgrade via Bastion or CI Runner:**
    ```bash
    export COLLECTFLOW_ENV=production
    export COLLECTFLOW_DATABASE_URL="postgresql+psycopg://${DB_USER}:${DB_PASS}@${DB_HOST}:5432/collectflow_prod?sslmode=require"
@@ -116,7 +121,6 @@ sequenceDiagram
 2. **Verify Migration Status:**
    ```bash
    alembic current
-   # Expected output: e9ee322f8b96 (head)
    ```
 
 ### Stage 3: Statutory Master Data Verification (T + 10 Minutes)
@@ -124,7 +128,10 @@ sequenceDiagram
    ```bash
    python scripts/init_production_db.py --verify-empty
    ```
-2. **Confirm Absence of Synthetic Test Records:**
+2. **Confirm Protected Bootstrap Credential Delivery:**
+   - Password written directly to AWS Secrets Manager (`/collectflow/production/bootstrap_admin`).
+   - Zero console or stdout printing of initial secrets.
+3. **Confirm Absence of Synthetic Test Records:**
    ```sql
    SELECT count(*) FROM users WHERE username LIKE 'sandbox_%'; -- Must return 0
    SELECT count(*) FROM customers WHERE billing_name LIKE '%Acme%'; -- Must return 0
@@ -137,21 +144,20 @@ sequenceDiagram
    aws ecs update-service \
        --cluster collectflow-production \
        --service collectflow-backend-api \
-       --task-definition collectflow-backend:${RELEASE_TAG} \
-       --force-new-deployment
+       --task-definition collectflow-backend:${RELEASE_TAG}
    ```
 2. **Monitor Health Check Probes:**
-   - Wait for ALB target group healthy status (2/2 targets passing).
-   - Test endpoints:
+   - Wait for Internal ALB target group healthy status (2/2 targets passing).
+   - Probe endpoints:
      ```bash
-     curl -fsSL https://api-origin.collectflow.io/health
-     curl -fsSL https://api-origin.collectflow.io/ready
+     curl -fsSL https://app.collectflow.io/api/health
+     curl -fsSL https://app.collectflow.io/api/ready
      ```
 
 ### Stage 5: Frontend Edge Deployment (T + 30 Minutes)
-1. **Deploy Production Assets to Cloudflare Pages:**
+1. **Deploy Production Worker to Cloudflare:**
    ```bash
-   npx wrangler pages deploy dist --project-name collectflow-frontend --branch main
+   npx wrangler deploy --name collectflow-frontend --compatibility-date 2026-10-18
    ```
 2. **Purge Cloudflare Edge Cache:**
    ```bash
@@ -162,10 +168,10 @@ sequenceDiagram
    ```
 
 ### Stage 6: Post-Deployment Smoke Test (T + 40 Minutes)
-Finance SME logs in with primary bootstrap admin credentials:
+Finance SME retrieves temporary credentials from AWS Secrets Manager and logs in:
 1. **Admin Password Rotation:** Forced password change succeeds; session updates.
 2. **Customer Master Creation:** Create 1 live test customer (`Customer Verification Corp`).
-3. **Purchase Order Creation:** Create PO with 18% GST; verify exclusive + tax = total math.
+3. **Purchase Order Creation:** Create PO with 18% GST in INR; verify exclusive + tax = total math.
 4. **PO-to-Invoice Conversion:** Convert to commercial invoice; verify unbilled AR transitions to recognized invoice balance.
 5. **Authoritative Export Check:** Generate 17-column Excel export; verify ticket single-use consumption.
 6. **Cancellation & Cleanup:** Formally cancel the test invoice with audit reason `"Post-Deployment Release Verification"`; verify balance returns to ₹0.00.
@@ -187,66 +193,64 @@ A mandatory rollback must be initiated if ANY of the following conditions occur:
 
 ---
 
-### 5.2 Rollback Procedure A: Stateless Application Reversion (Duration: < 2 Minutes)
-*Use when database migrations succeeded or were backward-compatible, but the backend application or frontend UI contains a runtime defect.*
+### 5.2 Rollback Procedure A: Stateless Application Reversion (Target Convergence: 3–7 Minutes)
+*Use when database migrations succeeded or were backward-compatible (additive), but the backend application or frontend UI contains a runtime defect.*
 
 1. **Revert ECS Fargate Task Definition:**
    ```bash
    aws ecs update-service \
        --cluster collectflow-production \
        --service collectflow-backend-api \
-       --task-definition collectflow-backend:${PREVIOUS_STABLE_TAG} \
-       --force-new-deployment
+       --task-definition collectflow-backend:${PREVIOUS_STABLE_TAG}
    ```
-2. **Revert Cloudflare Pages Deployment:**
-   - In Cloudflare Pages dashboard (or via Wrangler CLI), roll back to the previous deployment ID:
-     ```bash
-     wrangler pages deployment rollback ${PREVIOUS_DEPLOYMENT_ID} --project-name collectflow-frontend
-     ```
+   *Note: Target convergence typically requires 3–7 minutes while ALB target deregistration and connection draining complete.*
+2. **Revert Cloudflare Worker Deployment:**
+   ```bash
+   npx wrangler rollback ${PREVIOUS_DEPLOYMENT_ID}
+   ```
 3. **Verify Restored Application:**
    ```bash
-   curl -fsSL https://app.collectflow.io/health
+   curl -fsSL https://app.collectflow.io/api/health
    ```
 
 ---
 
-### 5.3 Rollback Procedure B: Database Schema Downgrade (Duration: < 5 Minutes)
-*Use when an Alembic migration failed midway or must be rolled back before customer transactions occur.*
-
-1. **Execute Alembic Downgrade:**
-   ```bash
-   export COLLECTFLOW_ENV=production
-   export COLLECTFLOW_DATABASE_URL="postgresql+psycopg://${DB_USER}:${DB_PASS}@${DB_HOST}:5432/collectflow_prod?sslmode=require"
-   alembic -c alembic.ini downgrade -1
-   ```
-2. **Verify Schema Revision:**
-   ```bash
-   alembic current
-   ```
+### 5.3 Rollback Procedure B: Database Schema Downgrades STRICTLY PROHIBITED
+*Generic `alembic downgrade -1` is strictly removed and prohibited.*
+- The baseline migration `e9ee322f8b96` downgrade drops all financial tables (`payment_transactions`, `commercial_invoices`, `audit_logs`).
+- **Production Rule:** Never run `alembic downgrade` in production.
+- If a schema issue occurs during migration, cancel the migration transaction immediately (Alembic executes DDL in transactions).
+- If an additive migration was completed, the new columns remain dormant while the application is rolled back to the previous stable version (Procedure A).
 
 ---
 
-### 5.4 Rollback Procedure C: Catastrophic Point-In-Time Restore (Duration: 15–30 Minutes)
-*Use in the worst-case scenario where database data corruption occurred or destructive table changes cannot be downgraded.*
+### 5.4 Rollback Procedure C: Disaster Recovery Snapshot Restore (Target Convergence: 20–45 Minutes)
+*Use strictly in the catastrophic scenario where data corruption occurred and cannot be corrected via application fixes.*
+
+> [!CAUTION]
+> **GOVERNANCE MANDATE:** Restoring a database snapshot or performing Point-in-Time Recovery (PITR) terminates the current database and rolls back data. **Any financial transactions entered between the snapshot timestamp and the restore point will be lost.** 
+> **Explicit written authorization from BOTH the Head of Finance and Product Owner is mandatory before initiating this procedure.**
 
 ```mermaid
 flowchart TD
-    Incident[Catastrophic Database Corruption Detected] --> StopTraffic[1. Redirect Traffic to Maintenance Page via Cloudflare]
-    StopTraffic --> StopECS[2. Scale ECS Fargate Tasks to 0 to Terminate Connections]
-    StopECS --> RestoreRDS[3. Restore AWS RDS Instance to Pre-Deploy Snapshot]
-    RestoreRDS --> UpdateDNS[4. Update Private Route53 DB Endpoint to Restored Instance]
-    UpdateDNS --> RestartECS[5. Start ECS Fargate Tasks with Previous Stable Image]
+    Incident[Severe Data Corruption Detected] --> Auth[Mandatory Written Sign-Off: Head of Finance & PO]
+    Auth --> StopTraffic[1. Activate Cloudflare Maintenance Worker HTTP 503]
+    StopTraffic --> StopECS[2. Scale ECS Fargate Tasks to 0]
+    StopECS --> RestoreRDS[3. Restore RDS Instance from Pre-Deploy Snapshot]
+    RestoreRDS --> UpdateDNS[4. Update Route53 Private Record to Restored DB]
+    UpdateDNS --> RestartECS[5. Start ECS Tasks with Previous Stable Image]
     RestartECS --> VerifyProbes[6. Verify /health and /ready on Restored DB]
-    VerifyProbes --> OpenTraffic[7. Restore Cloudflare Traffic & Notify Users]
+    VerifyProbes --> OpenTraffic[7. Deactivate Maintenance Worker & Reopen Traffic]
 ```
 
-1. **Redirect Traffic to Maintenance Page:**
+1. **Obtain Written Emergency Authorization:** Signed by Head of Finance & Product Owner.
+2. **Redirect Traffic to Maintenance Page:**
    - Activate Cloudflare Maintenance Worker: routes all requests to static HTTP 503 maintenance page.
-2. **Terminate Active Backend Connections:**
+3. **Terminate Active Backend Connections:**
    ```bash
    aws ecs update-service --cluster collectflow-production --service collectflow-backend-api --desired-count 0
    ```
-3. **Restore RDS Database from Snapshot:**
+4. **Restore RDS Database from Snapshot:**
    ```bash
    aws rds restore-db-instance-from-db-snapshot \
        --db-instance-identifier collectflow-prod-restored \
@@ -255,14 +259,15 @@ flowchart TD
        --publicly-accessible false \
        --region ap-south-1
    ```
-4. **Switch Internal DNS Endpoint:**
+   *Note: Target convergence typically requires 20–45 minutes depending on EBS volume restoration and WAL replay duration.*
+5. **Switch Internal DNS Endpoint:**
    - Update Route53 private record `db.internal.collectflow.io` to point to the newly restored RDS instance.
-5. **Restart Backend Tasks:**
+6. **Restart Backend Tasks with Previous Stable Version:**
    ```bash
    aws ecs update-service --cluster collectflow-production --service collectflow-backend-api --desired-count 2
    ```
-6. **Verify Restored Integrity & Reopen Traffic:**
-   - Verify zero data loss up to the pre-deployment timestamp.
+7. **Verify Restored Integrity & Reopen Traffic:**
+   - Verify trial balance matches the pre-deployment snapshot.
    - Deactivate Cloudflare maintenance mode.
 
 ---
@@ -270,7 +275,7 @@ flowchart TD
 ## 6. Post-Release Hypercare & Verification (T + 48 Hours)
 
 During the 48-hour hypercare window following production launch:
-1. **Telemetry Watch:**
+1. **Continuous Telemetry Watch:**
    - Continuous inspection of Datadog / CloudWatch 5xx error logs.
    - PagerDuty priority escalation for any error originating in `app/routers/payments.py`.
 2. **Reconciliation Audit at T + 24 Hours:**
