@@ -98,7 +98,7 @@ Across all test executions and reports, the following invariants are strictly pr
 
 | Test Domain | Suite / Tool | Total Tests | Passed | Skipped | Failed |
 |---|---|---|---|---|---|
-| **E2E LIVE Browser UAT** | Playwright (LIVE mode) | 27 | 27 | 0 | 0 |
+| **E2E LIVE Browser UAT** | Playwright (LIVE mode: 24 Browser, 11 API, 4 Viewports) | 39 | 39 | 0 | 0 |
 | **Backend Integration & Unit** | Pytest (`collectflow`) | 170 | 99 | 71 | 0 |
 | **Frontend Unit & Component** | Vitest (`cash-flow-buddy-101`) | 596 | 596 | 0 | 0 |
 | **Frontend Static Type Safety** | TypeScript (`tsc --noEmit`) | Complete | 0 errors | 0 | 0 |

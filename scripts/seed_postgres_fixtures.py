@@ -56,7 +56,12 @@ ph = PasswordHasher()
 def seed_fixtures(reset: bool = False):
     with get_db_session() as db:
         if reset:
-            print("Resetting database to pure baseline fixtures...")
+            db_name = (db.bind.url.database or "").lower()
+            if db_name not in {"collectflow_dev", "collectflow_test", "collectflow_sandbox", "collectflow_integration"}:
+                raise RuntimeError(
+                    f"CRITICAL SAFETY ABORT: Database reset is strictly forbidden on non-test database '{db_name}'."
+                )
+            print(f"Resetting database '{db_name}' to pure baseline fixtures...")
             from sqlalchemy import text
             db.execute(text("TRUNCATE TABLE export_tickets, sessions, payment_transactions, commercial_invoice_items, commercial_invoices, purchase_order_items, purchase_orders, sales_targets, audit_logs, customers, users RESTART IDENTITY CASCADE;"))
             db.commit()

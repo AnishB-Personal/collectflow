@@ -86,9 +86,9 @@ $$\text{Invoice Ledger Totals} = \text{Reporting Summary Totals} = \text{Export 
 | :--- | :---: | :---: | :---: | :---: |
 | **View Dashboard / Reports** | Allowed (All) | Allowed (All) | Allowed (All) | Allowed (All) |
 | **Customer Master (Read)** | Allowed (All) | Allowed (All) | Allowed (All) | Allowed (All) |
-| **Customer Master (Write)** | Allowed | Allowed | Denied (403) | Denied (403) |
+| **Customer Master (Write)** | Allowed | Allowed | Allowed | Denied (403) |
 | **Purchase Orders (Create)** | Allowed | Allowed | Allowed | Denied (403) |
-| **Convert PO to Invoice** | Allowed | Allowed | Allowed | Denied (403) |
+| **Convert PO to Invoice** | Allowed | Allowed | Denied (403) | Denied (403) |
 | **Cancel Invoice (Unsettled)** | Allowed | Allowed | Denied (403) | Denied (403) |
 | **Record Payment / TDS** | Allowed | Allowed | Denied (403) | Denied (403) |
 | **Payment Correction / Reversal** | Allowed | Allowed | Denied (403) | Denied (403) |
