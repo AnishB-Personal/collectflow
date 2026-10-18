@@ -31,19 +31,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from argon2 import PasswordHasher
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from app.core.database import get_db_session
 from app.models.domain_models import (
     AuditLog,
     CommercialInvoice,
     CommercialInvoiceItem,
     Customer,
+    ExportTicket,
     FinancialYear,
     GstRateMaster,
     PaymentTransaction,
     PurchaseOrder,
     PurchaseOrderItem,
     SalesTarget,
+    SessionModel,
     TdsSectionMaster,
     User,
 )
@@ -51,8 +53,14 @@ from app.models.domain_models import (
 ph = PasswordHasher()
 
 
-def seed_fixtures():
+def seed_fixtures(reset: bool = False):
     with get_db_session() as db:
+        if reset:
+            print("Resetting database to pure baseline fixtures...")
+            from sqlalchemy import text
+            db.execute(text("TRUNCATE TABLE export_tickets, sessions, payment_transactions, commercial_invoice_items, commercial_invoices, purchase_order_items, purchase_orders, sales_targets, audit_logs, customers, users RESTART IDENTITY CASCADE;"))
+            db.commit()
+
         print("Idempotently verifying and seeding baseline fixtures...")
 
         # 1. Financial Years
@@ -292,4 +300,5 @@ def seed_fixtures():
 
 
 if __name__ == "__main__":
-    seed_fixtures()
+    reset_flag = "--reset" in sys.argv
+    seed_fixtures(reset=reset_flag)
