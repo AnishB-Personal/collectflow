@@ -1,8 +1,8 @@
 # CollectFlow Post-Phase 4C Release Readiness Plan
 
 **Document Reference:** `COLLECTFLOW_POST_4C_RELEASE_READINESS_PLAN.md`  
-**Stage:** Post-Phase 4C Release Readiness Preflight (Planning & Read-Only Verification)  
-**Date:** October 18, 2026 (Revised per Independent Architecture Review)  
+**Stage:** Post-Phase 4C Release Readiness Preflight  
+**Date:** October 18, 2026 (Revised per Product Owner Cloud-Agnostic Direction)  
 **Status:** DRAFT — AUTHORIZED FOR PLANNING AND ARCHITECTURE REVIEW  
 **Recommendation Status:** `NEEDS SECURITY / ARCHITECTURE DECISIONS`  
 
@@ -12,299 +12,375 @@
 
 Phase 4C (Stages 4C.1 through 4C.6) concluded with an independent verification verdict of **ACCEPTANCE WITH LIMITATIONS**, establishing full PostgreSQL 16 relational parity, a 39-scenario Playwright LIVE UAT suite, and zero monetary delta ($\Delta = ₹0.00$) five-source financial reconciliation across direct database models, REST APIs, DOM-rendered figures, and 17-column Excel/CSV exports.
 
-This preflight document establishes a technical roadmap, risk evaluation, and release governance framework for transitioning the complete PostgreSQL-backed CollectFlow application from a local verified test environment into an enterprise staging and production deployment.
+### Product Owner Strategic Mandate: Cloud-Agnostic & On-Premises Deployable
+Per Product Owner directive, **CollectFlow must be 100% cloud-agnostic and deployable on-premises, in private clouds, or across any major public cloud (AWS, Azure, GCP)** without modifying application source code or business logic:
+- The previous Cloudflare Workers environment was a development/UAT staging adapter, **not** the permanent or mandatory production architecture.
+- The Cloudflare Tunnel + AWS ECS/RDS pattern is retained strictly as an **optional reference implementation**, not a mandatory dependency.
+- The core application packaging must be based on standard **OCI container images (Docker)**, standard **PostgreSQL 16+**, and generic **HTTP/S reverse proxy ingress** (Nginx, Traefik, or Kubernetes Ingress).
+- **Zero proprietary cloud SDKs** (e.g., AWS Boto3, Cloudflare SDKs) are permitted within application business logic. All configuration and secret delivery must use provider-neutral POSIX environment variables.
 
 ### Authoritative Git Baselines & Planning Branches
 - **Backend Repository:** [`collectflow`](file:///home/anishb/projects/personal/collectflow)
   - Accepted Baseline Commit: `1eb94b96321780d42527721585551d35f774fa3b`
-  - Dedicated Planning Branch: `docs/phase4-release-readiness-preflight`
-  - Verified Remote Planning Checkpoint: `f892a6cdec991c5613456917d0fabd04e1ea499a`
+  - Planning Branch: `docs/phase4-release-readiness-preflight`
+  - Verified Remote Planning Checkpoint: `e5f50a99df294ccdff48ff7dcac20a4376490067`
 - **Frontend Repository:** [`cash-flow-buddy-101`](file:///home/anishb/projects/personal/cash-flow-buddy-101)
   - Accepted Baseline Commit: `2085c29e51d28cd5a2466883415442dd861734b7`
-  - Dedicated Planning Branch: `docs/phase4-release-readiness-preflight`
-  - Verified Remote Planning Checkpoint: `c71b89592e78deb07c3fe770501de715c205c14a`
-
-> [!IMPORTANT]
-> **Preflight Constraints:** No cloud infrastructure has been provisioned, no code merged to `main`, no database migrations executed in production, and no application behavior modified during this assessment.
+  - Planning Branch: `docs/phase4-release-readiness-preflight`
+  - Verified Remote Planning Checkpoint: `f65696f2e5f6ccf3f9678be73560befe09ec965b`
 
 ---
 
 ## 2. Superseded vs. Authoritative Architecture Decisions
 
-A rigorous review of historical design documentation (Stage 4A through Stage 4C.6) identifies several proposals that have been superseded by subsequent stage implementations:
-
-| Domain | Historical Proposal (Stage 4A/4B) | Accepted Authoritative Architecture (Stage 4C.6) | Status & Justification |
+| Domain | Historical Proposal (Stage 4A/4B) | Accepted Authoritative Architecture (Stage 4C.6 / Revised) | Status & Justification |
 |---|---|---|---|
-| **Persistence Engine** | SQLite WAL-mode with `BEGIN IMMEDIATE` locks | Dedicated PostgreSQL 16+ with SQLAlchemy 2.0 ORM, psycopg3 driver, and Alembic migrations | **SUPERSEDED** by Stage 4C.1 for multi-tenant scalability and strict typing. |
-| **Payment Mutation** | Physical deletion of erroneous payments allowed in development | Strict physical deletion block (`DELETE /api/payments/{id}` returns HTTP 400); all adjustments execute via non-destructive compensating `REVERSAL` events | **AUTHORITATIVE** (Stage 4C.4). Statutory compliance under Indian accounting standards. |
-| **Export Security** | Direct bearer token accepted in download query parameter | Single-use cryptographic tickets issued via `POST /api/export/token` with 5-minute TTL, consumed atomically under PostgreSQL `SELECT FOR UPDATE` | **AUTHORITATIVE** (Stage 4C.5). Eliminates token leakage in access logs and prevents download link sharing. |
-| **Reporting Aggregation** | Client-side aggregation of `GET /api/invoices?limit=1000` | Authoritative server-side aggregation endpoints (`/api/reporting/summary`, `/api/reporting/ar-aging`, `/api/payments`) with server pagination | **AUTHORITATIVE** (Stage 4C.5). Prevents 100-invoice truncation and browser memory overflow. |
-| **Auth Session Storage** | Browser `sessionStorage` proposed in Stage 4A | Ephemeral in-memory React state (`inMemoryToken`) in Stage 4B/4C; `HttpOnly` same-origin cookies proposed for Production | **EVOLVED**. In-memory tokens protect against persistent XSS but require same-origin cookie architecture for production persistence across reloads. |
+| **Hosting Target** | Cloudflare Workers edge required for production | **Cloud-Agnostic OCI Containers** with generic Ingress. Cloudflare and AWS ECS become optional reference adapters. | **AUTHORITATIVE DIRECTION**. Eliminates vendor lock-in; enables on-premises enterprise deployment. |
+| **Frontend Packaging** | Cloudflare-only Nitro bundle (`cloudflare-module`) | **Dual-Target Nitro Packaging**: Portable Node.js SSR container (`node-server` preset) as default; Cloudflare as optional adapter. | **PORTABLE REVISION**. Allows deployment on generic Linux, Docker, or Kubernetes. |
+| **Persistence Engine** | SQLite WAL-mode with `BEGIN IMMEDIATE` locks | Dedicated PostgreSQL 16+ (Self-hosted or Managed) with SQLAlchemy 2.0 ORM, psycopg3 driver, and Alembic migrations. | **AUTHORITATIVE** (Stage 4C.1). Multi-tenant scalability, ACID transactions, and strict typing. |
+| **Payment Mutation** | Physical deletion of erroneous payments allowed | Strict physical deletion block (`DELETE /api/payments/{id}` returns HTTP 400); all adjustments execute via non-destructive compensating `REVERSAL` events. | **AUTHORITATIVE** (Stage 4C.4). Statutory compliance under Indian accounting standards. |
+| **Export Security** | Direct bearer token accepted in download query | Single-use cryptographic tickets issued via `POST /api/export/token` with 5-minute TTL, consumed atomically under PostgreSQL `SELECT FOR UPDATE`. | **AUTHORITATIVE** (Stage 4C.5). Eliminates token leakage in access logs and prevents link sharing. |
+| **Reporting Aggregation** | Client-side aggregation of `GET /api/invoices?limit=1000` | Authoritative server-side aggregation endpoints (`/api/reporting/summary`, `/api/reporting/ar-aging`, `/api/payments`) with server pagination. | **AUTHORITATIVE** (Stage 4C.5). Prevents 100-invoice truncation and browser memory overflow. |
+| **Auth Session Storage** | Browser `sessionStorage` proposed in Stage 4A | Same-origin `HttpOnly; Secure; SameSite=Lax` cookie session independent of ingress provider. In-memory state preserved in SPA. | **EVOLVED**. Solves page-reload session loss while preventing XSS token exfiltration. |
 
 ---
 
-## 3. Production Hosting Architecture & Private Connectivity (ARCH-01)
+## 3. Core Application Packaging & Frontend Runtime Portability
 
-### 3.1 Frontend Runtime Clarification: Cloudflare Workers
-The accepted frontend repository ([`cash-flow-buddy-101`](file:///home/anishb/projects/personal/cash-flow-buddy-101)) is configured with `@lovable.dev/vite-tanstack-config` and Nitro targeting `cloudflare-module` output (`dist/` and `.output/server/index.mjs`). 
-- **Preserved Runtime Target:** The application is architected specifically as a **Cloudflare Worker** with server-side rendering wrappers in [`src/server.ts`](file:///home/anishb/projects/personal/cash-flow-buddy-101/src/server.ts) and [`src/start.ts`](file:///home/anishb/projects/personal/cash-flow-buddy-101/src/start.ts).
-- **No Unverified Migration to Pages:** The deployment design retains Cloudflare Workers as the authoritative edge hosting target to preserve compatibility with TanStack Start SSR error wrappers and server functions. Moving to Cloudflare Pages is not assumed to be drop-in compatible and is avoided.
+### 3.1 Containerized OCI Application Packaging
+CollectFlow is packaged into two portable OCI-compliant container images:
 
-### 3.2 Cloudflare to AWS Private Connectivity Architecture
-A production financial system requires seamless edge integration with private AWS backend services without exposing internal infrastructure to the public internet:
+1. **Backend Container (`collectflow-api`):**
+   - **Base Image:** `python:3.12-slim-bookworm`
+   - **Runtime:** Uvicorn ASGI server running FastAPI application.
+   - **Dependencies:** Pinned production manifest (`SQLAlchemy 2.0+`, `psycopg 3.3+`, `alembic`, `argon2-cffi`, `pydantic 2.0+`).
+   - **Port:** Exposes internal HTTP port `8000`.
+   - **Process Isolation:** Runs as unprivileged `appuser` (UID 10001).
+
+2. **Frontend Container (`collectflow-web`):**
+   - **Base Image:** `node:22-bookworm-slim`
+   - **Runtime:** Node.js HTTP server running the TanStack Start SSR application.
+   - **Port:** Exposes internal HTTP port `3000`.
+   - **Process Isolation:** Runs as unprivileged `node` user.
+
+3. **Database Tier:**
+   - **Requirement:** Standard PostgreSQL 16+ with UTF-8 encoding.
+   - **Deployment Agnostic:** Compatible with self-hosted PostgreSQL (bare metal or container) or managed cloud databases (AWS RDS, GCP Cloud SQL, Azure Database for PostgreSQL).
+
+4. **Ingress / Reverse Proxy Tier:**
+   - **Requirement:** Standard HTTP/S reverse proxy terminating TLS 1.3 and unifying routing under a single origin:
+     - `/*` $\rightarrow$ Frontend container (`port 3000`).
+     - `/api/*` $\rightarrow$ Backend container (`port 8000`).
+   - **Implementations:** Nginx, Traefik, Caddy, Kubernetes Ingress Controller, or Cloudflare Gateway.
 
 ```mermaid
 flowchart TD
-    subgraph Client ["Client Tier"]
-        Browser["User Browser / Client"]
+    subgraph Client ["Client / Browser"]
+        User["End User Browser"]
     end
 
-    subgraph Edge ["Cloudflare Global Edge (app.collectflow.io)"]
-        WAF["Cloudflare WAF & DDoS Shield"]
-        DNS["Authoritative DNS & TLS 1.3 Termination"]
-        WorkerRouter{"Cloudflare Worker Gateway & Router"}
-        EdgeSSR["TanStack Start Nitro Worker (Frontend SSR & Assets)"]
+    subgraph Ingress ["Generic Ingress / Reverse Proxy (Nginx / Ingress Controller / Caddy)"]
+        TLS["TLS 1.3 Termination (Certbot / Custom CA / Enterprise Cert)"]
+        Router{"Path-Based Reverse Proxy"}
     end
 
-    subgraph AWS_VPC ["AWS ap-south-1 VPC (10.0.0.0/16)"]
-        subgraph PublicSubnets ["Public Subnets (2 AZs)"]
-            NAT1["NAT Gateway AZ-1"]
-            NAT2["NAT Gateway AZ-2"]
-        end
-
-        subgraph PrivateAppSubnets ["Private Application Subnets (2 AZs)"]
-            CFConnector1["cloudflared Tunnel Task 1"]
-            CFConnector2["cloudflared Tunnel Task 2"]
-            InternalALB["Internal Application Load Balancer"]
-            FastAPI1["FastAPI Container 1 (ECS Fargate)"]
-            FastAPI2["FastAPI Container 2 (ECS Fargate)"]
-        end
-
-        subgraph IsolatedDBSubnets ["Isolated Database Subnets (2 AZs)"]
-            RDSPrimary[("AWS RDS PostgreSQL 16 (Primary)")]
-            RDSStandby[("AWS RDS PostgreSQL 16 (Multi-AZ Standby)")]
-        end
+    subgraph Containers ["Portable OCI Container Workloads"]
+        WebContainer["collectflow-web (Node.js 22 / TanStack Start SSR:3000)"]
+        APIContainer["collectflow-api (Python 3.12 / FastAPI Uvicorn:8000)"]
     end
 
-    Browser -->|HTTPS TLS 1.3| WAF
-    WAF --> DNS
-    DNS --> WorkerRouter
-    WorkerRouter -->|/* Static & SSR Navigation| EdgeSSR
-    WorkerRouter -->|/api/* Reverse Proxy| CFConnector1 & CFConnector2
-    CFConnector1 & CFConnector2 -->|HTTP/2 Outbound Quick-Tunnel| InternalALB
-    InternalALB --> FastAPI1 & FastAPI2
-    FastAPI1 & FastAPI2 -->|psycopg3 SSL Required| RDSPrimary
-    RDSPrimary -.->|Sync Replication| RDSStandby
-    FastAPI1 & FastAPI2 --> NAT1 & NAT2
+    subgraph Storage ["PostgreSQL 16+ Persistence Tier"]
+        DB[("PostgreSQL 16 Database (Self-Hosted / Managed RDS / Cloud SQL)")]
+    end
+
+    User -->|HTTPS 443| TLS
+    TLS --> Router
+    Router -->|/* (SSR & Static Assets)| WebContainer
+    Router -->|/api/* (REST API Calls)| APIContainer
+    APIContainer -->|psycopg3 TCP/SSL Connection Pool| DB
 ```
 
-#### Provider-Supported Ingress Patterns Evaluated:
-1. **Pattern 1: Cloudflare Tunnel (`cloudflared` on ECS Fargate) — RECOMMENDED**
-   - **Mechanism:** Deploy lightweight `cloudflared` daemon instances inside private AWS subnets as ECS Fargate tasks (or sidecars to the backend container).
-   - **Outbound-Only Connectivity:** `cloudflared` establishes persistent, outbound-only encrypted QUIC/HTTP/2 tunnels to the nearest Cloudflare edge PoPs.
-   - **Zero Inbound Ports:** The AWS VPC security groups allow **0 inbound internet traffic**. No public IP addresses are assigned to the Internal Application Load Balancer (ALB) or ECS tasks.
-   - **Routing:** Cloudflare routes `app.collectflow.io/api/*` securely through the tunnel directly to the Internal ALB.
-   - **Failure Modes & Resilience:** Redundant `cloudflared` tasks across two Availability Zones (`ap-south-1a`, `ap-south-1b`). If one task fails, Cloudflare automatically fails over to the second tunnel connection within milliseconds.
+### 3.2 Frontend Runtime Portability Assessment (TanStack Start / Nitro)
+The frontend repository ([`cash-flow-buddy-101`](file:///home/anishb/projects/personal/cash-flow-buddy-101)) currently uses `@lovable.dev/vite-tanstack-config` which defaults Nitro to Cloudflare output (`cloudflare-module`).
 
-2. **Pattern 2: Public ALB with Cloudflare Authenticated Origin Pull (Alternative)**
-   - **Mechanism:** Deploy an internet-facing ALB that strictly enforces TLS Client Authentication (mTLS) with Cloudflare's published Origin CA certificate, coupled with an AWS Security Group restricted to Cloudflare's published IP ranges.
-   - **Tradeoffs:** Requires maintaining IP allowlists and public ALB endpoints; more complex certificate rotation lifecycle than Cloudflare Tunnel.
-
-### 3.3 Routing, Origin Access & Health Checks
-- **Domain:** `https://app.collectflow.io`
-- **Routing Rules:**
-  - `/*` $\rightarrow$ Cloudflare Worker (Frontend SSR & static bundles).
-  - `/api/*` $\rightarrow$ Cloudflare Tunnel $\rightarrow$ Internal ALB $\rightarrow$ FastAPI backend.
-- **TLS Configuration:**
-  - Edge: TLS 1.3 with strict modern cipher suites (`HSTS: max-age=63072000; includeSubDomains; preload`).
-  - Tunnel: Authenticated end-to-end encryption between Cloudflare edge and `cloudflared` connector.
-  - Internal: Internal ALB terminates tunnel traffic; backend calls to RDS PostgreSQL enforce `sslmode=require`.
-- **Health Checks & Origin Probes:**
-  - Cloudflare Edge Monitor: Probes `https://app.collectflow.io/api/health` every 15 seconds. If backend is unavailable, Worker serves custom branded HTTP 503 maintenance response.
-  - Internal ALB Probe: Probes `GET /ready` on backend containers every 10 seconds; auto-deregisters unhealthy tasks if database probe fails.
-
-### 3.4 Recalculated Monthly Cost Assumptions (`ap-south-1` Mumbai)
-*The following itemized cost model reflects deployment in AWS Asia Pacific (Mumbai) `ap-south-1` with Multi-AZ redundancy and enterprise networking. Planning estimates only, not binding quotes:*
-
-| Component | AWS Resource & Configuration | Monthly Cost (USD) |
-|---|---|---|
-| **Frontend & Edge Gateway** | Cloudflare Workers Paid Plan + Custom Domain & WAF | $20 – $30 |
-| **Backend Compute** | AWS ECS Fargate: 2 tasks (0.5 vCPU, 1 GB RAM, 24/7 across 2 AZs) | $32 – $42 |
-| **Cloudflare Tunnel Connectors** | AWS ECS Fargate: 2 tasks (0.25 vCPU, 0.5 GB RAM for `cloudflared`) | $16 – $22 |
-| **Application Load Balancing** | AWS Internal ALB (1 ALB + ~1 LCU average) | $22 – $28 |
-| **Managed Database** | AWS RDS PostgreSQL 16 Multi-AZ (`db.t4g.medium`, 100 GB gp3) | $135 – $155 |
-| **Outbound NAT Gateway** | AWS NAT Gateway (1 per AZ for private subnet outbound: images/updates) | $65 – $75 |
-| **Automated Backups & PITR** | AWS RDS Snapshot storage + S3 Standard encrypted bucket | $12 – $20 |
-| **Secrets & Telemetry** | AWS Secrets Manager (4 secrets) + CloudWatch Logs (10 GB ingestion) | $15 – $25 |
-| **Data Egress & Transfer** | Cloudflare Tunnel egress (inbound to Cloudflare is free; minimal AWS egress) | $5 – $12 |
-| **Total Estimated Run-Rate** | **High-Availability Production Environment (`ap-south-1`)** | **$322 – $409 / month** |
+#### Assessment & Portable Target Specification:
+- **Nitro Multi-Preset Capability:** Nitro (UnJS) natively supports multiple deployment presets via the `NITRO_PRESET` environment variable.
+- **Primary Portable Target:** `node-server`
+  - Running `NITRO_PRESET=node-server npm run build` compiles the application into a standalone Node.js server located in `.output/server/index.mjs`.
+  - The resulting output runs via standard `node .output/server/index.mjs` listening on `PORT=3000`.
+  - Fully compatible with standard Docker, Kubernetes, Linux VMs, and on-premises servers.
+- **Optional Edge Adapter:** `cloudflare-module`
+  - Retained as a build option (`NITRO_PRESET=cloudflare-module`) for teams electing to use Cloudflare Workers.
+- **Build-Time vs. Runtime Configuration Separation:**
+  - *Build-Time (Static):* React route tree, Tailwind CSS compilation, client asset hashing.
+  - *Runtime (Dynamic):* Injected via standard environment variables:
+    - `PORT`: HTTP port to bind (default `3000`).
+    - `HOST`: IP to bind (default `0.0.0.0`).
+    - `VITE_API_MODE`: `"live"`.
+    - `VITE_API_BASE_URL`: Left empty (empty string) to leverage same-origin `/api` routing via the reverse proxy, eliminating CORS.
 
 ---
 
-## 4. Production Authentication & Bootstrap Security (ARCH-03)
+## 4. Supported Deployment Profiles
 
-### 4.1 Same-Origin Cookie Session Architecture
-To eliminate session loss on browser reload without introducing persistent XSS vulnerabilities:
+To fulfill the Product Owner's portability mandate, three deployment profiles are formally supported:
 
-1. **Cookie Directives:**
-   - On successful `POST /api/auth/login`, backend issues:
-     ```http
-     Set-Cookie: collectflow_session=<session_secret>; Path=/api; HttpOnly; Secure; SameSite=Lax; Max-Age=604800
-     ```
-   - `HttpOnly`: Strictly blocks client-side JavaScript (`document.cookie` cannot inspect or exfiltrate token).
-   - `Secure`: Transmitted solely over TLS connections.
-   - `SameSite=Lax`: Prevents cross-site POST invocation while permitting safe top-level navigations.
-   - `Path=/api`: Limits cookie transmission strictly to backend API endpoints.
-
-2. **Session Lifecycle & Invalidation:**
-   - **Generation:** 256 bits CSPRNG entropy (`secrets.token_hex(32)`).
-   - **Storage:** SHA-256 hash stored in `sessions.token_hash`. Raw secret exists only on the client cookie.
-   - **Expiration:** 7-day hard expiry (`expires_at`); optional 24-hour sliding inactivity expiration.
-   - **Logout:** `POST /api/auth/logout` deletes session record in PostgreSQL and issues expired cookie header (`Max-Age=0`).
-
-3. **Origin & Host Header Validation:**
-   - FastAPI middleware validates that the `Origin` (or `Referer` on navigation) matches the configured production origin (`https://app.collectflow.io`). Unmatched origins are rejected with **HTTP 403 Forbidden**.
-
-4. **CSRF Defense & Negative Test Matrix:**
-   - All state-mutating requests (`POST`, `PUT`, `DELETE`) require a custom header: `X-Requested-With: XMLHttpRequest` or `X-CollectFlow-CSRF: 1`.
-   - Modern browsers forbid cross-origin forms, images, or scripts from attaching custom headers without CORS preflight approval.
-   - **Negative Test Matrix (Must Pass Before Go-Live):**
-     1. *Cross-Origin Form POST without Custom Header:* Returns **HTTP 403 Forbidden**.
-     2. *Cross-Origin Fetch with Custom Header from Disallowed Origin:* Fails at preflight `OPTIONS` (CORS origin denied).
-     3. *Forged Origin Header:* Returns **HTTP 403 Forbidden**.
-     4. *Missing Session Cookie:* Returns **HTTP 401 Unauthorized**.
-     5. *Expired or Revoked Session Cookie:* Returns **HTTP 401 Unauthorized**.
-     6. *Tampered Cookie Secret Value:* Returns **HTTP 401 Unauthorized**.
-
-5. **RBAC & Audit Trail Preservation:**
-   - Full compatibility with existing dependencies: `get_current_user`, `require_admin`, `require_finance_or_admin`.
-   - All authentication events (success, failure, lockout, logout) continue to record immutable audit rows in `audit_logs` with client IP and `request_id`.
-
-### 4.2 Database Schema Prerequisite: `must_change_password`
-The existing `User` model ([`collectflow/app/models/domain_models.py#L85-L96`](file:///home/anishb/projects/personal/collectflow/app/models/domain_models.py#L85-L96)) **does not possess a `must_change_password` column**.
-- **Mandatory Prerequisite:** Forced password rotation cannot be implemented purely in code without database backing.
-- **Required Action:** Author an additive Alembic migration adding `must_change_password = Column(Boolean, nullable=False, default=False)` to `users`.
-- **Enforcement:** When `must_change_password == True`, `get_current_user` intercepts all API calls (except `/api/auth/change-password` and `/api/auth/logout`) and returns **HTTP 403 Password Change Required**.
-
-### 4.3 Protected Bootstrap Secret Delivery
-- The initial primary administrator credentials **must never be printed to stdout, build logs, or CI/CD pipelines**.
-- **Delivery Mechanism:** The automated bootstrap initializer (`scripts/init_production_db.py`) writes the generated initial password directly into **AWS Secrets Manager** (`/collectflow/production/bootstrap_admin`) with access restricted to the nominated Lead Administrator IAM role.
-- Once the initial administrator logs in and changes their password, the temporary secret in Secrets Manager is marked obsolete and rotated.
-
----
-
-## 5. Financially Safe Migration & Rollback Strategy (ARCH-02)
-
-### 5.1 Removal of Generic `alembic downgrade -1`
-In the initial preflight draft, running `alembic downgrade -1` was referenced as a generic rollback step. 
-- **CRITICAL AUDIT CORRECTION:** Review of [`migrations/versions/e9ee322f8b96_create_collectflow_v1_domain_schema.py#L289-L322`](file:///home/anishb/projects/personal/collectflow/migrations/versions/e9ee322f8b96_create_collectflow_v1_domain_schema.py#L289-L322) demonstrates that its `downgrade()` function executes:
-  `op.drop_table('payment_transactions')`, `op.drop_table('commercial_invoices')`, `op.drop_table('audit_logs')`!
-- Running `alembic downgrade -1` against a populated database is **destructive, catastrophic, and illegal under statutory audit standards**.
-- **Policy:** Generic `downgrade` commands are strictly forbidden in production runbooks.
-
-### 5.2 Safe Additive-Only Migration Pattern (Expand & Contract)
-All future production schema changes must follow the non-destructive **Expand and Contract** pattern:
-1. **Phase 1 (Expand):** Add new columns as nullable, add new tables, or introduce non-destructive indexes. Never drop or rename columns in an active migration.
-2. **Phase 2 (Dual Write / Compatibility):** Deploy backend application code that writes to new structures while remaining backward-compatible with the old schema.
-3. **Phase 3 (Contract):** Once verified across a full financial reporting cycle, deprecate and archive old structures in a planned, separate maintenance release.
-
-### 5.3 Write Freezing & Maintenance Mode
-For any deployment requiring exclusive table locks:
-1. Activate Cloudflare Edge Maintenance Worker: immediately serves branded HTTP 503 Maintenance Page, gracefully freezing incoming financial writes.
-2. Verify in-flight database transactions complete via `pg_stat_activity`.
-3. Apply migration.
-4. Verify `/ready` probe.
-5. Deactivate Maintenance Worker to restore live traffic.
-
-### 5.4 Database Restores: No Claim of Automatic Lossless Recovery
-- A database restore (whether from RDS automated snapshot or point-in-time recovery) terminates the live database timeline and replaces it with historical state.
-- **Explicit Reality:** Any transactions recorded between the snapshot timestamp and the point of failure will be lost unless replayed from independent bank or application audit logs.
-- **Governance Mandate:** A database snapshot restore is a severe disaster recovery action. It requires **explicit joint written authorization from the Head of Finance and Product Owner** before execution.
-
----
-
-## 6. CI/CD Pipeline & Realistic Operational Targets (ARCH-04)
-
-### 6.1 Automated GitHub Actions Pipeline Structure
-To satisfy the automation-first mandate without manual cloud portal actions:
+### Profile 1: On-Premises / Generic Linux Docker Compose (Reference Profile)
+Ideal for on-premises enterprise data centers, private clouds, air-gapped installations, or small-scale self-hosted environments.
 
 ```mermaid
-flowchart LR
-    subgraph PR_Gate ["PR Validation Pipeline"]
-        PR[Developer PR] --> LintCheck[Ruff & ESLint]
-        LintCheck --> TypeCheck[tsc & Pydantic Check]
-        TypeCheck --> PytestRun[Backend Pytest: 115 tests]
-        TypeCheck --> VitestRun[Frontend Vitest: 596 tests]
+flowchart TD
+    subgraph Host ["Single Linux Host / VM (Ubuntu / RHEL / Debian)"]
+        subgraph DockerNetwork ["Internal Docker Bridge Network (collectflow-net)"]
+            Nginx["nginx:alpine (Ports 80/443 Public)"]
+            Web["collectflow-web:v1.0.0 (Port 3000 Internal)"]
+            API["collectflow-api:v1.0.0 (Port 8000 Internal)"]
+            PG[("postgres:16-alpine (Port 5432 Internal)")]
+            Volume[("Named Docker Volume: pgdata")]
+        end
     end
 
-    subgraph Staging_Gate ["Staging & UAT Pipeline"]
-        PytestRun --> MergeStaging[Merge to release/*]
-        VitestRun --> MergeStaging
-        MergeStaging --> EphemeralPG[Spin Up Ephemeral PG 16]
-        EphemeralPG --> MigrateTest[alembic upgrade head]
-        MigrateTest --> LiveUAT[Playwright LIVE UAT: 39 tests]
-        LiveUAT --> FiveSource[5-Source Reconciliation Verifier]
+    Internet["Corporate LAN / Internet"] -->|HTTPS 443| Nginx
+    Nginx -->|/*| Web
+    Nginx -->|/api/*| API
+    API -->|TCP 5432| PG
+    PG --- Volume
+```
+
+#### Docker Compose Specification (`docker-compose.prod.yml`):
+```yaml
+version: "3.8"
+
+networks:
+  collectflow-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+    driver: local
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks:
+      - collectflow-net
+    environment:
+      POSTGRES_DB: ${COLLECTFLOW_DB_NAME:-collectflow}
+      POSTGRES_USER: ${COLLECTFLOW_DB_USER:-collectflow_user}
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${COLLECTFLOW_DB_USER:-collectflow_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: collectflow-api:v1.0.0
+    restart: unless-stopped
+    networks:
+      - collectflow-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      COLLECTFLOW_ENV: production
+      COLLECTFLOW_DATABASE_URL: postgresql+psycopg://${COLLECTFLOW_DB_USER}:${DB_PASSWORD}@postgres:5432/${COLLECTFLOW_DB_NAME}
+      COLLECTFLOW_SECRET_KEY_FILE: /run/secrets/app_secret
+    secrets:
+      - db_password
+      - app_secret
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    image: collectflow-web:v1.0.0
+    restart: unless-stopped
+    networks:
+      - collectflow-net
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOST: 0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    networks:
+      - collectflow-net
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+      - frontend
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+  app_secret:
+    file: ./secrets/app_secret.txt
+```
+
+---
+
+### Profile 2: Cloud-Native Kubernetes / Helm (Enterprise Cluster Profile)
+Ideal for enterprise organizations running Kubernetes on bare metal, OpenShift, or managed public cloud clusters (AWS EKS, GCP GKE, Azure AKS).
+
+- **Packaging:** Standard Helm Chart (`collectflow/`).
+- **Workloads:**
+  - `Deployment`: `collectflow-web` (replicas: 2+, horizontal pod autoscaling).
+  - `Deployment`: `collectflow-api` (replicas: 2+, horizontal pod autoscaling).
+  - `Ingress`: `ingress-nginx` or Traefik with automated cert-manager TLS certificates.
+  - `Service`: ClusterIP services routing internal traffic.
+  - `Secrets`: Standard Kubernetes `Secret` resources or External Secrets Operator integration (HashiCorp Vault, AWS Secrets Manager, Azure Key Vault).
+  - `Database`: External high-availability PostgreSQL cluster or Cloud-native Operator (e.g. CloudNativePG, Crunchy Data PostgreSQL).
+
+---
+
+### Profile 3: Optional Managed Cloud Reference Implementations
+Preserved as optional cloud-specific deployment patterns for organizations with existing cloud provider commitments:
+- **AWS Reference Architecture:** AWS ECS Fargate (API & Web) + AWS RDS PostgreSQL 16 Multi-AZ + Application Load Balancer (or Cloudflare Tunnel for edge protection).
+- **GCP Reference Architecture:** GCP Cloud Run (API & Web) + GCP Cloud SQL PostgreSQL 16 + Google Cloud Load Balancing.
+- **Azure Reference Architecture:** Azure Container Apps + Azure Database for PostgreSQL Flexible Server.
+
+---
+
+## 5. Portable Infrastructure & Provider-Neutral Operations
+
+### 5.1 Infrastructure as Code (IaC) Decoupling
+To enforce provider neutrality:
+- Application source repositories (`collectflow`, `cash-flow-buddy-101`) contain **zero provider-specific Terraform code**.
+- Infrastructure automation is maintained in separate, modular repositories:
+  - `collectflow-deploy/compose/`: Portable Docker Compose deployment templates.
+  - `collectflow-deploy/helm/`: Universal Kubernetes Helm chart.
+  - `collectflow-deploy/terraform/aws/`: Optional AWS ECS/RDS module.
+  - `collectflow-deploy/terraform/gcp/`: Optional GCP Cloud Run/Cloud SQL module.
+
+### 5.2 Provider-Neutral Security & Authentication
+1. **Same-Origin Cookie Authentication:**
+   - Functions identically across all deployment profiles. The reverse proxy (Nginx, Traefik, or Cloudflare) unifies the origin under `app.yourdomain.com`.
+   - Cookie directive:
+     ```http
+     Set-Cookie: collectflow_session=<token_secret>; Path=/api; HttpOnly; Secure; SameSite=Lax; Max-Age=604800
+     ```
+   - Ingress-agnostic CSRF protection via required custom header: `X-Requested-With: XMLHttpRequest`.
+2. **Provider-Neutral Secret Delivery:**
+   - The application expects secrets via standard POSIX environment variables (e.g., `COLLECTFLOW_DATABASE_URL`, `COLLECTFLOW_SECRET_KEY`) or file mounts (`*_FILE`).
+   - Secret injection is decoupled from the runtime: Docker Compose uses Docker secrets; Kubernetes uses K8s Secret volumes; Cloud environments use native task injection.
+   - Initial bootstrap administrator password is delivered securely via container environment injection or secure file volume, and is **never printed to stdout, console, or build logs**.
+3. **Database Schema Prerequisite:**
+   - Additive Alembic migration adding `must_change_password` to `users` table is required before forced password rotation can be enforced.
+
+### 5.3 Portable PostgreSQL Backup & Restore Strategy
+Applicable equally to on-premises Linux servers, Docker volumes, Kubernetes persistent storage, and managed cloud databases:
+1. **Standardized Logical Backups:**
+   - Automated scheduled `pg_dump` job:
+     ```bash
+     pg_dump -Fc -v -d "${COLLECTFLOW_DATABASE_URL}" -f "/backups/collectflow_$(date +%Y%m%d_%H%M%S).dump"
+     ```
+   - Compatible with local storage, NFS mounts, AWS S3, Azure Blob, or Google Cloud Storage.
+2. **Physical WAL Archiving & Point-In-Time Recovery (PITR):**
+   - *Self-Hosted / On-Premises:* Configured via `pgBackRest` or `Barman` pushing WAL archives to local/remote storage.
+   - *Managed Cloud:* Automated provider backup archiving (RDS / Cloud SQL).
+3. **Restoration Governance:**
+   - Restoring a snapshot or dump resets data state; transactions between the snapshot and failure point must be reconciled externally.
+   - **Mandatory Policy:** Database restores require **joint written authorization from the Head of Finance and Product Owner**.
+
+---
+
+## 6. Portability & Release Acceptance Matrix
+
+The release candidate must be validated against the following multi-profile portability matrix:
+
+| Deployment Profile | Target Platform | Ingress Technology | Database Implementation | Portability Status |
+|---|---|---|---|---|
+| **Profile 1 (On-Premises)** | Bare-metal Linux (Ubuntu/RHEL) | Nginx Reverse Proxy | Self-hosted PostgreSQL 16 (Container/Host) | **PRIMARY PORTABLE GATE** |
+| **Profile 1 (Private Cloud)** | Enterprise VMware / Nutanix VM | Traefik Reverse Proxy | Dedicated PostgreSQL 16 VM | **PRIMARY PORTABLE GATE** |
+| **Profile 2 (Kubernetes)** | Vanilla K8s / K3s / OpenShift | `ingress-nginx` Controller | CloudNativePG Operator / External PG | **ENTERPRISE CLUSTER GATE** |
+| **Profile 3 (AWS Reference)** | AWS ECS Fargate | Internal ALB + Cloudflare Tunnel | AWS RDS PostgreSQL 16 Multi-AZ | **OPTIONAL CLOUD ADAPTER** |
+| **Profile 3 (GCP Reference)** | GCP Cloud Run | Google Cloud HTTPS Load Balancer | GCP Cloud SQL PostgreSQL 16 | **OPTIONAL CLOUD ADAPTER** |
+| **Air-Gapped Offline** | Isolated LAN (No Internet) | Nginx + Local SSL Certs | Local PostgreSQL 16 | **AIR-GAPPED COMPLIANT** |
+
+---
+
+## 7. Comparative Monthly Cost Breakdown Across Profiles
+
+*The following comparative estimates illustrate infrastructure economics across supported deployment profiles:*
+
+| Cost Component | Profile 1: On-Premises / Single VM | Profile 2: Managed Kubernetes (EKS/GKE) | Profile 3: AWS ECS + RDS + Cloudflare |
+|---|---|---|---|
+| **Compute** | $40 – $80 / mo (1 Dedicated 4-vCPU VM) | $90 – $140 / mo (2 Worker Nodes) | $48 – $64 / mo (ECS Fargate Tasks) |
+| **Ingress / Load Balancer** | $0 (Included in Nginx container) | $20 – $30 / mo (Cloud Load Balancer) | $22 – $28 / mo (Internal ALB) |
+| **Database** | $0 (Self-hosted on VM with EBS/disk) | $70 – $120 / mo (Managed DB or Stateful) | $135 – $155 / mo (RDS Multi-AZ) |
+| **Edge / WAF** | $0 (Corporate firewall / local WAF) | $0 – $25 / mo (Ingress WAF plugin) | $20 – $30 / mo (Cloudflare Workers/WAF) |
+| **Backups & Networking** | $10 – $20 / mo (S3 / Local NAS backup) | $25 – $40 / mo (Storage + Egress) | $80 – $105 / mo (NAT Gateways + S3) |
+| **Total Estimated Run-Rate** | **$50 – $100 / month** | **$205 – $355 / month** | **$305 – $382 / month** |
+
+---
+
+## 8. Release-Readiness Sequencing & Reconciled Work Packages
+
+The release readiness sequencing prioritizes provider-neutral packaging and core application hardening before any cloud-specific tooling:
+
+```mermaid
+flowchart TD
+    subgraph Phase_A ["Phase A: Core Portability & Hardening (Mandatory)"]
+        WP1[WP-01: Dependency & Isolation Hardening] --> WP2[WP-02: Portable OCI Container Packaging]
+        WP2 --> WP3[WP-03: User Model Migration & Production Initializer]
+        WP3 --> WP4[WP-04: Provider-Neutral Cookie Auth & CSRF]
     end
 
-    subgraph Deploy_Gate ["Deployment Pipeline"]
-        FiveSource --> BuildImages[Build Signed Docker Images]
-        BuildImages --> DeployStaging[Deploy to Staging via Terraform]
-        DeployStaging --> FinSignOff{Finance & PO Sign-Off}
-        FinSignOff -->|Approved| CanaryProd[Production ECS Rollout]
+    subgraph Phase_B ["Phase B: Portability Verification & Governance"]
+        WP4 --> WP5[WP-05: Docker Compose & K8s Portability Suite]
+        WP4 --> WP6[WP-06: Business Policy Technical Gates]
+        WP6 --> BPD[Formal Sign-Off on Decision Register]
+    end
+
+    subgraph Phase_C ["Phase C: Optional Cloud Adapters (On-Demand)"]
+        BPD --> WP7[WP-07 Optional: AWS / GCP / Azure Terraform Modules]
     end
 ```
 
-### 6.2 Realistic Operational Recovery Timeframes
-*Absolute guarantees (such as "guaranteed 90-second rollbacks") are removed in favor of realistic orchestrator convergence targets:*
-- **ECS Fargate Application Reversion:** Target convergence: **3 to 7 minutes** (governed by ALB connection draining timeouts, minimum healthy task percentages, and container startup latency).
-- **Cloudflare Edge Worker Reversion:** Target convergence: **< 1 minute** (instantaneous edge bundle activation).
-- **RDS Point-In-Time Disaster Recovery:** Target convergence: **20 to 45 minutes** (governed by EBS volume initialization and WAL log replay duration).
-
----
-
-## 7. Business Policy & Release Boundaries (ARCH-04)
-
-### 7.1 Customer Deactivation Policy Revision
-- **Independent Review Correction:** The previous recommendation to automatically cancel unbilled purchase orders upon customer deactivation has been removed.
-- **Revised Policy:**
-  1. Soft-deactivating a customer (`is_active=False`) blocks creating *new* purchase orders or invoices for that customer.
-  2. **Existing unbilled purchase orders remain active and intact.** Cancelling a purchase order is a separate, audited commercial action requiring formal cancellation reasons.
-  3. **Outstanding receivables remain legally binding.** Existing commercial invoices remain active.
-  4. The Reports Hub, Customer Exposure views, and AR Aging summaries **continue to display inactive customers who possess unbilled commitments or outstanding balances** (flagged with an "Inactive Customer" badge) so financial commitments are never hidden.
-
-### 7.2 Statutory Accounting & Closed-Period Status
-- Formal statutory accounting policies (BPD-01) remain strictly **PENDING QUALIFIED FINANCE / AUDITOR APPROVAL**.
-- No code change or assumption of closed-period behavior will be implemented prior to written sign-off.
-
-### 7.3 Domestic INR Scope Enforcement Gate
-- If approved under BPD-04, an explicit server-side technical gate will be added:
-  `if item.currency != "INR" or item.exchange_rate != Decimal("1.000000"): raise HTTPException(400, "Only domestic INR transactions are supported in v1.0")`.
-
----
-
-## 8. Implementation Work Packages (Reconciled WP-01 to WP-06)
-
-The implementation work packages are formally reconciled:
-
+### Work Package Definitions (WP-01 to WP-07):
 - **WP-01: Dependency & Environment Isolation Hardening (Backend)**
   - Update `requirements.txt` with pinned versions of SQLAlchemy 2.0, psycopg3, Alembic, and Argon2-cffi.
-  - Refactor `app/core/database.py` to support `COLLECTFLOW_ENV=production` with mandatory SSL and remote RDS DSN validation.
-- **WP-02: User Model Migration & Production Initializer**
+  - Refactor `app/core/database.py` to support `COLLECTFLOW_ENV=production` with standard TCP/SSL connections to any PostgreSQL 16 host (local, container, or remote).
+- **WP-02: Portable OCI Container Packaging (Frontend & Backend)**
+  - Author multi-stage Dockerfile for Backend (`python:3.12-slim`).
+  - Configure frontend Nitro preset to compile with `NITRO_PRESET=node-server` and author multi-stage Dockerfile (`node:22-slim`).
+  - Author `docker-compose.prod.yml` with Nginx reverse proxy.
+- **WP-03: User Model Migration & Production Initializer**
   - Create Alembic migration adding `must_change_password` column to `users`.
   - Author `scripts/init_production_db.py` to seed clean statutory reference data and bootstrap one primary administrator.
-  - Deliver bootstrap credentials securely to AWS Secrets Manager (zero plaintext output).
+  - Ingest bootstrap credentials via secure environment variable / Secrets volume (zero stdout printing).
   - Add hard safety abort to `scripts/seed_postgres_fixtures.py` preventing execution outside `COLLECTFLOW_ENV=test`.
-- **WP-03: Same-Origin Cookie Authentication & CSRF Hardening**
+- **WP-04: Provider-Neutral Same-Origin Cookie Authentication & CSRF Hardening**
   - Implement `HttpOnly; Secure; SameSite=Lax` cookie issuance and renewal in FastAPI.
   - Add Origin / Referer validation and custom CSRF header check (`X-Requested-With: XMLHttpRequest`).
   - Update frontend `ApiClient` to leverage cookie sessions while preserving in-memory user profile state.
   - Implement negative test battery validating CSRF and origin rejection.
-- **WP-04: GitHub Actions CI/CD Pipeline Automation**
+- **WP-05: Portability Verification Suite & CI Automation**
   - Implement `.github/workflows/ci.yml` (lint, typecheck, pytest, vitest).
-  - Implement `.github/workflows/release.yml` (ephemeral PostgreSQL 16 container, Playwright LIVE UAT, 5-source reconciliation verifier, signed container build).
-- **WP-05: Infrastructure as Code (Terraform) & Cloudflare Tunnel**
-  - Author Terraform modules for AWS VPC (`ap-south-1`), private subnets, RDS PostgreSQL Multi-AZ, Internal ALB, and ECS Fargate.
-  - Configure `cloudflared` tunnel connectors on ECS Fargate for private ingress.
+  - Implement automated Docker Compose startup and healthcheck validation in CI.
+  - Author Helm chart for Kubernetes deployment testing.
 - **WP-06: Business Policy Technical Gates & Domestic INR Scoping**
   - Implement INR-only validation gate on purchase orders and invoices (`currency == "INR"`, `exchange_rate == 1.000000`).
   - Update Customer Directory and Reports Hub to display inactive customer exposure badges.
+- **WP-07 (Optional): Cloud-Specific Reference Modules**
+  - Author Terraform modules for AWS ECS/RDS and Cloudflare Tunnel only if AWS deployment is explicitly selected.

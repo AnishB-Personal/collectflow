@@ -1,7 +1,7 @@
 # CollectFlow Post-Phase 4C Release Business Decision Register
 
 **Document Reference:** `COLLECTFLOW_RELEASE_DECISION_REGISTER.md`  
-**Stage:** Post-Phase 4C Release Readiness Preflight (Revised per Independent Architecture Review)  
+**Stage:** Post-Phase 4C Release Readiness Preflight (Revised per Product Owner Cloud-Agnostic Direction)  
 **Date:** October 18, 2026  
 **Status:** DRAFT — PENDING FORMAL STAKEHOLDER & FINANCE APPROVAL  
 **Governance Rule:** *Antigravity provides technical analysis and engineering recommendations; formal policy determinations remain strictly the prerogative of the Product Owner, Finance Controller, and Statutory Auditor. No planning recommendation in this register constitutes completed business sign-off.*
@@ -12,7 +12,11 @@
 
 During Phase 4C, the engineering team achieved mathematical parity and technical compliance with the approved integration contracts. However, moving from an isolated development sandbox to an enterprise production environment exposes four foundational business-policy decisions where technical choices directly impact statutory accounting compliance, financial audit certification, and operational workflows.
 
-This register formally documents each policy dilemma, provides technical and legal context under Indian accounting standards (Ind AS / Companies Act / GST), evaluates practical options with tradeoffs, presents the engineering recommendation, and defines the required approval authority.
+### Strategic Architectural Mandate
+Per Product Owner directive, **CollectFlow must be 100% cloud-agnostic and deployable on-premises, in private clouds, or across any major public cloud (AWS, Azure, GCP)** without modifying application source code or business logic:
+- The previous Cloudflare Workers environment was a development/UAT staging adapter, **not** the permanent or mandatory production architecture.
+- Core packaging must be based on portable OCI container images, standard PostgreSQL 16+, and generic HTTP/S reverse proxy ingress (Nginx, Traefik, Kubernetes Ingress).
+- Application code must remain free of proprietary cloud SDKs.
 
 ### Decision Classification Summary
 | Decision ID | Domain | Policy Topic | Classification | Required Sign-Off | Approval Status |
