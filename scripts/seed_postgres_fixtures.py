@@ -290,7 +290,89 @@ def seed_fixtures(reset: bool = False):
                 db.add(target)
                 db.flush()
 
-        # 10. Audit Log
+        # 10. Known Payment/Reversal Pair on Cancelled Invoice (for audit & historical retention verification)
+        existing_rev_inv = db.scalar(select(CommercialInvoice).where(CommercialInvoice.invoice_number == "INV-2026-REV-001"))
+        if not existing_rev_inv and acme and sales_user and admin_user:
+            canc_inv = CommercialInvoice(
+                po_id=None,
+                fy_code="FY 2026-27",
+                customer_id=acme.id,
+                executive_id=sales_user.id,
+                invoice_number="INV-2026-REV-001",
+                invoice_date=date(2026, 4, 14),
+                due_date=date(2026, 5, 14),
+                currency="INR",
+                exchange_rate=Decimal("1.000000"),
+                exclusive_amount=Decimal("100000.00"),
+                tax_rate=Decimal("0.1800"),
+                tax_amount=Decimal("18000.00"),
+                total_amount=Decimal("118000.00"),
+                snapshot_customer_name=acme.billing_name,
+                snapshot_gstin=acme.gst_number,
+                snapshot_billing_address=acme.billing_address,
+                snapshot_state=acme.state,
+                cgst_amount=Decimal("9000.00"),
+                sgst_amount=Decimal("9000.00"),
+                igst_amount=Decimal("0.00"),
+                lifecycle_status="CANCELLED",
+                cancelled_at=datetime(2026, 4, 20, 12, 0, 0, tzinfo=timezone.utc),
+                cancelled_by=admin_user.id,
+                cancellation_reason="Full reversal and cancellation audit trail baseline",
+                remarks="Cancelled invoice with paired payment and reversal audit history",
+            )
+            db.add(canc_inv)
+            db.flush()
+
+            canc_item = CommercialInvoiceItem(
+                invoice_id=canc_inv.id,
+                item_description="Specialist Infrastructure Migration (Cancelled Retainer)",
+                quantity=Decimal("1.0000"),
+                unit_price=Decimal("100000.00"),
+                exclusive_amount=Decimal("100000.00"),
+                tax_rate=Decimal("0.1800"),
+                tax_amount=Decimal("18000.00"),
+                total_amount=Decimal("118000.00"),
+            )
+            db.add(canc_item)
+            db.flush()
+
+            # Seed parent payment
+            parent_pay = PaymentTransaction(
+                invoice_id=canc_inv.id,
+                parent_transaction_id=None,
+                transaction_type="PAYMENT",
+                cash_amount=Decimal("50000.00"),
+                tds_amount=Decimal("2500.00"),
+                total_settled=Decimal("52500.00"),
+                tds_section="194C",
+                payment_date=date(2026, 4, 18),
+                remittance_number="REM-2026-REV-ORIG",
+                payment_mode="NEFT",
+                notes="Original payment superseded by full reversal before cancellation",
+                recorded_by=admin_user.id,
+            )
+            db.add(parent_pay)
+            db.flush()
+
+            # Seed compensating reversal
+            rev_pay = PaymentTransaction(
+                invoice_id=canc_inv.id,
+                parent_transaction_id=parent_pay.id,
+                transaction_type="REVERSAL",
+                cash_amount=Decimal("-50000.00"),
+                tds_amount=Decimal("-2500.00"),
+                total_settled=Decimal("-52500.00"),
+                tds_section="194C",
+                payment_date=date(2026, 4, 20),
+                remittance_number="REM-2026-REV-COMP",
+                payment_mode="NEFT",
+                notes="Full compensating reversal restoring balance prior to invoice cancellation",
+                recorded_by=admin_user.id,
+            )
+            db.add(rev_pay)
+            db.flush()
+
+        # 11. Audit Log
         if admin_user:
             existing_audit = db.scalar(select(AuditLog).where(AuditLog.entity_id == "SEED-4C1"))
             if not existing_audit:

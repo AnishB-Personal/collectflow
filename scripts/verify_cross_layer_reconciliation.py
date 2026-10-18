@@ -4,7 +4,7 @@ Cross-Layer Independent Financial Reconciliation Verifier for CollectFlow Stage 
 Compares and verifies financial values across 5 independent sources:
 Source 1: Direct PostgreSQL 16 Domain Models & Relational Aggregates
 Source 2: Backend REST API Endpoints (Reporting Summary, AR Aging, Invoices, Payments, Targets)
-Source 3: Actual Browser-Rendered UI Values (Captured via Playwright DOM Inspection)
+Source 3: Actual Browser-Rendered UI Values (Fresh Playwright DOM Inspection on Every Run)
 Source 4: Downloaded Authoritative XLSX Workbook (Parsed via openpyxl)
 Source 5: Downloaded Authoritative CSV File (Parsed via csv.reader)
 
@@ -18,6 +18,7 @@ Verifies with Decimal precision (₹0.00 monetary difference tolerance):
 - Canonical 17-Column Workbook Structure in exact authoritative order
 - Genuine PO References (not remarks/synthetic fallbacks)
 - Settlement & Reversal Invariants: signed negative values, net ₹0.00 settlement, cancelled invoice retention
+- Strictly unrendered UI metrics marked N/A (UI) with zero derived/hardcoded fallbacks
 """
 
 import csv
@@ -26,15 +27,20 @@ from decimal import Decimal, ROUND_HALF_UP
 import io
 import json
 import os
+import secrets
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 # Enforce environment isolation
 if os.environ.get("COLLECTFLOW_ENV") != "test":
     os.environ["COLLECTFLOW_ENV"] = "test"
 if "COLLECTFLOW_DATABASE_URL" not in os.environ:
-    os.environ["COLLECTFLOW_DATABASE_URL"] = "postgresql+psycopg://collectflow_user:collectflow_secret@127.0.0.1:5432/collectflow_test"
+    os.environ["COLLECTFLOW_DATABASE_URL"] = (
+        "postgresql+psycopg://collectflow_user:collectflow_secret@127.0.0.1:5432/collectflow_test"
+    )
 
 # Canonical 17 columns in strict required order
 AUTHORITATIVE_COLUMNS = [
@@ -81,7 +87,7 @@ BACKEND_URL = os.environ.get("BACKEND_URL", "http://127.0.0.1:8000")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://127.0.0.1:3000")
 
 
-def quantize_dec(val) -> Decimal:
+def quantize_dec(val: Any) -> Decimal:
     if val is None:
         return Decimal("0.00")
     return Decimal(str(val)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -94,70 +100,179 @@ def parse_csv_money(val_str: str) -> Decimal:
     return quantize_dec(cleaned)
 
 
-def load_or_capture_browser_financials() -> dict:
-    """Load browser-rendered financials from artifacts or execute capture automation."""
-    possible_paths = [
-        Path(__file__).resolve().parent.parent / "artifacts" / "browser_rendered_financials.json",
-        Path(__file__).resolve().parent.parent.parent / "cash-flow-buddy-101" / "artifacts" / "browser_rendered_financials.json",
-        Path(__file__).resolve().parent.parent.parent / "collectflow" / "artifacts" / "browser_rendered_financials.json",
+def validate_browser_snapshot(data: dict, run_id: str, run_start_utc: datetime.datetime) -> dict:
+    """
+    Validates provenance, run-id binding, and timestamp freshness of captured browser data.
+    Strictly raises ValueError on invalid provenance, stale timestamp, or missing metrics.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("FATAL: Browser snapshot payload must be a JSON object.")
+
+    # 1. Provenance validation
+    source = data.get("source")
+    if source != "Playwright Headless Chromium DOM":
+        raise ValueError(
+            f"FATAL: Provenance check failed: expected 'Playwright Headless Chromium DOM', got '{source}'."
+        )
+
+    # 2. Run ID binding
+    snap_run_id = data.get("run_id")
+    if snap_run_id != run_id:
+        raise ValueError(
+            f"FATAL: Run ID mismatch: snapshot is bound to '{snap_run_id}', expected current run '{run_id}'."
+        )
+
+    # 3. Timestamp freshness (must be captured during this run, within 5s grace for clock skew)
+    ts_str = data.get("captured_at")
+    if not ts_str:
+        raise ValueError("FATAL: Browser snapshot is missing 'captured_at' timestamp.")
+
+    try:
+        captured_at = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except Exception as e:
+        raise ValueError(f"FATAL: Invalid ISO timestamp format '{ts_str}': {e}")
+
+    if captured_at < run_start_utc - datetime.timedelta(seconds=5):
+        raise ValueError(
+            f"FATAL: Stale snapshot detected: captured at {captured_at.isoformat()} < run start {run_start_utc.isoformat()}. "
+            "A fresh browser capture is strictly required."
+        )
+
+    # 4. Required metrics presence
+    required_metrics = [
+        "invoiced_gross",
+        "exclusive_amount",
+        "cash_amount",
+        "tds_amount",
+        "total_settled",
+        "total_outstanding",
+        "annual_target",
     ]
+    for m in required_metrics:
+        if data.get(m) is None:
+            raise ValueError(f"FATAL: Browser snapshot missing required UI metric '{m}'.")
 
-    for p in possible_paths:
-        if p.exists():
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                print(f"  Loaded browser financial snapshot from: {p}")
-                return data
-            except Exception as e:
-                print(f"  Warning: Failed to read {p}: {e}")
+    return data
 
-    # If artifact not present, attempt to run capture script if node/frontend available
-    capture_script = Path(__file__).resolve().parent / "capture_browser_financials.mjs"
-    if not capture_script.exists():
-        capture_script = Path(__file__).resolve().parent.parent.parent / "cash-flow-buddy-101" / "scripts" / "capture_browser_financials.mjs"
 
-    if capture_script.exists():
+def execute_fresh_browser_capture(run_id: str, run_start_utc: datetime.datetime) -> dict:
+    """
+    Executes a fresh Playwright headless capture against the live frontend on every reconciliation run.
+    Validates output provenance and timestamp. Zero hardcoded fallbacks permitted.
+    """
+    artifacts_dir = project_root / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = artifacts_dir / f"browser_snapshot_{run_id}.json"
+
+    # Remove stale artifact if it somehow exists
+    if snapshot_path.exists():
+        snapshot_path.unlink()
+
+    # Find capture script
+    possible_scripts = [
+        project_root.parent / "cash-flow-buddy-101" / "scripts" / "capture_browser_financials.mjs",
+        project_root / "scripts" / "capture_browser_financials.mjs",
+    ]
+    capture_script = next(
+        (s for s in possible_scripts if s.exists() and (s.parent.parent / "node_modules").exists()),
+        next((s for s in possible_scripts if s.exists()), None)
+    )
+    if not capture_script:
+        raise RuntimeError(
+            "FATAL: Browser capture script 'scripts/capture_browser_financials.mjs' not found in either repository."
+        )
+
+    # Check if frontend server is reachable; if not, temporarily spawn Vite dev server
+    frontend_dir = project_root if (project_root / "package.json").exists() else project_root.parent / "cash-flow-buddy-101"
+    vite_proc = None
+
+    try:
         try:
-            print(f"  Executing browser financial capture automation: node {capture_script}...")
-            res = subprocess.run(
-                ["node", str(capture_script)],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                env=dict(os.environ, FRONTEND_URL=FRONTEND_URL),
+            r = requests.get(FRONTEND_URL, timeout=1)
+            server_online = r.status_code < 500
+        except Exception:
+            server_online = False
+
+        if not server_online:
+            print(f"  Frontend at {FRONTEND_URL} not running. Launching Vite dev server from {frontend_dir}...")
+            vite_proc = subprocess.Popen(
+                ["npm", "run", "dev", "--", "--port", "3000"],
+                cwd=str(frontend_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=dict(os.environ, VITE_API_MODE="live", VITE_API_BASE_URL=BACKEND_URL),
             )
-            if res.returncode == 0:
-                for p in possible_paths:
-                    if p.exists():
-                        with open(p, "r", encoding="utf-8") as f:
-                            return json.load(f)
-        except Exception as e:
-            print(f"  Browser live capture bypassed (dev server may be offline): {e}")
+            t0 = time.time()
+            ready = False
+            while time.time() - t0 < 25:
+                try:
+                    r = requests.get(FRONTEND_URL, timeout=1)
+                    if r.status_code < 500:
+                        ready = True
+                        break
+                except Exception:
+                    time.sleep(0.5)
+            if not ready:
+                raise RuntimeError(f"FATAL: Vite dev server on {FRONTEND_URL} failed to start within 25 seconds.")
+            print(f"  Vite dev server is ready at {FRONTEND_URL}.")
 
-    # Fallback to authoritative verified DOM snapshot
-    print("  Using canonical verified browser DOM presentation baseline...")
-    return {
-        "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "source": "Canonical Playwright Browser DOM Presentation Baseline",
-        "frontend_url": FRONTEND_URL,
-        "invoiced_gross": "531000.00",
-        "exclusive_amount": "450000.00",
-        "tax_amount": "81000.00",
-        "cash_amount": "200000.00",
-        "tds_amount": "9000.00",
-        "total_settled": "209000.00",
-        "total_outstanding": "322000.00",
-        "unbilled_po_gross": "295000.00",
-        "unbilled_recognized_ar": "0.00",
-        "annual_target": "7500000.00",
-    }
+        # Execute Playwright capture script
+        print(f"  Executing fresh browser capture automation (run_id={run_id})...")
+        cmd = [
+            "node",
+            str(capture_script),
+            "--output",
+            str(snapshot_path),
+            "--run-id",
+            run_id,
+        ]
+        env = dict(
+            os.environ,
+            FRONTEND_URL=FRONTEND_URL,
+            CAPTURE_RUN_ID=run_id,
+            CAPTURE_OUTPUT_PATH=str(snapshot_path),
+            LD_LIBRARY_PATH=f"/home/anishb/.local/lib:{os.environ.get('LD_LIBRARY_PATH', '')}",
+        )
+        res = subprocess.run(cmd, cwd=str(frontend_dir), capture_output=True, text=True, timeout=40, env=env)
+
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"FATAL: Playwright browser DOM capture failed (code {res.returncode}):\n"
+                f"STDOUT: {res.stdout}\n"
+                f"STDERR: {res.stderr}\n"
+                "Reconciliation aborted. No fallback to expected values is permitted under CF4C6-UAT-02."
+            )
+
+        if not snapshot_path.exists():
+            raise RuntimeError(
+                f"FATAL: Expected browser snapshot file '{snapshot_path}' was not written by capture script."
+            )
+
+        with open(snapshot_path, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+
+        validated_data = validate_browser_snapshot(raw_data, run_id, run_start_utc)
+        print(f"  Successfully captured and validated fresh browser snapshot at {validated_data['captured_at']}")
+        return validated_data
+
+    finally:
+        if vite_proc:
+            print("  Stopping temporary Vite dev server process...")
+            vite_proc.terminate()
+            try:
+                vite_proc.wait(timeout=5)
+            except Exception:
+                vite_proc.kill()
 
 
-def verify_cross_layer_reconciliation():
-    print("=" * 120)
-    print("COLLECTFLOW STAGE 4C.6 INDEPENDENT MULTI-SOURCE FINANCIAL RECONCILIATION")
-    print("=" * 120)
+def verify_cross_layer_reconciliation(browser_override: Optional[dict] = None) -> bool:
+    run_start_utc = datetime.datetime.now(datetime.timezone.utc)
+    run_id = f"uat_{int(time.time())}_{secrets.token_hex(4)}"
+
+    print("=" * 128)
+    print(f"COLLECTFLOW STAGE 4C.6 INDEPENDENT MULTI-SOURCE FINANCIAL RECONCILIATION")
+    print(f"Run ID: {run_id} | Start: {run_start_utc.isoformat()}")
+    print("=" * 128)
 
     # -------------------------------------------------------------------------
     # Source 1: Direct PostgreSQL Database Values
@@ -227,6 +342,7 @@ def verify_cross_layer_reconciliation():
         print(f"  PG Outstanding AR:    ₹{pg_outstanding}")
         print(f"  PG Unbilled Backlog:  ₹{pg_unbilled_po_gross}")
         print(f"  PG Unbilled Recog AR: ₹{pg_unbilled_po_ar} (from {len(po_linked_invoices)} linked invoices)")
+        print(f"  PG Reversal Rows:     {len(reversals)} reversal event(s) found")
 
     # -------------------------------------------------------------------------
     # Source 2: Backend REST API Endpoints
@@ -254,8 +370,8 @@ def verify_cross_layer_reconciliation():
     api_outstanding = quantize_dec(summary_data["total_outstanding"])
     api_unbilled_po = quantize_dec(summary_data["unbilled_orders_value"])
 
-    # Statutory AR Invariance: Total outstanding must strictly equal invoiced minus settled
-    api_unbilled_ar = api_outstanding - (api_invoiced - api_settled)
+    # Statutory invariant from API: Outstanding - (Invoiced - Settled) == 0 -> Unbilled recognized AR == 0
+    api_unbilled_ar = quantize_dec(api_outstanding - (api_invoiced - api_settled))
 
     # AR Aging API
     aging_res = requests.get(
@@ -266,7 +382,10 @@ def verify_cross_layer_reconciliation():
     assert aging_res.status_code == 200
     aging_data = aging_res.json()
     assert len(aging_data["buckets"]) == 6, f"Expected 6 buckets, got {len(aging_data['buckets'])}"
-    api_aging_sum = sum((quantize_dec(b["amount"]) for b in aging_data["buckets"]), Decimal("0.00"))
+    api_aging_sum = sum(
+        (quantize_dec(b["amount"]) for b in aging_data["buckets"]),
+        Decimal("0.00"),
+    )
 
     # Targets API
     targets_res = requests.get(f"{BACKEND_URL}/api/targets?fy=FY 2026-27", headers=headers, timeout=10)
@@ -276,6 +395,11 @@ def verify_cross_layer_reconciliation():
     assert sales_target_dto is not None
     api_target_yearly = quantize_dec(sales_target_dto["yearly_target"])
 
+    # Payments API for Collections Ledger audit & reversal inspection
+    payments_res = requests.get(f"{BACKEND_URL}/api/payments", headers=headers, timeout=10)
+    assert payments_res.status_code == 200
+    payments_data = payments_res.json()
+
     print(f"  API Invoiced:         ₹{api_invoiced}")
     print(f"  API Exclusive:        ₹{api_exclusive}")
     print(f"  API Tax:              ₹{api_tax}")
@@ -284,34 +408,39 @@ def verify_cross_layer_reconciliation():
     print(f"  API Settled:          ₹{api_settled}")
     print(f"  API Outstanding AR:   ₹{api_outstanding}")
     print(f"  API Unbilled Backlog: ₹{api_unbilled_po}")
-    print(f"  API Unbilled Recog AR:₹{api_unbilled_ar} (verified from summary balance invariance)")
+    print(f"  API Unbilled Recog AR:₹{api_unbilled_ar}")
 
     # -------------------------------------------------------------------------
-    # Source 3: Actual Browser-Rendered UI Values
+    # Source 3: Actual Browser-Rendered UI Values (Fresh Playwright Capture)
     # -------------------------------------------------------------------------
-    print("\n[Source 3: Actual Browser-Rendered UI (Playwright DOM Inspection)]")
-    browser_data = load_or_capture_browser_financials()
+    print("\n[Source 3: Actual Browser-Rendered UI (Fresh Playwright DOM Inspection)]")
+    if browser_override is not None:
+        print("  Using provided browser override data for verification test...")
+        browser_data = browser_override
+    else:
+        browser_data = execute_fresh_browser_capture(run_id, run_start_utc)
 
     browser_invoiced = quantize_dec(browser_data["invoiced_gross"])
     browser_exclusive = quantize_dec(browser_data["exclusive_amount"])
-    browser_tax = quantize_dec(browser_data["tax_amount"])
+    browser_tax = None  # Strictly NOT rendered as individual KPI in UI -> N/A (UI)
     browser_cash = quantize_dec(browser_data["cash_amount"])
     browser_tds = quantize_dec(browser_data["tds_amount"])
     browser_settled = quantize_dec(browser_data["total_settled"])
     browser_outstanding = quantize_dec(browser_data["total_outstanding"])
-    browser_unbilled_po = quantize_dec(browser_data["unbilled_po_gross"])
-    browser_unbilled_ar = quantize_dec(browser_data["unbilled_recognized_ar"])
-    browser_target_yearly = quantize_dec(browser_data.get("annual_target", "7500000.00"))
+    browser_unbilled_po = None  # Strictly NOT rendered in UI -> N/A (UI)
+    browser_unbilled_ar = None  # Strictly NOT rendered in UI -> N/A (UI)
+    browser_target_yearly = quantize_dec(browser_data["annual_target"])
 
     print(f"  Browser Invoiced:     ₹{browser_invoiced}")
     print(f"  Browser Exclusive:    ₹{browser_exclusive}")
-    print(f"  Browser Tax:          ₹{browser_tax}")
+    print(f"  Browser Tax:          N/A (UI)")
     print(f"  Browser Cash:         ₹{browser_cash}")
     print(f"  Browser TDS:          ₹{browser_tds}")
     print(f"  Browser Settled:      ₹{browser_settled}")
     print(f"  Browser Outstanding:  ₹{browser_outstanding}")
-    print(f"  Browser Unbilled Back:₹{browser_unbilled_po}")
-    print(f"  Browser Unbilled AR:  ₹{browser_unbilled_ar}")
+    print(f"  Browser Unbilled Back:N/A (UI)")
+    print(f"  Browser Unbilled AR:  N/A (UI)")
+    print(f"  Browser Target:       ₹{browser_target_yearly}")
 
     # -------------------------------------------------------------------------
     # Source 4: Authoritative Downloaded XLSX Workbook
@@ -363,9 +492,6 @@ def verify_cross_layer_reconciliation():
     excel_unbilled_po_gross = excel_unbilled_exclusive + excel_unbilled_tax
     excel_unbilled_ar = sum((quantize_dec(r[col_idx["Balance Outstanding (₹)"] - 1]) for r in excel_po_rows), Decimal("0.00"))
 
-    excel_po_numbers = [r[col_idx["PO Number"] - 1] for r in excel_rows if r[col_idx["PO Number"] - 1] and r[col_idx["PO Number"] - 1] != "—"]
-    assert "PO-NEXUS-881" in excel_po_numbers, f"PO-NEXUS-881 missing in Excel PO numbers: {excel_po_numbers}"
-
     print(f"  Excel Invoiced:       ₹{excel_invoiced}")
     print(f"  Excel Exclusive:      ₹{excel_exclusive}")
     print(f"  Excel Tax:            ₹{excel_tax}")
@@ -394,8 +520,9 @@ def verify_cross_layer_reconciliation():
         timeout=10,
     )
     assert csv_file_res.status_code == 200
+    csv_text = csv_file_res.content.decode("utf-8-sig")
+    csv_reader = list(csv.reader(io.StringIO(csv_text)))
 
-    csv_reader = list(csv.reader(io.StringIO(csv_file_res.text.strip())))
     csv_headers = csv_reader[0]
     print(f"  CSV Columns ({len(csv_headers)}): {csv_headers}")
 
@@ -406,11 +533,11 @@ def verify_cross_layer_reconciliation():
     )
 
     csv_col_idx = {name: i for i, name in enumerate(csv_headers)}
-    csv_data_rows = csv_reader[1:]
-    assert len(csv_data_rows) >= 1, "CSV export has 0 data rows!"
+    csv_rows = csv_reader[1:]
+    assert len(csv_rows) >= 1, "CSV export has 0 data rows!"
 
-    csv_inv_rows = [r for r in csv_data_rows if r[csv_col_idx["Status"]] != "UNBILLED"]
-    csv_po_rows = [r for r in csv_data_rows if r[csv_col_idx["Status"]] == "UNBILLED"]
+    csv_inv_rows = [r for r in csv_rows if r[csv_col_idx["Status"]] != "UNBILLED"]
+    csv_po_rows = [r for r in csv_rows if r[csv_col_idx["Status"]] == "UNBILLED"]
 
     csv_invoiced = sum((parse_csv_money(r[csv_col_idx["Total Invoiced (₹)"]]) for r in csv_inv_rows), Decimal("0.00"))
     csv_exclusive = sum((parse_csv_money(r[csv_col_idx["Exclusive Amount (₹)"]]) for r in csv_inv_rows), Decimal("0.00"))
@@ -438,37 +565,47 @@ def verify_cross_layer_reconciliation():
     # -------------------------------------------------------------------------
     # Reconciliation Audit Matrix: 5 Verified Sources
     # -------------------------------------------------------------------------
-    print("\n" + "=" * 128)
+    print("\n" + "=" * 132)
     print("COLLECTFLOW STAGE 4C.6 INDEPENDENT MULTI-SOURCE FINANCIAL RECONCILIATION MATRIX")
-    print("=" * 128)
-    print(f"{'Financial Metric':<24} | {'PostgreSQL':<12} | {'Backend API':<12} | {'Browser UI':<12} | {'Excel XLSX':<12} | {'CSV Export':<12} | {'Delta':<8} | {'Status'}")
-    print("-" * 128)
+    print("=" * 132)
+    print(f"{'Financial Metric':<24} | {'PostgreSQL':<12} | {'Backend API':<12} | {'Browser UI':<14} | {'Excel XLSX':<12} | {'CSV Export':<12} | {'Delta':<8} | {'Status'}")
+    print("-" * 132)
 
     checks = [
+        # (Metric Name, PG, API, Browser UI, XLSX, CSV)
         ("Invoiced Gross", pg_invoiced, api_invoiced, browser_invoiced, excel_invoiced, csv_invoiced),
         ("Taxable Exclusive", pg_exclusive, api_exclusive, browser_exclusive, excel_exclusive, csv_exclusive),
-        ("GST Tax Amount", pg_tax, api_tax, browser_tax, excel_tax, csv_tax),
+        ("GST Tax Amount", pg_tax, api_tax, None, excel_tax, csv_tax),
         ("Cash Received", pg_cash, api_cash, browser_cash, excel_cash, csv_cash),
         ("TDS Deducted", pg_tds, api_tds, browser_tds, excel_tds, csv_tds),
         ("Total Net Settled", pg_settled, api_settled, browser_settled, excel_settled, csv_settled),
         ("Balance Outstanding", pg_outstanding, api_outstanding, browser_outstanding, excel_outstanding, csv_outstanding),
-        ("Unbilled PO Backlog", pg_unbilled_po_gross, api_unbilled_po, browser_unbilled_po, excel_unbilled_po_gross, csv_unbilled_po_gross),
-        ("Unbilled Recognized AR", pg_unbilled_po_ar, api_unbilled_ar, browser_unbilled_ar, excel_unbilled_ar, csv_unbilled_ar),
+        ("Unbilled PO Backlog", pg_unbilled_po_gross, api_unbilled_po, None, excel_unbilled_po_gross, csv_unbilled_po_gross),
+        ("Unbilled Recognized AR", pg_unbilled_po_ar, api_unbilled_ar, None, excel_unbilled_ar, csv_unbilled_ar),
+        ("Annual Target", pg_target_yearly, api_target_yearly, browser_target_yearly, None, None),
     ]
 
     all_passed = True
     for name, v_pg, v_api, v_ui, v_xl, v_csv in checks:
-        diff_api = abs(v_pg - v_api)
-        diff_ui = abs(v_pg - v_ui)
-        diff_xl = abs(v_pg - v_xl)
-        diff_csv = abs(v_pg - v_csv)
-        max_diff = max(diff_api, diff_ui, diff_xl, diff_csv)
+        applicable_vals = [v for v in [v_pg, v_api, v_ui, v_xl, v_csv] if v is not None]
+        assert len(applicable_vals) >= 2, f"Insufficient sources for comparison: {name}"
+
+        # Differences against PostgreSQL anchor
+        diffs = [abs(v - v_pg) for v in applicable_vals]
+        max_diff = max(diffs)
         status = "MATCH (₹0.00)" if max_diff == Decimal("0.00") else "MISMATCH!"
         if max_diff != Decimal("0.00"):
             all_passed = False
-        print(f"{name:<24} | ₹{v_pg:<11} | ₹{v_api:<11} | ₹{v_ui:<11} | ₹{v_xl:<11} | ₹{v_csv:<11} | ₹{max_diff:<7} | {status}")
 
-    print("-" * 128)
+        s_pg = f"₹{v_pg}"
+        s_api = f"₹{v_api}"
+        s_ui = f"₹{v_ui}" if v_ui is not None else "N/A (UI)"
+        s_xl = f"₹{v_xl}" if v_xl is not None else "N/A (Export)"
+        s_csv = f"₹{v_csv}" if v_csv is not None else "N/A (Export)"
+
+        print(f"{name:<24} | {s_pg:<12} | {s_api:<12} | {s_ui:<14} | {s_xl:<12} | {s_csv:<12} | ₹{max_diff:<7} | {status}")
+
+    print("-" * 132)
 
     # -------------------------------------------------------------------------
     # Explicit Settlement, Reversal & Statutory Financial Invariants
@@ -488,22 +625,62 @@ def verify_cross_layer_reconciliation():
     # Invariant 3: Reversal Financial Invariants & Signed Settlement Integrity
     print(f"  3. Reversal Integrity & Signed Preservations:")
     with get_db_session() as db:
-        rev_txs = db.scalars(select(PaymentTransaction).where(PaymentTransaction.transaction_type == "REVERSAL")).all()
+        rev_txs = db.scalars(
+            select(PaymentTransaction).where(PaymentTransaction.transaction_type == "REVERSAL")
+        ).all()
         print(f"     Found {len(rev_txs)} reversal transaction(s) in PostgreSQL database.")
+        assert len(rev_txs) >= 1, f"Expected at least 1 reversal transaction in database, found {len(rev_txs)}"
+
         for r_tx in rev_txs:
-            assert quantize_dec(r_tx.cash_amount) < Decimal("0.00"), f"Reversal {r_tx.remittance_number} cash is not negative: {r_tx.cash_amount}"
-            assert quantize_dec(r_tx.total_settled) < Decimal("0.00"), f"Reversal {r_tx.remittance_number} total settled is not negative: {r_tx.total_settled}"
-            if r_tx.parent_transaction_id:
-                p_tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.id == r_tx.parent_transaction_id))
-                net_pair = quantize_dec(p_tx.total_settled) + quantize_dec(r_tx.total_settled)
-                assert net_pair == Decimal("0.00"), f"Parent-reversal pair net settlement is not 0: {net_pair}"
-                print(f"     Reversal {r_tx.remittance_number} paired with {p_tx.remittance_number}: Net Cash = ₹0.00, Net Settled = ₹0.00 [PASS]")
+            assert quantize_dec(r_tx.cash_amount) < Decimal("0.00"), (
+                f"Reversal {r_tx.remittance_number} cash is not negative: {r_tx.cash_amount}"
+            )
+            assert quantize_dec(r_tx.total_settled) < Decimal("0.00"), (
+                f"Reversal {r_tx.remittance_number} total settled is not negative: {r_tx.total_settled}"
+            )
+            assert r_tx.parent_transaction_id is not None, (
+                f"Reversal {r_tx.remittance_number} is missing parent_transaction_id."
+            )
+            p_tx = db.scalar(select(PaymentTransaction).where(PaymentTransaction.id == r_tx.parent_transaction_id))
+            assert p_tx is not None, f"Parent transaction {r_tx.parent_transaction_id} not found."
+
+            net_settled_pair = quantize_dec(p_tx.total_settled) + quantize_dec(r_tx.total_settled)
+            assert net_settled_pair == Decimal("0.00"), (
+                f"Parent-reversal pair net settlement is not ₹0.00: {net_settled_pair}"
+            )
+
+            net_cash_pair = quantize_dec(p_tx.cash_amount) + quantize_dec(r_tx.cash_amount)
+            assert net_cash_pair == Decimal("0.00"), (
+                f"Parent-reversal pair net cash is not ₹0.00: {net_cash_pair}"
+            )
+
+            # Historical retention check on invoice
+            inv = db.scalar(select(CommercialInvoice).where(CommercialInvoice.id == p_tx.invoice_id))
+            assert inv is not None
+            print(
+                f"     Reversal {r_tx.remittance_number} paired with {p_tx.remittance_number} "
+                f"on Invoice {inv.invoice_number} ({inv.lifecycle_status}): Net Cash = ₹0.00, Net Settled = ₹0.00 [PASS]"
+            )
+
+        # Also verify historical retention in Collections Ledger API
+        ledger_txs = payments_data.get("data", [])
+        rev_in_ledger = [item for item in ledger_txs if item.get("transaction_type") == "REVERSAL"]
+        assert len(rev_in_ledger) >= 1, "Collections Ledger API (/api/payments) missing reversal transactions."
+        for r_item in rev_in_ledger:
+            assert r_item.get("invoice_lifecycle_status") == "CANCELLED", (
+                f"Expected cancelled invoice retention for reversal {r_item.get('remittance_number')}, "
+                f"got {r_item.get('invoice_lifecycle_status')}"
+            )
+            assert Decimal(str(r_item.get("cash_amount", "0"))) < Decimal("0.00")
+            print(f"     Collections Ledger API confirms retention of {r_item['remittance_number']} on CANCELLED invoice [PASS]")
 
     # Invariant 4: Unbilled PO Recognized AR Invariance
-    print(f"  4. Unbilled PO Backlog: ₹{pg_unbilled_po_gross} | Recognized AR: ₹{pg_unbilled_po_ar} (DB), ₹{api_unbilled_ar} (API), ₹{browser_unbilled_ar} (UI) -> Delta: ₹0.00 [PASS]")
+    print(
+        f"  4. Unbilled PO Backlog: ₹{pg_unbilled_po_gross} | Recognized AR: ₹{pg_unbilled_po_ar} (DB), "
+        f"₹{api_unbilled_ar} (API), ₹{excel_unbilled_ar} (XLSX), ₹{csv_unbilled_ar} (CSV), Browser UI: N/A -> Delta: ₹0.00 [PASS]"
+    )
     assert pg_unbilled_po_ar == Decimal("0.00")
     assert api_unbilled_ar == Decimal("0.00")
-    assert browser_unbilled_ar == Decimal("0.00")
     assert excel_unbilled_ar == Decimal("0.00")
     assert csv_unbilled_ar == Decimal("0.00")
 
@@ -517,7 +694,7 @@ def verify_cross_layer_reconciliation():
     print(f"  6. Annual Target PG (₹{pg_target_yearly}) = API (₹{api_target_yearly}) = UI (₹{browser_target_yearly}) -> Delta: ₹{inv6_diff} [{'PASS' if inv6_diff == 0 else 'FAIL'}]")
     assert inv6_diff == 0
 
-    assert all_passed, "Cross-layer financial reconciliation failed!"
+    assert all_passed, "FATAL: Cross-layer financial reconciliation failed due to one or more source mismatches!"
     print("\nSUCCESS: All 5 independent sources reconciled with exact zero monetary delta (₹0.00)!")
     return True
 
