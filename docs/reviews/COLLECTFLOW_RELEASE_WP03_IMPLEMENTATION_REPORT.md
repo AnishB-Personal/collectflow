@@ -1,6 +1,6 @@
 # CollectFlow — Release Preparation WP-03 Implementation Report
 
-**Document Status:** Complete (Final Focused Corrections)  
+**Document Status:** Complete (Final Acceptance Corrections)  
 **Date:** 2026-10-19  
 **Developer Recommendation:** **READY FOR INDEPENDENT RE-REVIEW**  
 **Target Package:** Production-Safe Database Initialization & Administrator Bootstrap (WP-03)
@@ -9,32 +9,21 @@
 
 ## 1. Executive Summary & Verdict
 
-Release Preparation Work Package 03 (WP-03) has been fully hardened and verified, addressing all independent review findings including the final focused corrections:
+Release Preparation Work Package 03 (WP-03) has been fully hardened and verified, addressing all independent review findings including the final acceptance corrections:
 
-1. **Bootstrap Provenance Verification (WP03-R01)**:
-   - **Provenance Enforcement on Repeat Run:** `verify_target_environment()` and `bootstrap_administrator()` now strictly require that an existing administrator account possess verifiable initial bootstrap audit evidence (`action="ADMIN_BOOTSTRAPPED"`). Missing audit records fail closed.
-   - **Stable Identifier Matching:** Replaced username-only matching with database-enforced stable identifiers: matches `AuditLog.user_id` and `AuditLog.entity_id` against the primary key ID of active administrator accounts, verifying matching username and `"admin"` role.
-   - **Ambiguity & Duplicate Rejection:** Reject duplicate or ambiguous bootstrap provenance records (`count > 1` triggers an immediate fail-closed abort).
-   - **Clean First-Time Preservation:** Clean first-time database initialization requires zero prior audits, but verifies no orphaned audit records exist in an empty user table.
-   - **Inactive Admin Rejection:** An inactive/deactivated administrator account triggers a fail-closed abort.
-   - **Zero Credential Modification:** Repeat executions never reset administrator passwords, modify roles, or create duplicate users.
+1. **Bootstrap Audit Identifier Consistency (WP03-F01)**:
+   - **Dual Identifier Verification:** Both `verify_target_environment()` and `bootstrap_administrator()` now strictly require that **BOTH** `AuditLog.user_id` and `AuditLog.entity_id` match the same active administrator account ID (`audit.user_id == admin.id and str(audit.entity_id) == str(admin.id)`). Single-identifier matches or cross-matches are rejected fail-closed.
+   - **Identity & Entity Constraints:** Verified `audit.username == admin.username`, `audit.entity_type == "USER"`, `admin.role == "admin"`, and `admin.is_active is True`. Non-`USER` entity types, role mismatches, or inactive admins fail closed.
+   - **Single Bootstrap Provenance Record:** Exactly one initial bootstrap provenance record (`action="ADMIN_BOOTSTRAPPED"`) is permitted (`count == 1`). Missing provenance on repeat runs or multiple audit records trigger immediate fail-closed aborts.
+   - **Negative Test Coverage:** Added dedicated negative tests verifying rejection of: matching `user_id` with incorrect `entity_id`; incorrect `user_id` with matching `entity_id`; matching IDs with conflicting audit usernames; and non-`USER` entity types.
+   - **Preserved Concurrency & Idempotency:** PostgreSQL transaction-scoped advisory locking (`pg_advisory_xact_lock`) and idempotent verified no-op on repeat execution remain intact without credential or role resets.
 
-2. **Separation of Test Approval from Genuine Finance Approval (WP03-R02)**:
-   - **Explicit Identification:** Committed test fixture `tests/fixtures/approved_reference_config.json` is explicitly marked:
-     `_comment: "TEST ONLY — NOT FINANCE APPROVED. Synthetic test fixture for automated test validation only. Must be rejected if supplied as production authorization."`
-     `is_test_fixture: true`, `approval_status: "TEST_SYNTHETIC_ONLY_NOT_FINANCE_APPROVED"`.
-   - **Production Rejection of Test Fixtures:** `load_reference_config()` detects synthetic test markers and strictly rejects them unless explicitly run within an authorized test harness (`allow_test_fixture=True`). CLI flag `--allow-test-fixture` is strictly forbidden and rejected when `COLLECTFLOW_ENV=production`.
-   - **Formal Governance Provenance Schema:** Production reference configurations must declare:
-     - `approval_status: "finance_approved"`
-     - `approval_reference`: Corporate governance sign-off ID (e.g. `FIN-DIR-2026-BPD-01`)
-     - `approved_by`: Formal approver name and title
-     - `approval_date`: ISO date `YYYY-MM-DD`
-     - `controlled_source`: Controlled repository provenance
-     - `effective_date`: ISO date `YYYY-MM-DD`
-     - `config_version`: Version string
-     - `policy_references`: Array of policy IDs (e.g. `BPD-01`, `BPD-02`)
-   - **No Self-Declared Authorization:** Code, documentation, and CLI notices explicitly state that self-declared JSON fields alone do not independently prove Finance authorization, requiring out-of-band verification against signed corporate finance governance policy.
-   - **Negative & Positive Tests:** Added negative tests proving the committed fixture is rejected for production reference insertion, and positive tests verifying schema compliance and deterministic reference ingestion.
+2. **Restriction of Synthetic Reference Configurations (WP03-F02)**:
+   - **Multi-Alias Environment Guard:** Implemented `assert_test_fixture_permitted(env_mode)` rejecting synthetic reference test fixtures across all production and staging environment aliases (`production`, `prod`, `live_prod`, `staging`, `stage`, `preprod`, etc.) as well as non-approved arbitrary modes.
+   - **Direct-Call Bypass Prevention:** Both `load_reference_config()` and `init_production_database()` invoke `assert_test_fixture_permitted()` directly before parsing synthetic fixtures or opening database sessions. Direct Python calls cannot bypass CLI checks.
+   - **Explicit Approved Test Modes:** Synthetic test fixtures are permitted only when explicitly approved local integration-test modes are active (`test`, `local_test`, `integration_test`) and `allow_test_fixture=True`.
+   - **Strict Governance Metadata:** Genuine production reference configurations require `approval_status == "finance_approved"` along with complete governance provenance metadata (`approval_reference`, `approved_by`, `approval_date`, `controlled_source`, `effective_date`, `config_version`, `policy_references`). Missing metadata or alternative statuses (e.g. `"approved"`, `"draft"`, `"pending"`) fail closed.
+   - **Negative Test Coverage:** Parametrized negative tests verify rejection of all production/staging aliases, arbitrary non-test environments, direct-call bypass attempts, non-`finance_approved` status values, and missing governance metadata.
 
 3. **Concurrency Serialization & Safety (WP03-02)**:
    - Preserved `pg_advisory_xact_lock(847291048291048291)` acquired at transaction start for database-level concurrency control.
@@ -45,7 +34,7 @@ Release Preparation Work Package 03 (WP-03) has been fully hardened and verified
    - Preserved Argon2id password hashing and secret-file ingestion.
    - Preserved synthetic fixture-seeder isolation (`scripts/seed_postgres_fixtures.py`).
    - Frontend repository (`cash-flow-buddy-101`) remains pristine and untouched.
-   - Complete backend test suite passes: **171 passed, 71 skipped, 0 failed**.
+   - Complete backend test suite passes: **214 passed, 71 skipped, 0 failed**.
 
 ---
 
@@ -123,8 +112,23 @@ Release Preparation Work Package 03 (WP-03) has been fully hardened and verified
 | `test_27` | Fixture seeding with `--reset` remains strictly test-only | **PASS** |
 | `test_28` | Remote and production database targets cannot be used for synthetic fixtures | **PASS** |
 | `test_29` | Existing financial test fixtures remain valid and unchanged | **PASS** |
+| `test_30` | Bootstrap audit: matching `user_id` but incorrect `entity_id` fails closed in `verify_env` (WP03-F01) | **PASS** |
+| `test_31` | Bootstrap audit: matching `user_id` but incorrect `entity_id` fails closed in `bootstrap_admin` (WP03-F01) | **PASS** |
+| `test_32` | Bootstrap audit: incorrect `user_id` but matching `entity_id` fails closed in `verify_env` (WP03-F01) | **PASS** |
+| `test_33` | Bootstrap audit: incorrect `user_id` but matching `entity_id` fails closed in `bootstrap_admin` (WP03-F01) | **PASS** |
+| `test_34` | Bootstrap audit: matching IDs but conflicting audit username fails closed in `verify_env` (WP03-F01) | **PASS** |
+| `test_35` | Bootstrap audit: matching IDs but conflicting audit username fails closed in `bootstrap_admin` (WP03-F01) | **PASS** |
+| `test_36` | Bootstrap audit: non-`USER` entity type (`INVOICE`) fails closed in both verify and bootstrap (WP03-F01) | **PASS** |
+| `test_37` | Reference config: `assert_test_fixture_permitted` rejects all prod/staging aliases (WP03-F02) | **PASS** |
+| `test_38` | Reference config: `assert_test_fixture_permitted` rejects arbitrary non-test environments (WP03-F02) | **PASS** |
+| `test_39` | Reference config: `assert_test_fixture_permitted` permits explicitly approved test modes (WP03-F02) | **PASS** |
+| `test_40` | Reference config: direct calls to `load_reference_config` cannot bypass environment guards (WP03-F02) | **PASS** |
+| `test_41` | Reference config: direct calls to `init_production_database` cannot bypass environment guards (WP03-F02) | **PASS** |
+| `test_42` | Reference config: genuine configs require exact `approval_status='finance_approved'` (WP03-F02) | **PASS** |
+| `test_43` | Reference config: genuine configs fail closed on missing governance provenance fields (WP03-F02) | **PASS** |
 
-**Full Suite Result:** 171 passed, 71 skipped, 0 failed in 24.43s.
+**WP-03 Suite Result:** 72 passed, 0 failed in 2.47s.  
+**Full Repository Test Suite Result:** 214 passed, 71 skipped, 0 failed in 28.91s.
 
 ---
 

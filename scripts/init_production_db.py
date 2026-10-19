@@ -8,13 +8,13 @@ Enforces:
 3. Strict refusal of test databases ('collectflow_test') or unknown/unsafe targets.
 4. Pre-existing business and identity data validation (fails closed if non-empty, inconsistent, or unprovenanced).
 5. Transaction-scoped PostgreSQL advisory lock serialization (pg_advisory_xact_lock) for administrator bootstrap.
-6. Verification of bootstrap provenance on repeat initialization using stable identifiers (user_id / entity_id).
+6. Verification of bootstrap provenance on repeat initialization using BOTH stable identifiers (user_id AND entity_id).
 7. Secure bootstrap of exactly one administrator with Argon2id hash and must_change_password=True.
 8. Refusal of missing, empty, weak, or known synthetic/demo passwords and usernames.
 9. Atomic idempotent execution: repeated runs perform a safe verified no-op without resetting passwords.
 10. Controlled statutory reference data initialization: DEFERRED by default pending formal Finance sign-offs,
-    only populated when an explicit, versioned, genuine Finance-approved configuration is supplied.
-11. Explicit rejection of synthetic test fixtures for production authorization (TEST ONLY — NOT FINANCE APPROVED).
+    only populated when an explicit, versioned, genuine Finance-approved configuration is supplied (approval_status=finance_approved).
+11. Explicit rejection of synthetic test fixtures for production/staging authorization across CLI and callable APIs.
 12. Safe verification-only mode (--verify-only) performing zero writes.
 13. Strict omission of synthetic customers, orders, invoices, payments, or targets.
 """
@@ -67,7 +67,26 @@ PROHIBITED_BOOTSTRAP_PASSWORDS = {
     "welcome12345!",
 }
 
+APPROVED_TEST_FIXTURE_ENVS = {"test", "local_test", "integration_test"}
+
 ph = PasswordHasher()
+
+
+def assert_test_fixture_permitted(env_mode: str) -> None:
+    """
+    Enforce that synthetic test fixtures are strictly forbidden in production, prod, staging, and non-test modes.
+    Enforces WP03-F02 consistently across CLI and callable initialization functions.
+    """
+    cleaned_env = (env_mode or "").strip().lower()
+    for token in ("prod", "stag"):
+        if token in cleaned_env:
+            raise RuntimeError(
+                f"CRITICAL SAFETY ABORT: Synthetic reference test fixtures are strictly forbidden in production and staging environments (got COLLECTFLOW_ENV='{cleaned_env}')."
+            )
+    if cleaned_env not in APPROVED_TEST_FIXTURE_ENVS:
+        raise RuntimeError(
+            f"CRITICAL SAFETY ABORT: Synthetic reference test fixtures are permitted only in explicitly approved isolated local integration-test mode (got COLLECTFLOW_ENV='{cleaned_env}')."
+        )
 
 
 def acquire_bootstrap_advisory_lock(db) -> None:
@@ -134,7 +153,7 @@ def get_bootstrap_admin_credentials() -> tuple[str, str | None]:
 def verify_target_environment(db) -> dict:
     """
     Rigorously verify environment mode, database configuration, Alembic schema revision,
-    pre-existing business data, and identity provenance (WP03-R01).
+    pre-existing business data, and identity provenance (WP03-R01 / WP03-F01).
     Fails closed on unsafe, test, corrupted, unprovenanced, or mismatched database targets.
     """
     env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
@@ -188,7 +207,7 @@ def verify_target_environment(db) -> dict:
             "Production initializer can only initialize clean application databases."
         )
 
-    # Check identity and session state (WP03-03 and WP03-R01)
+    # Check identity and session state (WP03-03 and WP03-F01)
     user_count = db.scalar(select(func.count()).select_from(User)) or 0
     admin_count = db.scalar(select(func.count()).select_from(User).where(User.role == "admin")) or 0
     session_count = db.scalar(select(func.count()).select_from(SessionModel)) or 0
@@ -213,7 +232,7 @@ def verify_target_environment(db) -> dict:
                 "Cannot verify legitimate bootstrap state."
             )
 
-        # WP03-R01: Rigorous Bootstrap Provenance Verification
+        # WP03-F01: Rigorous Bootstrap Provenance Verification
         bootstrap_audits = db.scalars(select(AuditLog).where(AuditLog.action == "ADMIN_BOOTSTRAPPED")).all()
         if len(bootstrap_audits) == 0:
             raise RuntimeError(
@@ -228,22 +247,32 @@ def verify_target_environment(db) -> dict:
             )
 
         audit = bootstrap_audits[0]
-        # Match using stable identifiers: user_id or entity_id
+        if audit.entity_type != "USER":
+            raise RuntimeError(
+                f"CRITICAL INITIALIZATION ERROR: Bootstrap audit record entity_type must be 'USER' (got '{audit.entity_type}')."
+            )
+
+        # WP03-F01: Require BOTH identifiers (user_id AND entity_id) to match the same administrator ID
         matching_admin = next(
-            (a for a in active_admins if a.id == audit.user_id or str(a.id) == str(audit.entity_id)),
+            (a for a in active_admins if a.id == audit.user_id and str(a.id) == str(audit.entity_id)),
             None,
         )
         if not matching_admin:
             raise RuntimeError(
-                f"CRITICAL INITIALIZATION ERROR: Bootstrap provenance mismatch. "
-                f"Bootstrap audit record user_id={audit.user_id} (entity_id='{audit.entity_id}') "
-                f"does not match any active administrator account (active admin IDs: {[a.id for a in active_admins]})."
+                f"CRITICAL INITIALIZATION ERROR: Bootstrap provenance identifier mismatch. "
+                f"Requires BOTH user_id={audit.user_id} and entity_id='{audit.entity_id}' to match "
+                f"the same active administrator ID (active admin IDs: {[a.id for a in active_admins]})."
             )
-        if matching_admin.username != audit.username or matching_admin.role != "admin":
+        if audit.username != matching_admin.username:
             raise RuntimeError(
-                f"CRITICAL INITIALIZATION ERROR: Bootstrap provenance identifier conflict. "
-                f"Audit record user_id={audit.user_id} specifies username '{audit.username}' and role 'admin', "
-                f"but active user #{matching_admin.id} has username '{matching_admin.username}' / role '{matching_admin.role}'."
+                f"CRITICAL INITIALIZATION ERROR: Bootstrap provenance username conflict. "
+                f"Audit record user_id={audit.user_id} specifies username '{audit.username}', "
+                f"but active user #{matching_admin.id} has username '{matching_admin.username}'."
+            )
+        if matching_admin.role != "admin" or not matching_admin.is_active:
+            raise RuntimeError(
+                f"CRITICAL INITIALIZATION ERROR: Administrator account #{matching_admin.id} "
+                f"must have role='admin' and is_active=True (got role='{matching_admin.role}', is_active={matching_admin.is_active})."
             )
         identity_state = "already_initialized"
     else:
@@ -274,8 +303,8 @@ def load_reference_config(
     """
     Load and validate an explicit, versioned, Finance-approved statutory reference configuration file.
     Returns None if no configuration file is provided (indicating reference data should be deferred).
-    Fails closed if the file is missing, invalid JSON, a synthetic test fixture in production,
-    or not approved by Finance.
+    Fails closed if the file is missing, invalid JSON, a synthetic test fixture in production/staging,
+    or not approved by Finance with approval_status='finance_approved'.
 
     NOTE: Self-declared JSON fields alone do not independently prove Finance authorization.
     Configuration provenance must be corroborated against formal signed corporate finance governance records (BPD-01/02).
@@ -297,28 +326,31 @@ def load_reference_config(
     if not isinstance(data, dict):
         raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config must be a JSON object.")
 
-    # 1. Detection and rejection of synthetic test fixtures (WP03-R02)
+    # 1. Detection and rejection of synthetic test fixtures (WP03-R02 / WP03-F02)
     is_test_fixture = bool(data.get("is_test_fixture", False))
     raw_status = str(data.get("approval_status", "")).strip()
     raw_approver = str(data.get("approved_by", "")).strip()
     raw_ref = str(data.get("approval_reference", "")).strip()
+    is_synthetic = is_test_fixture or any("TEST" in s.upper() for s in (raw_status, raw_approver, raw_ref))
 
-    if is_test_fixture or "TEST" in raw_status.upper() or "TEST" in raw_approver.upper() or "TEST" in raw_ref.upper():
+    if is_synthetic:
         if not allow_test_fixture:
             raise ValueError(
                 "CRITICAL CONFIGURATION REJECTED: Synthetic test configuration fixture detected ('TEST ONLY — NOT FINANCE APPROVED'). "
                 "Synthetic test fixtures cannot authorize production reference-data insertion. "
                 "Genuine Finance Directorate authorization provenance is required."
             )
+        # Even if allow_test_fixture is set, verify environment allows it (WP03-F02)
+        env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
+        assert_test_fixture_permitted(env_mode)
 
-    # 2. Validation of approval metadata and provenance
+    # 2. Validation of approval metadata and provenance (WP03-F02: require approval_status=finance_approved)
     approval_status = raw_status.lower()
-    if approval_status not in {"approved", "finance_approved"}:
-        if not (allow_test_fixture and "test" in approval_status):
+    if not is_synthetic:
+        if approval_status != "finance_approved":
             raise ValueError(
-                f"CRITICAL CONFIGURATION ERROR: Statutory reference config is not approved by Finance "
-                f"(approval_status='{data.get('approval_status')}', expected 'finance_approved'). "
-                "Unapproved statutory reference values cannot be populated."
+                f"CRITICAL CONFIGURATION ERROR: Statutory reference config approval_status must be 'finance_approved' "
+                f"(got '{data.get('approval_status')}'). Unapproved statutory reference values cannot be populated."
             )
 
     if not raw_approver:
@@ -474,12 +506,12 @@ def bootstrap_administrator(
     existing_admin = db.scalar(select(User).where(User.role == "admin").limit(1))
 
     if existing_admin:
-        if not existing_admin.is_active:
+        if not existing_admin.is_active or existing_admin.role != "admin":
             raise RuntimeError(
-                f"CRITICAL INITIALIZATION ERROR: Administrator account '{existing_admin.username}' exists but is inactive. "
-                "Cannot perform safe bootstrap or verification with an inactive administrator."
+                f"CRITICAL INITIALIZATION ERROR: Administrator account '{existing_admin.username}' exists but is inactive or invalid role '{existing_admin.role}'. "
+                "Cannot perform safe bootstrap or verification."
             )
-        # Verify bootstrap provenance on repeat bootstrap call (WP03-R01)
+        # Verify bootstrap provenance on repeat bootstrap call (WP03-R01 / WP03-F01)
         bootstrap_audits = db.scalars(select(AuditLog).where(AuditLog.action == "ADMIN_BOOTSTRAPPED")).all()
         if len(bootstrap_audits) == 0:
             raise RuntimeError(
@@ -491,9 +523,20 @@ def bootstrap_administrator(
                 f"CRITICAL INITIALIZATION ERROR: Ambiguous or duplicate bootstrap audit records detected ({len(bootstrap_audits)} records)."
             )
         audit = bootstrap_audits[0]
-        if audit.user_id != existing_admin.id and str(audit.entity_id) != str(existing_admin.id):
+        if audit.entity_type != "USER":
             raise RuntimeError(
-                f"CRITICAL INITIALIZATION ERROR: Bootstrap provenance mismatch for administrator '{existing_admin.username}'."
+                f"CRITICAL INITIALIZATION ERROR: Bootstrap audit record entity_type must be 'USER' (got '{audit.entity_type}')."
+            )
+        # WP03-F01: Require BOTH identifiers (user_id AND entity_id) to match existing administrator
+        if audit.user_id != existing_admin.id or str(audit.entity_id) != str(existing_admin.id):
+            raise RuntimeError(
+                f"CRITICAL INITIALIZATION ERROR: Bootstrap provenance identifier mismatch for administrator '{existing_admin.username}'. "
+                f"Requires BOTH user_id={existing_admin.id} and entity_id='{existing_admin.id}', but got audit user_id={audit.user_id} and entity_id='{audit.entity_id}'."
+            )
+        if audit.username != existing_admin.username:
+            raise RuntimeError(
+                f"CRITICAL INITIALIZATION ERROR: Bootstrap provenance username conflict for administrator '{existing_admin.username}'. "
+                f"Audit record username is '{audit.username}'."
             )
         return {
             "status": "already_exists",
@@ -549,7 +592,7 @@ def bootstrap_administrator(
     db.add(new_admin)
     db.flush()
 
-    # 6. Record sanitized audit log with stable identifier (user_id and entity_id)
+    # 6. Record sanitized audit log with BOTH stable identifiers (user_id and entity_id)
     audit_entry = AuditLog(
         user_id=new_admin.id,
         username=new_admin.username,
@@ -584,17 +627,22 @@ def init_production_database(
     verify_only: bool = False,
 ) -> dict:
     """Execute complete production database verification, initialization, and bootstrap workflow."""
+    # WP03-F02: Enforce test fixture restriction before any operations
+    if allow_test_fixture:
+        env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
+        assert_test_fixture_permitted(env_mode)
+
     admin_username, admin_password = get_bootstrap_admin_credentials()
     ref_config = load_reference_config(reference_config_path, allow_test_fixture=allow_test_fixture)
 
     with get_db_session() as db:
-        # 1. Environment & Database Safety Verification (including bootstrap provenance WP03-R01)
+        # 1. Environment & Database Safety Verification (including bootstrap provenance WP03-R01 / WP03-F01)
         env_status = verify_target_environment(db)
 
         # 2. Administrator Bootstrap Verification / Execution (with advisory lock serialization WP03-02)
         admin_status = bootstrap_administrator(db, admin_username, admin_password, verify_only=verify_only)
 
-        # 3. Statutory Reference Data Initialization (deferred if no approved config WP03-01 / WP03-R02)
+        # 3. Statutory Reference Data Initialization (deferred if no approved config WP03-01 / WP03-R02 / WP03-F02)
         ref_status = init_reference_data(db, ref_config=ref_config, verify_only=verify_only)
 
         if not verify_only:
@@ -627,17 +675,20 @@ def main():
         "--allow-test-fixture",
         action="store_true",
         default=False,
-        help="Allow synthetic test reference configuration fixtures (strictly for testing, forbidden in production)",
+        help="Allow synthetic test reference configuration fixtures (strictly for testing, forbidden in production/staging)",
     )
     args = parser.parse_args()
 
     mode_label = "VERIFICATION ONLY" if args.verify_only else "INITIALIZATION"
     print(f"==> CollectFlow Production Initializer [{mode_label}] Starting...")
 
-    env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
-    if env_mode == "production" and args.allow_test_fixture:
-        print("ERROR: CRITICAL SAFETY ABORT: --allow-test-fixture is strictly forbidden in production mode.", file=sys.stderr)
-        sys.exit(1)
+    if args.allow_test_fixture:
+        env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
+        try:
+            assert_test_fixture_permitted(env_mode)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     try:
         report = init_production_database(
