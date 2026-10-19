@@ -62,7 +62,7 @@ def _read_secret_from_env_or_file(env_var: str, file_var: str) -> Optional[str]:
     return None
 
 
-def get_csrf_secret() -> bytes:
+def get_csrf_secret(env_mode: Optional[str] = None) -> bytes:
     """Return the secret key used for HMAC-SHA256 CSRF token binding.
 
     In production and staging, strictly requires a persistent configured secret
@@ -76,7 +76,7 @@ def get_csrf_secret() -> bytes:
         or _read_secret_from_env_or_file("COLLECTFLOW_SECRET_KEY", "COLLECTFLOW_SECRET_KEY_FILE")
     )
 
-    if is_production_or_staging_env():
+    if is_production_or_staging_env(env_mode):
         if not secret or len(secret) < 32:
             raise RuntimeError(
                 "CRITICAL SECURITY VIOLATION: Stable CSRF secret must be configured in production/staging "
@@ -90,13 +90,13 @@ def get_csrf_secret() -> bytes:
     return secret.encode("utf-8")
 
 
-def get_session_cookie_name() -> str:
+def get_session_cookie_name(env_mode: Optional[str] = None) -> str:
     """
     Determine the appropriate session cookie name based on environment and TLS requirements.
     In production and staging, strictly requires '__Host-collectflow_session'.
     In local dev/test, uses 'collectflow_dev_session' unless TLS is explicitly enabled.
     """
-    is_prod_staging = is_production_or_staging_env()
+    is_prod_staging = is_production_or_staging_env(env_mode)
     cookie_secure_override = os.environ.get("COLLECTFLOW_COOKIE_SECURE")
 
     if is_prod_staging:
@@ -114,12 +114,12 @@ def get_session_cookie_name() -> str:
     return "collectflow_dev_session"
 
 
-def is_session_cookie_secure() -> bool:
+def is_session_cookie_secure(env_mode: Optional[str] = None) -> bool:
     """
     Determine whether session cookies must be marked 'Secure'.
     Fails closed if insecure cookies are attempted in production or staging.
     """
-    is_prod_staging = is_production_or_staging_env()
+    is_prod_staging = is_production_or_staging_env(env_mode)
     cookie_secure_override = os.environ.get("COLLECTFLOW_COOKIE_SECURE")
 
     if is_prod_staging:
@@ -134,6 +134,29 @@ def is_session_cookie_secure() -> bool:
         return True
 
     return False
+
+
+def validate_security_configuration(env_mode: Optional[str] = None) -> None:
+    """Validate critical security configuration for the application environment.
+
+    In production and staging:
+    - Strictly validates presence and complexity (minimum 32 characters) of stable CSRF secret.
+    - Strictly validates session cookie security flags (COLLECTFLOW_COOKIE_SECURE cannot be false).
+    - Fails closed immediately by raising RuntimeError.
+
+    In local dev / test environments:
+    - Verifies default secret generation and non-conflicting settings without raising.
+    """
+    is_prod_staging = is_production_or_staging_env(env_mode)
+    if is_prod_staging:
+        # 1. Validate required stable CSRF secret
+        get_csrf_secret(env_mode=env_mode)
+        # 2. Validate required production cookie security settings
+        get_session_cookie_name(env_mode=env_mode)
+        is_session_cookie_secure(env_mode=env_mode)
+    else:
+        # Dev / test environment: ensure get_csrf_secret() initializes cleanly
+        get_csrf_secret(env_mode=env_mode)
 
 
 def set_session_cookies(response: Response, raw_token: str, csrf_token: str) -> None:

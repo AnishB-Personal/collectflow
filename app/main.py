@@ -22,13 +22,29 @@ from app.routers import (
     targets,
     users,
 )
+from contextlib import asynccontextmanager
+from app.core.auth_security import validate_security_configuration
 from app.routers.auth import get_current_user
 
 # Configure structured logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [req:%(name)s] %(message)s")
 logger = logging.getLogger("collectflow")
 
-app = FastAPI(title="CollectFlow", description="Order-to-Cash & Accounts Receivable Management System")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Enforce security configuration validation at startup (WP04-R03)
+    logger.info("Validating CollectFlow security configuration...")
+    validate_security_configuration()
+    logger.info("Security configuration validated successfully.")
+    yield
+
+
+app = FastAPI(
+    title="CollectFlow",
+    description="Order-to-Cash & Accounts Receivable Management System",
+    lifespan=lifespan,
+)
 
 # Configure exact-origin CORS middleware (strictly non-wildcard for credentialed requests)
 raw_origins = os.environ.get(

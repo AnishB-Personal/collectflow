@@ -33,6 +33,7 @@ from app.core.auth_security import (
     set_session_cookies,
     validate_csrf_token,
     validate_same_origin,
+    validate_security_configuration,
     validate_strong_password,
 )
 
@@ -407,13 +408,23 @@ def login(req: LoginRequest, request: Request, response: Response):
             db.commit()
             raise HTTPException(status_code=401, detail="Invalid username or password")
 
-        # Success: record attempt and clear user rate failures
-        record_login_attempt(user_rate_key, success=True, ip_address=client_ip, clear_on_success=True)
-        record_login_attempt(ip_rate_key, success=True, ip_address=client_ip, clear_on_success=False)
+        # Validate essential session/CSRF configuration before generating or persisting session
+        validate_security_configuration()
 
         # Session Fixation Protection: generate fresh 32-byte session token
         raw_token = secrets.token_hex(32)
         token_hash_val = hash_token(raw_token)
+
+        # Generate CSRF token bound to this session (validates secret before commit)
+        csrf_token = generate_csrf_token(token_hash_val)
+
+        # Set secure HttpOnly session cookie and readable CSRF cookie (validates cookie flags before commit)
+        set_session_cookies(response, raw_token, csrf_token)
+
+        # Success: record attempt and clear user rate failures
+        record_login_attempt(user_rate_key, success=True, ip_address=client_ip, clear_on_success=True)
+        record_login_attempt(ip_rate_key, success=True, ip_address=client_ip, clear_on_success=False)
+
         expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)
 
         session_entry = SessionModel(
@@ -429,12 +440,6 @@ def login(req: LoginRequest, request: Request, response: Response):
             "LOGIN_SUCCESS", "USER", str(user.id), user_id=user.id, username=user.username, details={"ip": client_ip}, ip_address=client_ip, request_id=req_id, db=db
         )
         db.commit()
-
-        # Generate CSRF token bound to this session
-        csrf_token = generate_csrf_token(token_hash_val)
-
-        # Set secure HttpOnly session cookie and readable CSRF cookie
-        set_session_cookies(response, raw_token, csrf_token)
 
         payload = {
             "success": True,

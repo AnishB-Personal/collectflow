@@ -653,3 +653,124 @@ def test_export_ticket_caller_authentication_and_isolation(fresh_client):
     with get_db_session() as db:
         t_row = db.scalar(select(ExportTicket).where(ExportTicket.token_hash == token_hash_val))
         assert t_row.used is True
+
+
+# ============================================================================
+# WP04-R03: Production CSRF Secret Startup Lifespan Validation & Login Safety
+# ============================================================================
+
+def test_production_startup_fails_lifespan_when_csrf_secret_absent(monkeypatch):
+    """WP04-R03: Production startup fails via FastAPI lifespan when required CSRF secret is absent."""
+    monkeypatch.setenv("COLLECTFLOW_ENV", "production")
+    monkeypatch.delenv("COLLECTFLOW_CSRF_SECRET", raising=False)
+    monkeypatch.delenv("COLLECTFLOW_SECRET_KEY", raising=False)
+    monkeypatch.delenv("COLLECTFLOW_CSRF_SECRET_FILE", raising=False)
+    monkeypatch.delenv("COLLECTFLOW_SECRET_KEY_FILE", raising=False)
+
+    with pytest.raises(RuntimeError, match="CRITICAL SECURITY VIOLATION: Stable CSRF secret must be configured"):
+        with TestClient(app) as client:
+            client.get("/api/health")
+
+
+def test_production_startup_fails_lifespan_when_csrf_secret_insufficient(monkeypatch):
+    """WP04-R03: Production startup fails via FastAPI lifespan when secret is under 32 chars."""
+    monkeypatch.setenv("COLLECTFLOW_ENV", "production")
+    monkeypatch.setenv("COLLECTFLOW_CSRF_SECRET", "short_secret_under_32_chars")
+
+    with pytest.raises(RuntimeError, match="CRITICAL SECURITY VIOLATION: Stable CSRF secret must be configured"):
+        with TestClient(app) as client:
+            client.get("/api/health")
+
+
+def test_production_startup_succeeds_lifespan_with_valid_configured_secret(monkeypatch):
+    """WP04-R03: Production startup succeeds via FastAPI lifespan with valid 32+ char secret."""
+    monkeypatch.setenv("COLLECTFLOW_ENV", "production")
+    monkeypatch.setenv("COLLECTFLOW_CSRF_SECRET", "valid_super_secure_production_csrf_secret_32chars_min!")
+
+    with TestClient(app) as client:
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "healthy"
+
+
+def test_staging_receives_equivalent_protection(monkeypatch):
+    """WP04-R03: Staging receives equivalent startup validation protection as production."""
+    monkeypatch.setenv("COLLECTFLOW_ENV", "staging")
+    monkeypatch.delenv("COLLECTFLOW_CSRF_SECRET", raising=False)
+    monkeypatch.delenv("COLLECTFLOW_SECRET_KEY", raising=False)
+    monkeypatch.delenv("COLLECTFLOW_CSRF_SECRET_FILE", raising=False)
+    monkeypatch.delenv("COLLECTFLOW_SECRET_KEY_FILE", raising=False)
+
+    with pytest.raises(RuntimeError, match="CRITICAL SECURITY VIOLATION: Stable CSRF secret must be configured"):
+        with TestClient(app) as client:
+            client.get("/api/health")
+
+    # Staging succeeds when secret is valid
+    monkeypatch.setenv("COLLECTFLOW_CSRF_SECRET", "valid_super_secure_staging_csrf_secret_32chars_min!")
+    with TestClient(app) as client:
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "healthy"
+
+
+def test_isolated_local_development_remains_functional(monkeypatch):
+    """WP04-R03: Isolated local development remains functional without explicit CSRF secret configuration."""
+    monkeypatch.setenv("COLLECTFLOW_ENV", "development")
+    monkeypatch.delenv("COLLECTFLOW_CSRF_SECRET", raising=False)
+    monkeypatch.delenv("COLLECTFLOW_SECRET_KEY", raising=False)
+    monkeypatch.delenv("COLLECTFLOW_CSRF_SECRET_FILE", raising=False)
+    monkeypatch.delenv("COLLECTFLOW_SECRET_KEY_FILE", raising=False)
+
+    with TestClient(app) as client:
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "healthy"
+
+
+def test_no_partial_session_or_audit_persisted_on_configuration_failure(monkeypatch):
+    """WP04-R03: Ensure login does not persist a new session or successful-login audit if configuration validation fails."""
+    from app.models.domain_models import AuditLog, SessionModel, User
+
+    with get_db_session() as db:
+        admin_user = db.scalar(select(User).where(User.username == "sandbox_admin"))
+        assert admin_user is not None
+        admin_uid = admin_user.id
+        initial_sessions = db.scalars(select(SessionModel).where(SessionModel.user_id == admin_uid)).all()
+        initial_session_count = len(initial_sessions)
+        initial_audit_count = len(
+            db.scalars(
+                select(AuditLog).where(
+                    AuditLog.user_id == admin_uid,
+                    AuditLog.action == "LOGIN_SUCCESS",
+                )
+            ).all()
+        )
+
+    # In production without CSRF secret, login attempt must fail closed without writing DB records
+    monkeypatch.setenv("COLLECTFLOW_ENV", "production")
+    monkeypatch.delenv("COLLECTFLOW_CSRF_SECRET", raising=False)
+    monkeypatch.delenv("COLLECTFLOW_SECRET_KEY", raising=False)
+    monkeypatch.delenv("COLLECTFLOW_CSRF_SECRET_FILE", raising=False)
+    monkeypatch.delenv("COLLECTFLOW_SECRET_KEY_FILE", raising=False)
+
+    # Client without context manager executes request directly against login endpoint
+    client = TestClient(app, raise_server_exceptions=True)
+    with pytest.raises(RuntimeError, match="CRITICAL SECURITY VIOLATION: Stable CSRF secret must be configured"):
+        client.post(
+            "/api/auth/login",
+            json={"username": "sandbox_admin", "password": "AdminPass123!"},
+            headers={"Origin": "http://localhost:5173"},
+        )
+
+    # Verify no session or login audit was persisted
+    with get_db_session() as db:
+        final_sessions = db.scalars(select(SessionModel).where(SessionModel.user_id == admin_uid)).all()
+        assert len(final_sessions) == initial_session_count
+
+        final_audits = db.scalars(
+            select(AuditLog).where(
+                AuditLog.user_id == admin_uid,
+                AuditLog.action == "LOGIN_SUCCESS",
+            )
+        ).all()
+        assert len(final_audits) == initial_audit_count

@@ -85,9 +85,10 @@ Both branches were branched directly from their respective accepted parent basel
 
 #### 4.1 Backend Test Results (`collectflow`)
 ```text
-================ 234 passed, 71 skipped, 340 warnings in 25.67s ================
+================ 240 passed, 71 skipped, 340 warnings in 34.01s ================
 ```
-- **New Test Suite:** `tests/test_wp04_auth_sessions_csrf.py` (20/20 passed)
+- **Total Tests Collected:** 311 tests (240 passed, 71 skipped, 0 failed).
+- **WP-04 Suite (`tests/test_wp04_auth_sessions_csrf.py`):** 26/26 passed in 5.00s.
   - Cookie attributes in dev (`collectflow_dev_session`, HttpOnly, SameSite=Lax, Max-Age).
   - Production cookie `__Host-` prefix, Secure flag, and host-only domain omission.
   - Production fails closed on `COLLECTFLOW_COOKIE_SECURE=false`.
@@ -107,6 +108,13 @@ Both branches were branched directly from their respective accepted parent basel
   - **WP04-04**: Production CSRF secret enforcement and secret file support.
   - **WP04-05**: User creation and admin reset strong password policy enforcement.
   - **WP04-06**: RFC 6265bis compliant `__Host-` cookie deletion with `secure=True`.
+  - **WP04-R03**: FastAPI lifespan startup validation & atomic login tests:
+    - Production startup fails via FastAPI lifespan when required CSRF secret is absent.
+    - Production startup fails via FastAPI lifespan when secret is insufficient (< 32 chars).
+    - Production startup succeeds via FastAPI lifespan with valid 32+ char secret.
+    - Staging receives equivalent startup validation protection as production.
+    - Isolated local development remains functional without explicit secret configuration.
+    - Atomic login safety: no partial session or successful login audit is persisted when configuration validation fails.
 - **Regression Suite:** All existing Phase 4C, WP-01, WP-02, and WP-03 tests pass with 0 failures.
 
 #### 4.2 Frontend Test Results (`cash-flow-buddy-101`)
@@ -177,7 +185,7 @@ Both branches were branched directly from their respective accepted parent basel
 
 ---
 
-### 6. Focused Re-Review Corrections Implemented (WP04-R01 & WP04-R02)
+### 6. Focused Re-Review Corrections Implemented (WP04-R01, WP04-R02, WP04-R03)
 
 1. **WP04-R01 — Complete Logout UI Integration (`src/components/collectflow/workspace.tsx`)**:
    - `handleLogout()` inspects the structured `LogoutResult` returned by `apiClient.logout()`.
@@ -200,11 +208,18 @@ Both branches were branched directly from their respective accepted parent basel
    - Preserves login-sequence and cancellation safeguards.
    - Verified via comprehensive deferred-promise race tests.
 
+3. **WP04-R03 — Production CSRF Secret Startup Lifespan Validation & Atomic Login (`app/main.py`, `app/core/auth_security.py`, `app/routers/auth.py`)**:
+   - **FastAPI Lifespan Validation**: `app/main.py` defines an `asynccontextmanager` `lifespan` handler that executes `validate_security_configuration()` before the application starts accepting requests.
+   - **Fail-Closed Startup Guarantee**: In production and staging environments (`COLLECTFLOW_ENV=production` or `staging`), if `COLLECTFLOW_CSRF_SECRET` (or file/secret key equivalents) is missing or fewer than 32 characters, or if `COLLECTFLOW_COOKIE_SECURE=false`, `validate_security_configuration()` raises `RuntimeError`, aborting ASGI startup immediately (`lifespan.startup.failed`).
+   - **Isolated Local Dev Compatibility**: Non-production environments fallback safely to persistent startup secrets, allowing local development and tests to proceed without manual key generation.
+   - **Atomic Login Session Guarantee**: In `app/routers/auth.py`, `login()` validates configuration (`validate_security_configuration()`), derives `csrf_token`, and sets session cookies on `response` *before* inserting or committing database records. If configuration is missing or invalid, the transaction rolls back: zero `SessionModel` records are inserted, zero `LOGIN_SUCCESS` audit entries are created, and rate limits are not cleared.
+   - **Verified Lifespan Tests**: Verified via 6 dedicated lifespan-aware tests in `test_wp04_auth_sessions_csrf.py` covering production missing secret abort, insufficient secret abort, valid secret success, staging parity, local dev functionality, and atomic zero-state persistence on failure.
+
 ---
 
 ### 7. Additional Verification & Operational Boundaries
 
-1. **Production CSRF Fail-Closed Safety**: Verified in `test_wp04_auth_sessions_csrf.py:test_production_fails_closed_without_csrf_secret`. In staging/production environments, FastAPI engine startup fails immediately with `RuntimeError` if a stable 32+ character CSRF secret is absent.
+1. **Production CSRF Fail-Closed Safety**: Verified in `test_wp04_auth_sessions_csrf.py:test_production_startup_fails_lifespan_when_csrf_secret_absent`. In staging/production environments, FastAPI ASGI startup halts immediately with `RuntimeError` before traffic can be served if a stable 32+ character CSRF secret is absent.
 2. **Export Download Flow**: Verified in `test_export_ticket_caller_authentication_and_isolation` and `downloadExport` frontend tests. Export tickets strictly validate active session, user ownership, and admin/finance role. Unauthenticated or mismatched requests fail closed with 401/403, and tickets remain unconsumed.
 3. **Mandatory Password Rotation & RBAC Regressions**: All 214 Phase 4C financial logic, reconciliation, and RBAC tests pass with 0 regressions.
 4. **Local HTTPS Browser & Docker Compose Integration**:
@@ -217,15 +232,16 @@ Both branches were branched directly from their respective accepted parent basel
 ### 8. Summary of Modified Files
 
 #### Backend (`collectflow`):
-- `app/core/auth_security.py` (updated: CSRF secret from env/file validation, RFC 6265bis secure cookie deletion)
-- `app/routers/auth.py` (updated: prod dev-cookie rejection, conflicting cookie rejection)
+- `app/main.py` (updated: added lifespan handler enforcing security configuration validation at startup)
+- `app/core/auth_security.py` (updated: added `validate_security_configuration()`, env_mode support for CSRF and cookie validation, RFC 6265bis secure cookie deletion)
+- `app/routers/auth.py` (updated: atomic login session and audit persistence after configuration validation, prod dev-cookie rejection)
 - `app/routers/export.py` (updated: export ticket caller session authentication and ownership check)
 - `app/routers/users.py` (updated: strong password validation on create & reset, must_change_password setting)
 - `tests/conftest.py` (updated: test db cleanup for login_attempts and sandbox flags)
 - `tests/test_audit_remediation_regressions.py` (updated: test_h07 user flag handling)
 - `tests/test_stage4c2_live_services.py` (updated: strong password in user creation test)
-- `tests/test_wp04_auth_sessions_csrf.py` (expanded: 20 negative and positive tests covering WP04-01 through WP04-06)
-- `docs/reviews/COLLECTFLOW_RELEASE_WP04_IMPLEMENTATION_REPORT.md` (updated with WP04-R01 and WP04-R02 resolutions)
+- `tests/test_wp04_auth_sessions_csrf.py` (expanded: 26 negative and positive tests covering WP04-01 through WP04-06 and WP04-R03 lifespan & atomic login safety)
+- `docs/reviews/COLLECTFLOW_RELEASE_WP04_IMPLEMENTATION_REPORT.md` (updated with WP04-R01, WP04-R02, and WP04-R03 resolutions)
 
 #### Frontend (`cash-flow-buddy-101`):
 - `src/lib/api-client.ts` (updated: LogoutResult interface, session generation validation in fetchCurrentUser/fetchCsrfToken)
