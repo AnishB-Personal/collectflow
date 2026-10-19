@@ -7,17 +7,23 @@
 **Accepted Backend Baseline:** `b93b6e2c90dbaac422df606c102d85a8d06eaf20`
 **Accepted Frontend Baseline:** `93e47e0756a80fa1ebf5afd41e9dc0f78655d7ca`
 **Frontend Remote Commit SHA:** `aa28f66d87e722e3f6b00b9f2a8d9505c747c144`
-**Backend Target Remote Commit:** (Recorded upon commit/push)
+**Backend Implementation Commit SHA:** `400a7783cd487db529c7e6e01e3bfaf73fac1844`
 
 ---
 
-## 1. Verified Source Baselines & Ancestry
+## 1. Verified Source Baselines & Checkpoints
+
+| Repository | Branch | Commit Hash | Baseline (Accepted WP-04) | Working Tree |
+| :--- | :--- | :--- | :--- | :--- |
+| **Backend (`collectflow`)** | `feature/release-wp05-portable-cicd` | `400a7783cd487db529c7e6e01e3bfaf73fac1844` | `b93b6e2c90dbaac422df606c102d85a8d06eaf20` | Clean |
+| **Frontend (`cash-flow-buddy-101`)** | `feature/release-wp05-portable-cicd` | `aa28f66d87e722e3f6b00b9f2a8d9505c747c144` | `93e47e0756a80fa1ebf5afd41e9dc0f78655d7ca` | Clean |
 
 Both repositories were branched directly from their accepted baselines without divergence:
 
 ### Backend Repository: `AnishB-Personal/collectflow`
 - **Baseline Commit:** `b93b6e2c90dbaac422df606c102d85a8d06eaf20`
 - **Branch:** `feature/release-wp05-portable-cicd`
+- **Implementation Commit:** `400a7783cd487db529c7e6e01e3bfaf73fac1844`
 - **Ancestry Verification:** Exact parent commit is accepted WP-04 commit `b93b6e2c90dbaac422df606c102d85a8d06eaf20`.
 
 ### Frontend Repository: `AnishB-Personal/cash-flow-buddy-101`
