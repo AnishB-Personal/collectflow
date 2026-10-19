@@ -47,10 +47,10 @@ jobs:
 
     steps:
       - name: Checkout Source Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@0b93645e9fb737c336084004c238c36e99f829f0 # v5.3.0
         with:
           python-version: "3.12"
           cache: "pip"
@@ -63,15 +63,15 @@ jobs:
 
       - name: Python Syntax and Static Lint Analysis (Ruff)
         run: |
-          ruff check .
+          ruff check . --output-format json -o /tmp/backend-lint-report.json || ruff check .
 
       - name: Dependency Vulnerability Audit (pip-audit)
         run: |
-          pip-audit -r requirements.txt
+          pip-audit -r requirements.txt -f json -o /tmp/backend-pip-audit.json
 
       - name: Secret Scanning Gate
         run: |
-          python3 scripts/ci/scan_secrets.py --root .
+          python3 scripts/ci/scan_secrets.py --root . --json-output /tmp/backend-secret-scan.json
 
       - name: Database Schema Migration Verification (Alembic)
         run: |
@@ -79,7 +79,23 @@ jobs:
 
       - name: Full Backend Pytest Regression Suite
         run: |
-          pytest tests/ -v
+          pytest tests/ -v --junitxml=/tmp/backend-pytest-report.xml
+          python3 -c "
+import xml.etree.ElementTree as ET, json
+try:
+    tree = ET.parse('/tmp/backend-pytest-report.xml')
+    root = tree.getroot()
+    s = root if root.tag == 'testsuite' else root.find('testsuite')
+    tests = int(s.attrib.get('tests', 0))
+    failures = int(s.attrib.get('failures', 0)) + int(s.attrib.get('errors', 0))
+    skipped = int(s.attrib.get('skipped', 0))
+    passed = tests - failures - skipped
+    with open('/tmp/backend-test-summary.json', 'w') as f:
+        json.dump({'passed': passed, 'failed': failures, 'skipped': skipped, 'verdict': 'PASS' if failures == 0 else 'FAIL'}, f)
+except Exception as e:
+    with open('/tmp/backend-test-summary.json', 'w') as f:
+        json.dump({'passed': 0, 'failed': 1, 'skipped': 0, 'verdict': 'FAIL', 'error': str(e)}, f)
+"
 
       - name: Build Backend OCI Image
         run: |
@@ -87,14 +103,15 @@ jobs:
           ./scripts/ci/build_and_scan_image.sh backend collectflow-backend /tmp/backend-image-meta.json no-publish
 
       - name: Scan Backend Container Image (Trivy)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # 0.28.0
         with:
           image-ref: "collectflow-backend:${{ github.sha }}"
-          format: "table"
+          format: "json"
+          output: "/tmp/backend-trivy-report.json"
           exit-code: "1"
           ignore-unfixed: true
           vuln-type: "os,library"
-          severity: "CRITICAL"
+          severity: "HIGH,CRITICAL"
 
       - name: Generate CycloneDX SBOM
         run: |
@@ -102,10 +119,10 @@ jobs:
 
       - name: Verify Cross-Repository Pairing Traceability
         run: |
-          python3 scripts/ci/verify_cross_repo_release.py --initiator backend --backend-path . --frontend-path ../cash-flow-buddy-101 || true
+          python3 scripts/ci/verify_cross_repo_release.py --initiator backend --backend-path . --frontend-path ../cash-flow-buddy-101 --report /tmp/cross-repo-integration-report.json
 
       - name: Upload Build & Verification Evidence Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         if: always()
         with:
           name: backend-release-evidence
@@ -113,5 +130,11 @@ jobs:
             /tmp/backend-image-meta.json
             /tmp/collectflow-backend-sbom.json
             /tmp/collectflow-backend-sbom.json.sha256
+            /tmp/backend-test-summary.json
+            /tmp/backend-pytest-report.xml
+            /tmp/backend-pip-audit.json
+            /tmp/backend-secret-scan.json
+            /tmp/backend-lint-report.json
+            /tmp/backend-trivy-report.json
             /tmp/cross-repo-integration-report.json
           retention-days: 7

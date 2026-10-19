@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-CollectFlow Release Candidate Manifest Generator (WP05-06)
+CollectFlow Release Candidate Manifest Generator (WP05-01, WP05-04, WP05-06)
 Generates an immutable, machine-readable release candidate manifest linking backend and frontend
-commit SHAs, OCI image digests, SBOM references with SHA-256 checksums, and security gate verdicts.
+commit SHAs, container artifacts, SBOM references, and structured quality gate evidence.
+- Strictly ingests actual structured evidence files.
+- Removes hardcoded test counts, clean worktree flags, and arbitrary string verdicts.
+- Fails or explicitly records BLOCKED when evidence is missing or invalid.
+- Records live browser and real HTTPS testing as NOT_EXECUTED with environmental justification.
 """
 
 import argparse
@@ -12,37 +16,216 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
-def get_git_sha(repo_dir: Path) -> str:
-    try:
-        res = subprocess.run(
-            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return res.stdout.strip()
-    except Exception as e:
-        return f"UNKNOWN_ERROR: {e}"
-
-def compute_sha256(file_path: Path) -> str:
+def compute_sha256(file_path: Optional[Path]) -> Optional[str]:
+    if not file_path or not file_path.exists():
+        return None
     h = hashlib.sha256()
     with open(file_path, "rb") as f:
         while chunk := f.read(65536):
             h.update(chunk)
     return h.hexdigest()
 
-def load_json_if_exists(file_path: Path) -> Dict[str, Any]:
+def get_git_info(repo_dir: Path) -> Tuple[str, bool]:
+    """Returns (commit_sha, clean_worktree)."""
+    try:
+        sha = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "-C", str(repo_dir), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        return sha, (len(status) == 0)
+    except Exception as e:
+        return f"UNKNOWN_ERROR: {e}", False
+
+def load_json_if_exists(file_path: Optional[Path]) -> Optional[Dict[str, Any]]:
     if file_path and file_path.exists():
         try:
             return json.loads(file_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            return {"error": f"Failed to parse {file_path}: {e}"}
-    return {}
+        except Exception:
+            return None
+    return None
+
+def parse_test_report(report_path: Optional[Path]) -> Dict[str, Any]:
+    """Ingests structured test execution evidence."""
+    if not report_path or not report_path.exists():
+        return {
+            "verdict": "BLOCKED_EVIDENCE_UNAVAILABLE",
+            "passed": None,
+            "failed": None,
+            "skipped": None,
+            "evidence_file": str(report_path) if report_path else None,
+            "evidence_sha256": None,
+            "details": "Test report file was not found or not provided."
+        }
+    
+    sha = compute_sha256(report_path)
+    data = load_json_if_exists(report_path)
+    if not data or not isinstance(data, dict):
+        return {
+            "verdict": "BLOCKED_EVIDENCE_MALFORMED",
+            "passed": None,
+            "failed": None,
+            "evidence_file": str(report_path),
+            "evidence_sha256": sha,
+            "details": "Failed to parse structured JSON test report."
+        }
+
+    passed = data.get("passed")
+    failed = data.get("failed", 0)
+    skipped = data.get("skipped", 0)
+    verdict = data.get("verdict")
+
+    if verdict is None:
+        if failed == 0 and passed is not None and passed > 0:
+            verdict = "PASS"
+        else:
+            verdict = "FAIL"
+
+    return {
+        "verdict": verdict,
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "evidence_file": str(report_path),
+        "evidence_sha256": sha
+    }
+
+def parse_audit_report(report_path: Optional[Path], audit_type: str) -> Dict[str, Any]:
+    """Ingests pip-audit or npm audit JSON evidence."""
+    if not report_path or not report_path.exists():
+        return {
+            "verdict": "BLOCKED_EVIDENCE_UNAVAILABLE",
+            "vulnerabilities": None,
+            "evidence_file": str(report_path) if report_path else None,
+            "evidence_sha256": None,
+            "details": f"{audit_type} report was not found or not provided."
+        }
+
+    sha = compute_sha256(report_path)
+    data = load_json_if_exists(report_path)
+    if not data or not isinstance(data, dict):
+        return {
+            "verdict": "BLOCKED_EVIDENCE_MALFORMED",
+            "vulnerabilities": None,
+            "evidence_file": str(report_path),
+            "evidence_sha256": sha,
+            "details": f"Failed to parse {audit_type} report JSON."
+        }
+
+    vulns = 0
+    if audit_type == "pip-audit":
+        dependencies = data.get("dependencies", [])
+        for dep in dependencies:
+            vulns += len(dep.get("vulns", []))
+    elif audit_type == "npm-audit":
+        meta = data.get("metadata", {}).get("vulnerabilities", {})
+        vulns = meta.get("high", 0) + meta.get("critical", 0)
+
+    verdict = "PASS" if vulns == 0 else "FAIL"
+    return {
+        "verdict": verdict,
+        "vulnerabilities": vulns,
+        "evidence_file": str(report_path),
+        "evidence_sha256": sha
+    }
+
+def parse_secret_scan_report(report_path: Optional[Path]) -> Dict[str, Any]:
+    """Ingests scan_secrets.py JSON evidence."""
+    if not report_path or not report_path.exists():
+        return {
+            "verdict": "BLOCKED_EVIDENCE_UNAVAILABLE",
+            "findings_count": None,
+            "evidence_file": str(report_path) if report_path else None,
+            "evidence_sha256": None,
+            "details": "Secret scan report was not provided."
+        }
+
+    sha = compute_sha256(report_path)
+    data = load_json_if_exists(report_path)
+    if not data or not isinstance(data, dict):
+        return {
+            "verdict": "BLOCKED_EVIDENCE_MALFORMED",
+            "findings_count": None,
+            "evidence_file": str(report_path),
+            "evidence_sha256": sha
+        }
+
+    findings = data.get("findings_count", len(data.get("findings", [])))
+    verdict = "PASS" if findings == 0 else "FAIL"
+    return {
+        "verdict": verdict,
+        "findings_count": findings,
+        "evidence_file": str(report_path),
+        "evidence_sha256": sha
+    }
+
+def parse_lint_report(report_path: Optional[Path]) -> Dict[str, Any]:
+    """Ingests static analysis / lint evidence."""
+    if not report_path or not report_path.exists():
+        return {
+            "verdict": "BLOCKED_EVIDENCE_UNAVAILABLE",
+            "lint_errors": None,
+            "evidence_file": str(report_path) if report_path else None,
+            "evidence_sha256": None
+        }
+
+    sha = compute_sha256(report_path)
+    data = load_json_if_exists(report_path)
+    errors = 0
+    if data and isinstance(data, dict):
+        errors = data.get("errors", 0)
+    elif data and isinstance(data, list):
+        errors = len(data)
+
+    verdict = "PASS" if errors == 0 else "FAIL"
+    return {
+        "verdict": verdict,
+        "lint_errors": errors,
+        "evidence_file": str(report_path),
+        "evidence_sha256": sha
+    }
+
+def parse_cross_repo_report(report_path: Optional[Path]) -> Dict[str, Any]:
+    """Ingests cross-repository pairing report."""
+    if not report_path or not report_path.exists():
+        return {
+            "verdict": "BLOCKED",
+            "pairing_status": "MISSING_CROSS_REPO_REPORT",
+            "evidence_file": str(report_path) if report_path else None,
+            "evidence_sha256": None,
+            "details": "Cross-repository pairing report was not found."
+        }
+
+    sha = compute_sha256(report_path)
+    data = load_json_if_exists(report_path)
+    if not data or not isinstance(data, dict):
+        return {
+            "verdict": "BLOCKED",
+            "pairing_status": "MALFORMED_CROSS_REPO_REPORT",
+            "evidence_file": str(report_path),
+            "evidence_sha256": sha
+        }
+
+    return {
+        "verdict": data.get("verdict", "FAIL"),
+        "pairing_status": data.get("pairing_status", "UNKNOWN"),
+        "initiator": data.get("initiator"),
+        "details": data.get("details", []),
+        "evidence_file": str(report_path),
+        "evidence_sha256": sha
+    }
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate CollectFlow Release Manifest")
+    parser = argparse.ArgumentParser(description="Generate CollectFlow Release Manifest (WP05-01)")
     parser.add_argument("--rc-id", required=True, help="Release candidate identifier (e.g., RC-20261019-01)")
     parser.add_argument("--backend-dir", default=".", help="Backend repository path")
     parser.add_argument("--frontend-dir", default="../cash-flow-buddy-101", help="Frontend repository path")
@@ -50,8 +233,13 @@ def main() -> int:
     parser.add_argument("--frontend-image-meta", help="Frontend image metadata JSON path")
     parser.add_argument("--backend-sbom", help="Backend SBOM JSON path")
     parser.add_argument("--frontend-sbom", help="Frontend SBOM JSON path")
-    parser.add_argument("--backend-test-status", default="PASS", help="Backend test status (PASS/FAIL)")
-    parser.add_argument("--frontend-test-status", default="PASS", help="Frontend test status (PASS/FAIL)")
+    parser.add_argument("--backend-test-report", help="Backend test results JSON path")
+    parser.add_argument("--frontend-test-report", help="Frontend test results JSON path")
+    parser.add_argument("--backend-audit-report", help="pip-audit results JSON path")
+    parser.add_argument("--frontend-audit-report", help="npm audit results JSON path")
+    parser.add_argument("--secret-scan-report", help="Secret scanning report JSON path")
+    parser.add_argument("--sast-lint-report", help="SAST / linting report JSON path")
+    parser.add_argument("--cross-repo-report", help="Cross-repository pairing report JSON path")
     parser.add_argument("--output", default="release-manifest.json", help="Output manifest JSON path")
     args = parser.parse_args()
 
@@ -59,19 +247,37 @@ def main() -> int:
     frontend_root = Path(args.frontend_dir).resolve()
     manifest_out = Path(args.output).resolve()
 
-    backend_sha = get_git_sha(backend_root)
-    frontend_sha = get_git_sha(frontend_root)
+    # Dynamic git verification (WP05-01: No hardcoded clean worktree assertions)
+    backend_sha, backend_clean = get_git_info(backend_root)
+    frontend_sha, frontend_clean = get_git_info(frontend_root)
 
-    backend_meta = load_json_if_exists(Path(args.backend_image_meta)) if args.backend_image_meta else {}
-    frontend_meta = load_json_if_exists(Path(args.frontend_image_meta)) if args.frontend_image_meta else {}
+    backend_meta = load_json_if_exists(Path(args.backend_image_meta)) if args.backend_image_meta else None
+    frontend_meta = load_json_if_exists(Path(args.frontend_image_meta)) if args.frontend_image_meta else None
 
     backend_sbom_path = Path(args.backend_sbom).resolve() if args.backend_sbom else None
     frontend_sbom_path = Path(args.frontend_sbom).resolve() if args.frontend_sbom else None
 
-    backend_sbom_checksum = compute_sha256(backend_sbom_path) if backend_sbom_path and backend_sbom_path.exists() else None
-    frontend_sbom_checksum = compute_sha256(frontend_sbom_path) if frontend_sbom_path and frontend_sbom_path.exists() else None
+    backend_sbom_checksum = compute_sha256(backend_sbom_path)
+    frontend_sbom_checksum = compute_sha256(frontend_sbom_path)
 
-    # Derive toolchain versions
+    # Ingest actual structured evidence (WP05-01)
+    backend_tests = parse_test_report(Path(args.backend_test_report) if args.backend_test_report else None)
+    frontend_tests = parse_test_report(Path(args.frontend_test_report) if args.frontend_test_report else None)
+    pip_audit = parse_audit_report(Path(args.backend_audit_report) if args.backend_audit_report else None, "pip-audit")
+    npm_audit = parse_audit_report(Path(args.frontend_audit_report) if args.frontend_audit_report else None, "npm-audit")
+    secret_scan = parse_secret_scan_report(Path(args.secret_scan_report) if args.secret_scan_report else None)
+    sast_lint = parse_lint_report(Path(args.sast_lint_report) if args.sast_lint_report else None)
+    cross_repo = parse_cross_repo_report(Path(args.cross_repo_report) if args.cross_repo_report else None)
+
+    # Container artifacts handling (WP05-04: Distinguish Image Config ID from Registry Digest)
+    b_image_id = backend_meta.get("image_id") if backend_meta else None
+    b_oci_rev = backend_meta.get("oci_revision") if backend_meta else None
+    b_scan_verdict = backend_meta.get("scan_verdict") if backend_meta else "BLOCKED_METADATA_UNAVAILABLE"
+
+    f_image_id = frontend_meta.get("image_id") if frontend_meta else None
+    f_oci_rev = frontend_meta.get("oci_revision") if frontend_meta else None
+    f_scan_verdict = frontend_meta.get("scan_verdict") if frontend_meta else "BLOCKED_METADATA_UNAVAILABLE"
+
     docker_version = "unknown"
     try:
         res = subprocess.run(["docker", "--version"], capture_output=True, text=True)
@@ -80,7 +286,7 @@ def main() -> int:
         pass
 
     manifest = {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "release_candidate_id": args.rc_id,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "source_traceability": {
@@ -88,35 +294,41 @@ def main() -> int:
                 "repository": "AnishB-Personal/collectflow",
                 "commit_sha": backend_sha,
                 "target_branch": "feature/release-wp05-portable-cicd",
-                "clean_worktree": True
+                "clean_worktree": backend_clean
             },
             "frontend": {
                 "repository": "AnishB-Personal/cash-flow-buddy-101",
                 "commit_sha": frontend_sha,
                 "target_branch": "feature/release-wp05-portable-cicd",
-                "clean_worktree": True
+                "clean_worktree": frontend_clean
             }
         },
         "container_artifacts": {
             "backend": {
-                "image_name": backend_meta.get("image_name", "collectflow-backend"),
-                "image_tag": backend_meta.get("image_tag", f"collectflow-backend:{backend_sha}"),
-                "image_id": backend_meta.get("image_id", "sha256:unknown"),
-                "image_digest": backend_meta.get("image_digest", "sha256:unknown"),
-                "base_image": backend_meta.get("base_image", "python:3.12-slim-bookworm"),
-                "target_architecture": backend_meta.get("target_architecture", "x86_64"),
-                "scan_verdict": backend_meta.get("scan_verdict", "PASS"),
-                "publication_status": backend_meta.get("publication_status", "DISABLED_BY_DEFAULT")
+                "image_name": backend_meta.get("image_name", "collectflow-backend") if backend_meta else "collectflow-backend",
+                "image_tag": backend_meta.get("image_tag", f"collectflow-backend:{backend_sha}") if backend_meta else f"collectflow-backend:{backend_sha}",
+                "image_id": b_image_id,
+                "artifact_type": backend_meta.get("artifact_type", "local_daemon_image") if backend_meta else "unknown",
+                "oci_revision": b_oci_rev,
+                "base_image": backend_meta.get("base_image", "python:3.12-slim-bookworm") if backend_meta else "python:3.12-slim-bookworm",
+                "scan_verdict": b_scan_verdict,
+                "security_scan": backend_meta.get("security_scan", {}) if backend_meta else {},
+                "publication_status": "DISABLED_BY_DEFAULT",
+                "registry_published": False,
+                "registry_digest": None
             },
             "frontend": {
-                "image_name": frontend_meta.get("image_name", "collectflow-frontend"),
-                "image_tag": frontend_meta.get("image_tag", f"collectflow-frontend:{frontend_sha}"),
-                "image_id": frontend_meta.get("image_id", "sha256:unknown"),
-                "image_digest": frontend_meta.get("image_digest", "sha256:unknown"),
-                "base_image": frontend_meta.get("base_image", "node:22-alpine3.20"),
-                "target_architecture": frontend_meta.get("target_architecture", "x86_64"),
-                "scan_verdict": frontend_meta.get("scan_verdict", "PASS"),
-                "publication_status": frontend_meta.get("publication_status", "DISABLED_BY_DEFAULT")
+                "image_name": frontend_meta.get("image_name", "collectflow-frontend") if frontend_meta else "collectflow-frontend",
+                "image_tag": frontend_meta.get("image_tag", f"collectflow-frontend:{frontend_sha}") if frontend_meta else f"collectflow-frontend:{frontend_sha}",
+                "image_id": f_image_id,
+                "artifact_type": frontend_meta.get("artifact_type", "local_daemon_image") if frontend_meta else "unknown",
+                "oci_revision": f_oci_rev,
+                "base_image": frontend_meta.get("base_image", "node:22-alpine") if frontend_meta else "node:22-alpine",
+                "scan_verdict": f_scan_verdict,
+                "security_scan": frontend_meta.get("security_scan", {}) if frontend_meta else {},
+                "publication_status": "DISABLED_BY_DEFAULT",
+                "registry_published": False,
+                "registry_digest": None
             }
         },
         "sbom_artifacts": {
@@ -132,21 +344,21 @@ def main() -> int:
             }
         },
         "quality_gates": {
-            "backend_regression_tests": {
-                "verdict": args.backend_test_status,
-                "passed": 240,
-                "quarantined_legacy_sqlite_skipped": 71,
-                "failed": 0
+            "backend_regression_tests": backend_tests,
+            "frontend_regression_tests": frontend_tests,
+            "python_dependency_audit": pip_audit,
+            "npm_dependency_audit": npm_audit,
+            "secret_scanning": secret_scan,
+            "sast_lint_checks": sast_lint,
+            "cross_repo_pairing": cross_repo,
+            "live_browser_acceptance": {
+                "verdict": "NOT_EXECUTED",
+                "details": "Environment requires active live staging deployment with external reverse proxy and browser runner."
             },
-            "frontend_regression_tests": {
-                "verdict": args.frontend_test_status,
-                "passed": 620,
-                "failed": 0
-            },
-            "python_dependency_audit": "PASS (0 known vulnerabilities)",
-            "npm_dependency_audit": "PASS (0 vulnerabilities)",
-            "secret_scanning": "PASS (0 credentials detected)",
-            "sast_lint_checks": "PASS (Ruff & ESLint clean)"
+            "https_ssl_tls_verification": {
+                "verdict": "NOT_EXECUTED",
+                "details": "Environment requires active live staging deployment with external TLS termination (e.g. AWS ALB)."
+            }
         },
         "toolchain": {
             "python": "3.12",
@@ -156,7 +368,7 @@ def main() -> int:
         "governance_and_approval": {
             "approval_status": "UNAPPROVED",
             "deployment_authorized": False,
-            "release_boundary_control": "Release manifest generation does NOT authorize production deployment.",
+            "release_boundary_control": "Release candidate manifest verification strictly gates candidate packaging; it does NOT authorize production deployment.",
             "authorized_by": None,
             "authorization_timestamp": None
         }

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-CollectFlow Release Candidate Manifest Validator (WP05-06, WP05-10)
+CollectFlow Release Candidate Manifest Validator (WP05-01, WP05-03, WP05-04)
 Strictly validates a generated release-manifest.json:
-- Verifies exact Git source commit SHAs against working trees.
-- Validates container image digests.
+- Verifies exact Git source commit SHAs and clean-worktree assertions.
+- Enforces OCI revision labels matching exact source commit SHAs.
+- Distinguishes Image Config IDs from remote registry digests.
+- Strictly validates structured quality gate evidence (rejects fabricated or arbitrary string PASS values).
+- Enforces cross-repository pairing status (rejects BLOCKED, missing, or failed pairing).
 - Re-computes and verifies SHA-256 checksums of all referenced SBOM files.
-- Rejects unapproved or failed security gates.
-- Enforces cross-repository pairing consistency.
+- Rejects missing, unverified, or failed container vulnerability scans.
+- Enforces disabled-by-default publication boundary.
 """
 
 import argparse
@@ -15,7 +18,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 def compute_sha256(file_path: Path) -> str:
     h = hashlib.sha256()
@@ -38,12 +41,12 @@ def get_git_sha(repo_dir: Path) -> str:
 
 def validate_manifest(
     manifest_data: Dict[str, Any],
-    backend_dir: Path = None,
-    frontend_dir: Path = None,
+    backend_dir: Optional[Path] = None,
+    frontend_dir: Optional[Path] = None,
     verify_git_shas: bool = True,
     require_deployment_approved: bool = False
 ) -> List[str]:
-    errors = []
+    errors: List[str] = []
 
     # 1. Structural schema validation
     required_keys = [
@@ -61,7 +64,7 @@ def validate_manifest(
     if errors:
         return errors
 
-    # 2. Source Traceability and Git SHA Validation
+    # 2. Source Traceability, Git SHA & Clean Worktree Validation (WP05-01)
     source_trace = manifest_data.get("source_traceability", {})
     backend_source = source_trace.get("backend", {})
     frontend_source = source_trace.get("frontend", {})
@@ -73,6 +76,13 @@ def validate_manifest(
         errors.append(f"Invalid backend source commit SHA: '{backend_sha}'")
     if not frontend_sha or len(frontend_sha) < 40 or "UNKNOWN" in frontend_sha:
         errors.append(f"Invalid frontend source commit SHA: '{frontend_sha}'")
+
+    # Clean worktree enforcement (WP05-01)
+    if not isinstance(backend_source.get("clean_worktree"), bool) or backend_source.get("clean_worktree") is not True:
+        errors.append("Backend source working tree is dirty or clean_worktree evidence is missing (must be boolean true).")
+
+    if not isinstance(frontend_source.get("clean_worktree"), bool) or frontend_source.get("clean_worktree") is not True:
+        errors.append("Frontend source working tree is dirty or clean_worktree evidence is missing (must be boolean true).")
 
     if verify_git_shas and backend_dir and backend_dir.exists():
         actual_backend_sha = get_git_sha(backend_dir)
@@ -88,17 +98,31 @@ def validate_manifest(
                 f"Frontend source SHA mismatch! Manifest specifies '{frontend_sha}' but repo HEAD is '{actual_frontend_sha}'"
             )
 
-    # 3. Container Digest Validation
+    # 3. Container Artifacts, OCI Revisions & Vulnerability Scan Validation (WP05-02, WP05-04)
     container_artifacts = manifest_data.get("container_artifacts", {})
-    for component in ["backend", "frontend"]:
+    for component, expected_sha in [("backend", backend_sha), ("frontend", frontend_sha)]:
         c_info = container_artifacts.get(component, {})
-        digest = c_info.get("image_digest", "")
-        if not digest or not digest.startswith("sha256:") or len(digest) < 15 or "unknown" in digest.lower():
-            errors.append(f"Invalid or missing {component} container image digest: '{digest}'")
-        
+        image_id = c_info.get("image_id", "")
+        if not image_id or not image_id.startswith("sha256:") or len(image_id) < 15 or "unknown" in image_id.lower():
+            errors.append(f"Invalid or missing {component} container image ID / digest: '{image_id}'")
+
+        # Verify OCI revision label matches source commit SHA (WP05-04)
+        oci_rev = c_info.get("oci_revision")
+        if not oci_rev or oci_rev != expected_sha:
+            errors.append(
+                f"{component} OCI revision mismatch! Expected commit SHA '{expected_sha}', but recorded '{oci_rev}'"
+            )
+
+        # Enforce fail-closed scan verdict (WP05-02)
         scan_verdict = c_info.get("scan_verdict", "")
-        if "FAIL" in scan_verdict.upper():
-            errors.append(f"{component} container vulnerability scan failed: '{scan_verdict}'")
+        if scan_verdict not in ["PASS", "PASS_WITH_APPROVED_EXCEPTIONS"]:
+            errors.append(
+                f"{component} container vulnerability scan did not pass verified gate (verdict: '{scan_verdict}')"
+            )
+
+        # Verify disabled publication policy
+        if c_info.get("publication_status") != "DISABLED_BY_DEFAULT" or c_info.get("registry_published") is True:
+            errors.append(f"{component} image publication policy violation: must be DISABLED_BY_DEFAULT.")
 
     # 4. SBOM Artifact & Checksum Validation
     sbom_artifacts = manifest_data.get("sbom_artifacts", {})
@@ -126,20 +150,68 @@ def validate_manifest(
                 f"{component} SBOM checksum mismatch! Manifest recorded '{expected_checksum}' but actual file has '{actual_checksum}'"
             )
 
-    # 5. Quality Gate Verification
+    # 5. Quality Gate Evidence Verification (WP05-01, WP05-03, WP05-06)
     quality_gates = manifest_data.get("quality_gates", {})
-    backend_tests = quality_gates.get("backend_regression_tests", {})
-    if backend_tests.get("verdict") != "PASS" or backend_tests.get("failed", 1) > 0:
-        errors.append(f"Backend regression tests failed or did not receive PASS: {backend_tests}")
 
-    frontend_tests = quality_gates.get("frontend_regression_tests", {})
-    if frontend_tests.get("verdict") != "PASS" or frontend_tests.get("failed", 1) > 0:
-        errors.append(f"Frontend regression tests failed or did not receive PASS: {frontend_tests}")
+    # Ingestion check: reject arbitrary string values that claim PASS (WP05-01)
+    backend_tests = quality_gates.get("backend_regression_tests")
+    if not isinstance(backend_tests, dict):
+        errors.append("Backend regression tests evidence is missing or not a structured object.")
+    else:
+        if backend_tests.get("verdict") != "PASS" or backend_tests.get("failed", 1) > 0 or not isinstance(backend_tests.get("passed"), int):
+            errors.append(f"Backend regression tests failed or did not receive structured PASS verdict: {backend_tests}")
 
-    for gate_name in ["python_dependency_audit", "npm_dependency_audit", "secret_scanning", "sast_lint_checks"]:
-        verdict = quality_gates.get(gate_name, "")
-        if not str(verdict).startswith("PASS"):
-            errors.append(f"Security quality gate '{gate_name}' failed with verdict: '{verdict}'")
+    frontend_tests = quality_gates.get("frontend_regression_tests")
+    if not isinstance(frontend_tests, dict):
+        errors.append("Frontend regression tests evidence is missing or not a structured object.")
+    else:
+        if frontend_tests.get("verdict") != "PASS" or frontend_tests.get("failed", 1) > 0 or not isinstance(frontend_tests.get("passed"), int):
+            errors.append(f"Frontend regression tests failed or did not receive structured PASS verdict: {frontend_tests}")
+
+    py_audit = quality_gates.get("python_dependency_audit")
+    if not isinstance(py_audit, dict):
+        errors.append("Python dependency audit evidence is missing or not a structured object.")
+    else:
+        if py_audit.get("verdict") != "PASS" or py_audit.get("vulnerabilities", 1) > 0:
+            errors.append(f"Python dependency audit failed or has vulnerabilities: {py_audit}")
+
+    npm_audit = quality_gates.get("npm_dependency_audit")
+    if not isinstance(npm_audit, dict):
+        errors.append("NPM dependency audit evidence is missing or not a structured object.")
+    else:
+        if npm_audit.get("verdict") != "PASS" or npm_audit.get("vulnerabilities", 1) > 0:
+            errors.append(f"NPM dependency audit failed or has vulnerabilities: {npm_audit}")
+
+    sec_scan = quality_gates.get("secret_scanning")
+    if not isinstance(sec_scan, dict):
+        errors.append("Secret scanning evidence is missing or not a structured object.")
+    else:
+        if sec_scan.get("verdict") != "PASS" or sec_scan.get("findings_count", sec_scan.get("credentials_detected", 1)) > 0:
+            errors.append(f"Secret scanning gate failed or credentials detected: {sec_scan}")
+
+    sast_lint = quality_gates.get("sast_lint_checks")
+    if not isinstance(sast_lint, dict):
+        errors.append("SAST / lint check evidence is missing or not a structured object.")
+    else:
+        if sast_lint.get("verdict") != "PASS" or sast_lint.get("lint_errors", 1) > 0:
+            errors.append(f"SAST / lint gate failed with errors: {sast_lint}")
+
+    # Cross-repository pairing gate enforcement (WP05-03)
+    cross_repo = quality_gates.get("cross_repo_pairing")
+    if not isinstance(cross_repo, dict):
+        errors.append("Cross-repository pairing report evidence is missing or not a structured object.")
+    else:
+        cross_verdict = cross_repo.get("verdict")
+        pairing_status = cross_repo.get("pairing_status")
+        if cross_verdict == "BLOCKED" or "BLOCKED" in str(pairing_status):
+            errors.append(
+                f"Cross-repository integration gate is BLOCKED ({pairing_status}). "
+                "Release candidate cannot be accepted without verified dual-repository source pairing."
+            )
+        elif cross_verdict != "PASS" or pairing_status != "VERIFIED_PAIR":
+            errors.append(
+                f"Cross-repository integration gate failed (verdict: '{cross_verdict}', status: '{pairing_status}')."
+            )
 
     # 6. Governance & Deployment Authorization Gate
     gov = manifest_data.get("governance_and_approval", {})
@@ -150,7 +222,7 @@ def validate_manifest(
     return errors
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Validate CollectFlow Release Manifest")
+    parser = argparse.ArgumentParser(description="Validate CollectFlow Release Manifest (WP05-01, WP05-03, WP05-04)")
     parser.add_argument("--manifest", required=True, help="Path to release-manifest.json")
     parser.add_argument("--backend-dir", help="Path to backend git repo (for SHA verification)")
     parser.add_argument("--frontend-dir", help="Path to frontend git repo (for SHA verification)")

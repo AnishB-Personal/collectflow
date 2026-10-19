@@ -6,6 +6,7 @@ Redacts detected secrets in output to prevent log leakage.
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -104,6 +105,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="CollectFlow Portable Secret Scanner")
     parser.add_argument("--root", default=".", help="Root directory to scan (default: current directory)")
     parser.add_argument("--fail-on-findings", action="store_true", default=True, help="Exit with code 1 on findings")
+    parser.add_argument("--json-output", help="Optional path to emit structured JSON scan report")
     args = parser.parse_args()
 
     repo_root = Path(args.root).resolve()
@@ -113,16 +115,35 @@ def main() -> int:
     print(f"Found {len(files_to_scan)} tracked files to inspect.")
 
     total_findings = 0
+    all_findings = []
     for f in files_to_scan:
         findings = scan_file(f)
         if findings:
             for line_no, desc, redacted_sample in findings:
                 total_findings += 1
                 try:
-                    rel_path = f.relative_to(repo_root)
+                    rel_path = str(f.relative_to(repo_root))
                 except ValueError:
-                    rel_path = f
+                    rel_path = str(f)
+                all_findings.append({
+                    "file": rel_path,
+                    "line": line_no,
+                    "description": desc,
+                    "sample": redacted_sample
+                })
                 print(f"[SECURITY ALERT] {rel_path}:{line_no} - {desc} ({redacted_sample})")
+
+    if args.json_output:
+        out_p = Path(args.json_output).resolve()
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        report_data = {
+            "verdict": "PASS" if total_findings == 0 else "FAIL",
+            "findings_count": total_findings,
+            "findings": all_findings,
+            "scanned_files_count": len(files_to_scan)
+        }
+        out_p.write_text(json.dumps(report_data, indent=2), encoding="utf-8")
+        print(f"Structured secret scan report written to: {out_p}")
 
     if total_findings > 0:
         print(f"\nScan failed: {total_findings} potentially sensitive secret(s) detected.")
