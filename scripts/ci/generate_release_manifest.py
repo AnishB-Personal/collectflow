@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-CollectFlow Release Candidate Manifest Generator (WP05-01, WP05-04, WP05-06)
+CollectFlow Release Candidate Manifest Generator (WP05-01, WP05-04, WP05-R01, WP05-R04)
 Generates an immutable, machine-readable release candidate manifest linking backend and frontend
-commit SHAs, container artifacts, SBOM references, and structured quality gate evidence.
+commit SHAs, container artifacts, SBOM references, and verified structured quality gate evidence.
 - Strictly ingests actual structured evidence files.
-- Removes hardcoded test counts, clean worktree flags, and arbitrary string verdicts.
-- Fails or explicitly records BLOCKED when evidence is missing or invalid.
-- Records live browser and real HTTPS testing as NOT_EXECUTED with environmental justification.
+- Fails closed on missing, malformed, or incomplete evidence (WP05-R01).
+- Prohibits zero collected tests from producing PASS.
+- Never converts missing data into zero findings.
+- Enforces exact expected schemas for all mandatory quality gates.
 """
 
 import argparse
@@ -54,8 +55,8 @@ def load_json_if_exists(file_path: Optional[Path]) -> Optional[Dict[str, Any]]:
             return None
     return None
 
-def parse_test_report(report_path: Optional[Path]) -> Dict[str, Any]:
-    """Ingests structured test execution evidence."""
+def parse_test_report(report_path: Optional[Path], test_suite_name: str) -> Dict[str, Any]:
+    """Ingests structured test execution evidence with strict schema and non-zero execution enforcement (WP05-R01)."""
     if not report_path or not report_path.exists():
         return {
             "verdict": "BLOCKED_EVIDENCE_UNAVAILABLE",
@@ -64,7 +65,7 @@ def parse_test_report(report_path: Optional[Path]) -> Dict[str, Any]:
             "skipped": None,
             "evidence_file": str(report_path) if report_path else None,
             "evidence_sha256": None,
-            "details": "Test report file was not found or not provided."
+            "details": f"{test_suite_name} report file was not found or not provided."
         }
     
     sha = compute_sha256(report_path)
@@ -76,20 +77,37 @@ def parse_test_report(report_path: Optional[Path]) -> Dict[str, Any]:
             "failed": None,
             "evidence_file": str(report_path),
             "evidence_sha256": sha,
-            "details": "Failed to parse structured JSON test report."
+            "details": f"Failed to parse {test_suite_name} JSON report."
         }
 
-    passed = data.get("passed")
-    failed = data.get("failed", 0)
+    # Strict schema check: both 'passed' and 'failed' must be explicitly present as integers
+    if "passed" not in data or "failed" not in data or not isinstance(data["passed"], int) or not isinstance(data["failed"], int):
+        return {
+            "verdict": "BLOCKED_EVIDENCE_INCOMPLETE",
+            "passed": data.get("passed"),
+            "failed": data.get("failed"),
+            "evidence_file": str(report_path),
+            "evidence_sha256": sha,
+            "details": f"{test_suite_name} report missing mandatory 'passed' or 'failed' integer count."
+        }
+
+    passed = data["passed"]
+    failed = data["failed"]
     skipped = data.get("skipped", 0)
-    verdict = data.get("verdict")
 
-    if verdict is None:
-        if failed == 0 and passed is not None and passed > 0:
-            verdict = "PASS"
-        else:
-            verdict = "FAIL"
+    # WP05-R01: Zero collected tests cannot produce PASS
+    if passed <= 0:
+        return {
+            "verdict": "FAIL_ZERO_TESTS_EXECUTED",
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+            "evidence_file": str(report_path),
+            "evidence_sha256": sha,
+            "details": f"Zero tests were executed in {test_suite_name}."
+        }
 
+    verdict = "PASS" if failed == 0 else "FAIL"
     return {
         "verdict": verdict,
         "passed": passed,
@@ -100,7 +118,7 @@ def parse_test_report(report_path: Optional[Path]) -> Dict[str, Any]:
     }
 
 def parse_audit_report(report_path: Optional[Path], audit_type: str) -> Dict[str, Any]:
-    """Ingests pip-audit or npm audit JSON evidence."""
+    """Ingests pip-audit or npm audit JSON evidence without converting missing data to zero (WP05-R01)."""
     if not report_path or not report_path.exists():
         return {
             "verdict": "BLOCKED_EVIDENCE_UNAVAILABLE",
@@ -123,11 +141,26 @@ def parse_audit_report(report_path: Optional[Path], audit_type: str) -> Dict[str
 
     vulns = 0
     if audit_type == "pip-audit":
-        dependencies = data.get("dependencies", [])
-        for dep in dependencies:
+        if "dependencies" not in data or not isinstance(data["dependencies"], list):
+            return {
+                "verdict": "BLOCKED_EVIDENCE_INCOMPLETE",
+                "vulnerabilities": None,
+                "evidence_file": str(report_path),
+                "evidence_sha256": sha,
+                "details": "pip-audit JSON missing mandatory 'dependencies' list."
+            }
+        for dep in data["dependencies"]:
             vulns += len(dep.get("vulns", []))
     elif audit_type == "npm-audit":
-        meta = data.get("metadata", {}).get("vulnerabilities", {})
+        if "metadata" not in data or not isinstance(data["metadata"], dict) or "vulnerabilities" not in data["metadata"]:
+            return {
+                "verdict": "BLOCKED_EVIDENCE_INCOMPLETE",
+                "vulnerabilities": None,
+                "evidence_file": str(report_path),
+                "evidence_sha256": sha,
+                "details": "npm audit JSON missing mandatory 'metadata.vulnerabilities' object."
+            }
+        meta = data["metadata"]["vulnerabilities"]
         vulns = meta.get("high", 0) + meta.get("critical", 0)
 
     verdict = "PASS" if vulns == 0 else "FAIL"
@@ -139,7 +172,7 @@ def parse_audit_report(report_path: Optional[Path], audit_type: str) -> Dict[str
     }
 
 def parse_secret_scan_report(report_path: Optional[Path]) -> Dict[str, Any]:
-    """Ingests scan_secrets.py JSON evidence."""
+    """Ingests scan_secrets.py JSON evidence with strict schema (WP05-R01)."""
     if not report_path or not report_path.exists():
         return {
             "verdict": "BLOCKED_EVIDENCE_UNAVAILABLE",
@@ -156,10 +189,20 @@ def parse_secret_scan_report(report_path: Optional[Path]) -> Dict[str, Any]:
             "verdict": "BLOCKED_EVIDENCE_MALFORMED",
             "findings_count": None,
             "evidence_file": str(report_path),
-            "evidence_sha256": sha
+            "evidence_sha256": sha,
+            "details": "Secret scan report is not valid JSON."
         }
 
-    findings = data.get("findings_count", len(data.get("findings", [])))
+    if "findings_count" not in data or not isinstance(data["findings_count"], int):
+        return {
+            "verdict": "BLOCKED_EVIDENCE_INCOMPLETE",
+            "findings_count": None,
+            "evidence_file": str(report_path),
+            "evidence_sha256": sha,
+            "details": "Secret scan report missing mandatory 'findings_count' integer."
+        }
+
+    findings = data["findings_count"]
     verdict = "PASS" if findings == 0 else "FAIL"
     return {
         "verdict": verdict,
@@ -169,22 +212,44 @@ def parse_secret_scan_report(report_path: Optional[Path]) -> Dict[str, Any]:
     }
 
 def parse_lint_report(report_path: Optional[Path]) -> Dict[str, Any]:
-    """Ingests static analysis / lint evidence."""
+    """Ingests static analysis / lint evidence with strict schema (WP05-R01)."""
     if not report_path or not report_path.exists():
         return {
             "verdict": "BLOCKED_EVIDENCE_UNAVAILABLE",
             "lint_errors": None,
             "evidence_file": str(report_path) if report_path else None,
-            "evidence_sha256": None
+            "evidence_sha256": None,
+            "details": "Lint report was not provided."
         }
 
     sha = compute_sha256(report_path)
     data = load_json_if_exists(report_path)
-    errors = 0
-    if data and isinstance(data, dict):
-        errors = data.get("errors", 0)
-    elif data and isinstance(data, list):
+    if data is None:
+        return {
+            "verdict": "BLOCKED_EVIDENCE_MALFORMED",
+            "lint_errors": None,
+            "evidence_file": str(report_path),
+            "evidence_sha256": sha,
+            "details": "Lint report is not valid JSON."
+        }
+
+    errors = None
+    if isinstance(data, dict):
+        if "lint_errors" in data and isinstance(data["lint_errors"], int):
+            errors = data["lint_errors"]
+        elif "errors" in data and isinstance(data["errors"], int):
+            errors = data["errors"]
+    elif isinstance(data, list):
         errors = len(data)
+
+    if errors is None:
+        return {
+            "verdict": "BLOCKED_EVIDENCE_INCOMPLETE",
+            "lint_errors": None,
+            "evidence_file": str(report_path),
+            "evidence_sha256": sha,
+            "details": "Lint report missing recognized 'lint_errors' integer count."
+        }
 
     verdict = "PASS" if errors == 0 else "FAIL"
     return {
@@ -195,14 +260,14 @@ def parse_lint_report(report_path: Optional[Path]) -> Dict[str, Any]:
     }
 
 def parse_cross_repo_report(report_path: Optional[Path]) -> Dict[str, Any]:
-    """Ingests cross-repository pairing report."""
+    """Ingests cross-repository pairing report with strict schema (WP05-R01, WP05-R02)."""
     if not report_path or not report_path.exists():
         return {
             "verdict": "BLOCKED",
             "pairing_status": "MISSING_CROSS_REPO_REPORT",
             "evidence_file": str(report_path) if report_path else None,
             "evidence_sha256": None,
-            "details": "Cross-repository pairing report was not found."
+            "details": ["Cross-repository pairing report was not found."]
         }
 
     sha = compute_sha256(report_path)
@@ -212,20 +277,32 @@ def parse_cross_repo_report(report_path: Optional[Path]) -> Dict[str, Any]:
             "verdict": "BLOCKED",
             "pairing_status": "MALFORMED_CROSS_REPO_REPORT",
             "evidence_file": str(report_path),
-            "evidence_sha256": sha
+            "evidence_sha256": sha,
+            "details": ["Cross-repository pairing report is malformed."]
+        }
+
+    if "gate" not in data or "pairing_status" not in data or "verdict" not in data:
+        return {
+            "verdict": "BLOCKED",
+            "pairing_status": "INCOMPLETE_CROSS_REPO_REPORT",
+            "evidence_file": str(report_path),
+            "evidence_sha256": sha,
+            "details": ["Cross-repo report missing required schema keys."]
         }
 
     return {
         "verdict": data.get("verdict", "FAIL"),
         "pairing_status": data.get("pairing_status", "UNKNOWN"),
         "initiator": data.get("initiator"),
+        "backend_sha": data.get("backend", {}).get("commit_sha"),
+        "frontend_sha": data.get("frontend", {}).get("commit_sha"),
         "details": data.get("details", []),
         "evidence_file": str(report_path),
         "evidence_sha256": sha
     }
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate CollectFlow Release Manifest (WP05-01)")
+    parser = argparse.ArgumentParser(description="Generate CollectFlow Release Manifest (WP05-01, WP05-R01)")
     parser.add_argument("--rc-id", required=True, help="Release candidate identifier (e.g., RC-20261019-01)")
     parser.add_argument("--backend-dir", default=".", help="Backend repository path")
     parser.add_argument("--frontend-dir", default="../cash-flow-buddy-101", help="Frontend repository path")
@@ -260,16 +337,16 @@ def main() -> int:
     backend_sbom_checksum = compute_sha256(backend_sbom_path)
     frontend_sbom_checksum = compute_sha256(frontend_sbom_path)
 
-    # Ingest actual structured evidence (WP05-01)
-    backend_tests = parse_test_report(Path(args.backend_test_report) if args.backend_test_report else None)
-    frontend_tests = parse_test_report(Path(args.frontend_test_report) if args.frontend_test_report else None)
+    # Ingest actual structured evidence (WP05-01, WP05-R01)
+    backend_tests = parse_test_report(Path(args.backend_test_report) if args.backend_test_report else None, "backend_pytest")
+    frontend_tests = parse_test_report(Path(args.frontend_test_report) if args.frontend_test_report else None, "frontend_vitest")
     pip_audit = parse_audit_report(Path(args.backend_audit_report) if args.backend_audit_report else None, "pip-audit")
     npm_audit = parse_audit_report(Path(args.frontend_audit_report) if args.frontend_audit_report else None, "npm-audit")
     secret_scan = parse_secret_scan_report(Path(args.secret_scan_report) if args.secret_scan_report else None)
     sast_lint = parse_lint_report(Path(args.sast_lint_report) if args.sast_lint_report else None)
     cross_repo = parse_cross_repo_report(Path(args.cross_repo_report) if args.cross_repo_report else None)
 
-    # Container artifacts handling (WP05-04: Distinguish Image Config ID from Registry Digest)
+    # Container artifacts handling (WP05-04, WP05-R03)
     b_image_id = backend_meta.get("image_id") if backend_meta else None
     b_oci_rev = backend_meta.get("oci_revision") if backend_meta else None
     b_scan_verdict = backend_meta.get("scan_verdict") if backend_meta else "BLOCKED_METADATA_UNAVAILABLE"
@@ -286,7 +363,7 @@ def main() -> int:
         pass
 
     manifest = {
-        "schema_version": "1.1.0",
+        "schema_version": "1.2.0",
         "release_candidate_id": args.rc_id,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "source_traceability": {

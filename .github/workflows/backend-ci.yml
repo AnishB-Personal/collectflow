@@ -81,20 +81,25 @@ jobs:
         run: |
           pytest tests/ -v --junitxml=/tmp/backend-pytest-report.xml
           python3 -c "
-import xml.etree.ElementTree as ET, json
+import xml.etree.ElementTree as ET, json, sys
 try:
     tree = ET.parse('/tmp/backend-pytest-report.xml')
     root = tree.getroot()
     s = root if root.tag == 'testsuite' else root.find('testsuite')
+    if s is None:
+        raise ValueError('No testsuite tag found in pytest XML report')
     tests = int(s.attrib.get('tests', 0))
     failures = int(s.attrib.get('failures', 0)) + int(s.attrib.get('errors', 0))
     skipped = int(s.attrib.get('skipped', 0))
     passed = tests - failures - skipped
+    if passed <= 0:
+        raise ValueError(f'Zero tests passed in test suite (passed={passed}, tests={tests})')
+    verdict = 'PASS' if failures == 0 else 'FAIL'
     with open('/tmp/backend-test-summary.json', 'w') as f:
-        json.dump({'passed': passed, 'failed': failures, 'skipped': skipped, 'verdict': 'PASS' if failures == 0 else 'FAIL'}, f)
+        json.dump({'passed': passed, 'failed': failures, 'skipped': skipped, 'verdict': verdict}, f, indent=2)
 except Exception as e:
-    with open('/tmp/backend-test-summary.json', 'w') as f:
-        json.dump({'passed': 0, 'failed': 1, 'skipped': 0, 'verdict': 'FAIL', 'error': str(e)}, f)
+    print(f'ERROR: Failed to parse backend pytest report: {e}', file=sys.stderr)
+    sys.exit(1)
 "
 
       - name: Build Backend OCI Image
@@ -109,7 +114,6 @@ except Exception as e:
           format: "json"
           output: "/tmp/backend-trivy-report.json"
           exit-code: "1"
-          ignore-unfixed: true
           vuln-type: "os,library"
           severity: "HIGH,CRITICAL"
 

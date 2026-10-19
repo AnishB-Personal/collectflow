@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-CollectFlow Release Candidate Manifest Validator (WP05-01, WP05-03, WP05-04)
+CollectFlow Release Candidate Manifest Validator (WP05-01, WP05-03, WP05-04, WP05-R01, WP05-R03, WP05-R04)
 Strictly validates a generated release-manifest.json:
 - Verifies exact Git source commit SHAs and clean-worktree assertions.
 - Enforces OCI revision labels matching exact source commit SHAs.
 - Distinguishes Image Config IDs from remote registry digests.
 - Strictly validates structured quality gate evidence (rejects fabricated or arbitrary string PASS values).
+- Requires mandatory evidence paths and independently recomputes SHA-256 checksums (WP05-R04).
+- Confirms evidence files contain claimed results / anti-forgery verification (WP05-R04).
+- Rejects zero collected tests from producing PASS (WP05-R01).
 - Enforces cross-repository pairing status (rejects BLOCKED, missing, or failed pairing).
+- Verifies Docker daemon image configuration ID and OCI revision label against actual daemon images (WP05-R04).
 - Re-computes and verifies SHA-256 checksums of all referenced SBOM files.
-- Rejects missing, unverified, or failed container vulnerability scans.
+- Rejects missing, unverified, BLOCKED, ERROR, or failed container vulnerability scans (WP05-R03).
 - Enforces disabled-by-default publication boundary.
 """
 
@@ -18,7 +22,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 def compute_sha256(file_path: Path) -> str:
     h = hashlib.sha256()
@@ -39,11 +43,81 @@ def get_git_sha(repo_dir: Path) -> str:
     except Exception as e:
         return f"UNKNOWN: {e}"
 
+def verify_evidence_file(
+    gate_name: str,
+    gate_obj: Dict[str, Any]
+) -> Tuple[Optional[Any], List[str]]:
+    """Verifies evidence file existence, SHA-256 integrity, and parses JSON (WP05-R04)."""
+    errs: List[str] = []
+    if not isinstance(gate_obj, dict):
+        return None, [f"{gate_name} evidence is missing or not a structured object."]
+
+    file_path_str = gate_obj.get("evidence_file")
+    if not file_path_str:
+        return None, [f"{gate_name} is missing mandatory 'evidence_file' path."]
+
+    ev_path = Path(file_path_str)
+    if not ev_path.exists():
+        return None, [f"{gate_name} referenced evidence file does not exist: {ev_path}"]
+
+    expected_sha = gate_obj.get("evidence_sha256")
+    if not expected_sha or len(expected_sha) != 64:
+        return None, [f"{gate_name} missing or invalid recorded SHA-256 evidence checksum."]
+
+    actual_sha = compute_sha256(ev_path)
+    if actual_sha != expected_sha:
+        return None, [
+            f"{gate_name} evidence checksum mismatch! Recorded '{expected_sha}', but actual file has '{actual_sha}'."
+        ]
+
+    try:
+        content = json.loads(ev_path.read_text(encoding="utf-8"))
+        return content, []
+    except Exception as e:
+        return None, [f"{gate_name} evidence file is not valid JSON: {e}"]
+
+def verify_docker_image(
+    image_tag: str,
+    expected_image_id: str,
+    expected_commit_sha: str
+) -> List[str]:
+    """Verifies local Docker daemon image configuration ID and OCI revision label (WP05-R04)."""
+    errors: List[str] = []
+    try:
+        res = subprocess.run(
+            ["docker", "inspect", image_tag],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        inspect_data = json.loads(res.stdout)
+        if not inspect_data or not isinstance(inspect_data, list):
+            return [f"Docker inspect for '{image_tag}' returned invalid JSON structure."]
+        img = inspect_data[0]
+        actual_id = img.get("Id", "")
+        if actual_id != expected_image_id:
+            errors.append(
+                f"Docker daemon image ID mismatch for '{image_tag}': manifest records '{expected_image_id}', but daemon reports '{actual_id}'"
+            )
+        labels = img.get("Config", {}).get("Labels") or {}
+        actual_oci_rev = labels.get("org.opencontainers.image.revision", "")
+        if actual_oci_rev != expected_commit_sha:
+            errors.append(
+                f"Docker daemon image OCI revision label mismatch for '{image_tag}': expected commit SHA '{expected_commit_sha}', but daemon image label is '{actual_oci_rev}'"
+            )
+    except subprocess.CalledProcessError as e:
+        errors.append(f"Docker image '{image_tag}' not found in local daemon or inspect failed: {e.stderr.strip()}")
+    except Exception as e:
+        errors.append(f"Failed to inspect Docker image '{image_tag}': {e}")
+    return errors
+
 def validate_manifest(
     manifest_data: Dict[str, Any],
     backend_dir: Optional[Path] = None,
     frontend_dir: Optional[Path] = None,
     verify_git_shas: bool = True,
+    verify_evidence_integrity: bool = True,
+    verify_docker_images: bool = True,
     require_deployment_approved: bool = False
 ) -> List[str]:
     errors: List[str] = []
@@ -98,7 +172,7 @@ def validate_manifest(
                 f"Frontend source SHA mismatch! Manifest specifies '{frontend_sha}' but repo HEAD is '{actual_frontend_sha}'"
             )
 
-    # 3. Container Artifacts, OCI Revisions & Vulnerability Scan Validation (WP05-02, WP05-04)
+    # 3. Container Artifacts, OCI Revisions & Vulnerability Scan Validation (WP05-02, WP05-04, WP05-R03, WP05-R04)
     container_artifacts = manifest_data.get("container_artifacts", {})
     for component, expected_sha in [("backend", backend_sha), ("frontend", frontend_sha)]:
         c_info = container_artifacts.get(component, {})
@@ -113,12 +187,29 @@ def validate_manifest(
                 f"{component} OCI revision mismatch! Expected commit SHA '{expected_sha}', but recorded '{oci_rev}'"
             )
 
-        # Enforce fail-closed scan verdict (WP05-02)
+        # Enforce fail-closed scan verdict (WP05-02, WP05-R03)
         scan_verdict = c_info.get("scan_verdict", "")
         if scan_verdict not in ["PASS", "PASS_WITH_APPROVED_EXCEPTIONS"]:
             errors.append(
                 f"{component} container vulnerability scan did not pass verified gate (verdict: '{scan_verdict}')"
             )
+
+        # Container scan evidence file verification
+        sec_scan_meta = c_info.get("security_scan", {})
+        if verify_evidence_integrity and isinstance(sec_scan_meta, dict) and sec_scan_meta.get("evidence_file"):
+            ev_path = Path(sec_scan_meta["evidence_file"])
+            if not ev_path.exists():
+                errors.append(f"{component} container scan evidence file not found: {ev_path}")
+            elif sec_scan_meta.get("evidence_sha256"):
+                act_sha = compute_sha256(ev_path)
+                if act_sha != sec_scan_meta["evidence_sha256"]:
+                    errors.append(f"{component} container scan evidence checksum mismatch: {ev_path}")
+
+        # Docker daemon image inspection (WP05-R04)
+        if verify_docker_images and image_id:
+            image_tag = c_info.get("image_tag") or f"collectflow-{component}:{expected_sha}"
+            docker_errs = verify_docker_image(image_tag, image_id, expected_sha)
+            errors.extend(docker_errs)
 
         # Verify disabled publication policy
         if c_info.get("publication_status") != "DISABLED_BY_DEFAULT" or c_info.get("registry_published") is True:
@@ -150,24 +241,74 @@ def validate_manifest(
                 f"{component} SBOM checksum mismatch! Manifest recorded '{expected_checksum}' but actual file has '{actual_checksum}'"
             )
 
-    # 5. Quality Gate Evidence Verification (WP05-01, WP05-03, WP05-06)
+    # 5. Quality Gate Evidence Verification & Anti-Forgery (WP05-01, WP05-R01, WP05-R04)
     quality_gates = manifest_data.get("quality_gates", {})
 
-    # Ingestion check: reject arbitrary string values that claim PASS (WP05-01)
+    # 5a. Backend Regression Tests
     backend_tests = quality_gates.get("backend_regression_tests")
     if not isinstance(backend_tests, dict):
         errors.append("Backend regression tests evidence is missing or not a structured object.")
     else:
         if backend_tests.get("verdict") != "PASS" or backend_tests.get("failed", 1) > 0 or not isinstance(backend_tests.get("passed"), int):
             errors.append(f"Backend regression tests failed or did not receive structured PASS verdict: {backend_tests}")
+        if backend_tests.get("passed", 0) <= 0:
+            errors.append("Backend regression tests executed zero tests (cannot produce PASS).")
 
+        if verify_evidence_integrity:
+            ev_data, ev_errs = verify_evidence_file("Backend regression tests", backend_tests)
+            if ev_errs:
+                errors.extend(ev_errs)
+            elif isinstance(ev_data, dict):
+                # Anti-forgery check against evidence content
+                if "passed" not in ev_data or "failed" not in ev_data:
+                    errors.append("Backend test evidence file missing mandatory 'passed' or 'failed' counts.")
+                else:
+                    if ev_data["passed"] != backend_tests["passed"]:
+                        errors.append(
+                            f"Backend test evidence forgery detected! Manifest claims {backend_tests['passed']} passed, but evidence file records {ev_data['passed']}."
+                        )
+                    if ev_data["failed"] != backend_tests["failed"]:
+                        errors.append(
+                            f"Backend test evidence forgery detected! Manifest claims {backend_tests['failed']} failed, but evidence file records {ev_data['failed']}."
+                        )
+                    if ev_data["failed"] > 0:
+                        errors.append(f"Backend test evidence records {ev_data['failed']} test failure(s).")
+                    if ev_data["passed"] <= 0:
+                        errors.append("Backend test evidence records zero passed tests.")
+
+    # 5b. Frontend Regression Tests
     frontend_tests = quality_gates.get("frontend_regression_tests")
     if not isinstance(frontend_tests, dict):
         errors.append("Frontend regression tests evidence is missing or not a structured object.")
     else:
         if frontend_tests.get("verdict") != "PASS" or frontend_tests.get("failed", 1) > 0 or not isinstance(frontend_tests.get("passed"), int):
             errors.append(f"Frontend regression tests failed or did not receive structured PASS verdict: {frontend_tests}")
+        if frontend_tests.get("passed", 0) <= 0:
+            errors.append("Frontend regression tests executed zero tests (cannot produce PASS).")
 
+        if verify_evidence_integrity:
+            ev_data, ev_errs = verify_evidence_file("Frontend regression tests", frontend_tests)
+            if ev_errs:
+                errors.extend(ev_errs)
+            elif isinstance(ev_data, dict):
+                # Anti-forgery check against evidence content
+                if "passed" not in ev_data or "failed" not in ev_data:
+                    errors.append("Frontend test evidence file missing mandatory 'passed' or 'failed' counts.")
+                else:
+                    if ev_data["passed"] != frontend_tests["passed"]:
+                        errors.append(
+                            f"Frontend test evidence forgery detected! Manifest claims {frontend_tests['passed']} passed, but evidence file records {ev_data['passed']}."
+                        )
+                    if ev_data["failed"] != frontend_tests["failed"]:
+                        errors.append(
+                            f"Frontend test evidence forgery detected! Manifest claims {frontend_tests['failed']} failed, but evidence file records {ev_data['failed']}."
+                        )
+                    if ev_data["failed"] > 0:
+                        errors.append(f"Frontend test evidence records {ev_data['failed']} test failure(s).")
+                    if ev_data["passed"] <= 0:
+                        errors.append("Frontend test evidence records zero passed tests.")
+
+    # 5c. Python Dependency Audit (pip-audit)
     py_audit = quality_gates.get("python_dependency_audit")
     if not isinstance(py_audit, dict):
         errors.append("Python dependency audit evidence is missing or not a structured object.")
@@ -175,6 +316,23 @@ def validate_manifest(
         if py_audit.get("verdict") != "PASS" or py_audit.get("vulnerabilities", 1) > 0:
             errors.append(f"Python dependency audit failed or has vulnerabilities: {py_audit}")
 
+        if verify_evidence_integrity:
+            ev_data, ev_errs = verify_evidence_file("Python dependency audit", py_audit)
+            if ev_errs:
+                errors.extend(ev_errs)
+            elif isinstance(ev_data, dict):
+                if "dependencies" not in ev_data or not isinstance(ev_data["dependencies"], list):
+                    errors.append("Python audit evidence missing mandatory 'dependencies' list.")
+                else:
+                    actual_vulns = sum(len(d.get("vulns", [])) for d in ev_data["dependencies"])
+                    if py_audit.get("vulnerabilities") != actual_vulns:
+                        errors.append(
+                            f"Python audit evidence forgery detected! Manifest claims {py_audit.get('vulnerabilities')} vulnerabilities, but evidence records {actual_vulns}."
+                        )
+                    if actual_vulns > 0:
+                        errors.append(f"Python audit evidence records {actual_vulns} dependency vulnerability(ies).")
+
+    # 5d. NPM Dependency Audit (npm-audit)
     npm_audit = quality_gates.get("npm_dependency_audit")
     if not isinstance(npm_audit, dict):
         errors.append("NPM dependency audit evidence is missing or not a structured object.")
@@ -182,6 +340,24 @@ def validate_manifest(
         if npm_audit.get("verdict") != "PASS" or npm_audit.get("vulnerabilities", 1) > 0:
             errors.append(f"NPM dependency audit failed or has vulnerabilities: {npm_audit}")
 
+        if verify_evidence_integrity:
+            ev_data, ev_errs = verify_evidence_file("NPM dependency audit", npm_audit)
+            if ev_errs:
+                errors.extend(ev_errs)
+            elif isinstance(ev_data, dict):
+                if "metadata" not in ev_data or "vulnerabilities" not in ev_data.get("metadata", {}):
+                    errors.append("NPM audit evidence missing mandatory 'metadata.vulnerabilities' object.")
+                else:
+                    meta = ev_data["metadata"]["vulnerabilities"]
+                    actual_vulns = meta.get("high", 0) + meta.get("critical", 0)
+                    if npm_audit.get("vulnerabilities") != actual_vulns:
+                        errors.append(
+                            f"NPM audit evidence forgery detected! Manifest claims {npm_audit.get('vulnerabilities')} vulnerabilities, but evidence records {actual_vulns}."
+                        )
+                    if actual_vulns > 0:
+                        errors.append(f"NPM audit evidence records {actual_vulns} high/critical vulnerability(ies).")
+
+    # 5e. Secret Scanning Gate
     sec_scan = quality_gates.get("secret_scanning")
     if not isinstance(sec_scan, dict):
         errors.append("Secret scanning evidence is missing or not a structured object.")
@@ -189,6 +365,23 @@ def validate_manifest(
         if sec_scan.get("verdict") != "PASS" or sec_scan.get("findings_count", sec_scan.get("credentials_detected", 1)) > 0:
             errors.append(f"Secret scanning gate failed or credentials detected: {sec_scan}")
 
+        if verify_evidence_integrity:
+            ev_data, ev_errs = verify_evidence_file("Secret scanning", sec_scan)
+            if ev_errs:
+                errors.extend(ev_errs)
+            elif isinstance(ev_data, dict):
+                if "findings_count" not in ev_data or not isinstance(ev_data["findings_count"], int):
+                    errors.append("Secret scanning evidence missing mandatory 'findings_count' integer.")
+                else:
+                    act_findings = ev_data["findings_count"]
+                    if sec_scan.get("findings_count") != act_findings:
+                        errors.append(
+                            f"Secret scanning evidence forgery detected! Manifest claims {sec_scan.get('findings_count')} findings, but evidence records {act_findings}."
+                        )
+                    if act_findings > 0:
+                        errors.append(f"Secret scanning evidence records {act_findings} active credential/secret finding(s).")
+
+    # 5f. SAST / Lint Checks
     sast_lint = quality_gates.get("sast_lint_checks")
     if not isinstance(sast_lint, dict):
         errors.append("SAST / lint check evidence is missing or not a structured object.")
@@ -196,7 +389,24 @@ def validate_manifest(
         if sast_lint.get("verdict") != "PASS" or sast_lint.get("lint_errors", 1) > 0:
             errors.append(f"SAST / lint gate failed with errors: {sast_lint}")
 
-    # Cross-repository pairing gate enforcement (WP05-03)
+        if verify_evidence_integrity:
+            ev_data, ev_errs = verify_evidence_file("SAST lint checks", sast_lint)
+            if ev_errs:
+                errors.extend(ev_errs)
+            else:
+                act_errors = 0
+                if isinstance(ev_data, dict):
+                    act_errors = ev_data.get("lint_errors", ev_data.get("errors", 0))
+                elif isinstance(ev_data, list):
+                    act_errors = len(ev_data)
+                if sast_lint.get("lint_errors") != act_errors:
+                    errors.append(
+                        f"Lint evidence forgery detected! Manifest claims {sast_lint.get('lint_errors')} errors, but evidence records {act_errors}."
+                    )
+                if act_errors > 0:
+                    errors.append(f"SAST / lint evidence records {act_errors} static analysis error(s).")
+
+    # 5g. Cross-repository pairing gate enforcement (WP05-03, WP05-R02, WP05-R04)
     cross_repo = quality_gates.get("cross_repo_pairing")
     if not isinstance(cross_repo, dict):
         errors.append("Cross-repository pairing report evidence is missing or not a structured object.")
@@ -213,6 +423,34 @@ def validate_manifest(
                 f"Cross-repository integration gate failed (verdict: '{cross_verdict}', status: '{pairing_status}')."
             )
 
+        if verify_evidence_integrity:
+            ev_data, ev_errs = verify_evidence_file("Cross-repo pairing", cross_repo)
+            if ev_errs:
+                errors.extend(ev_errs)
+            elif isinstance(ev_data, dict):
+                r_verdict = ev_data.get("verdict")
+                r_status = ev_data.get("pairing_status")
+                if r_verdict == "BLOCKED" or "BLOCKED" in str(r_status):
+                    errors.append(
+                        f"Cross-repo pairing evidence file indicates BLOCKED status ({r_status}). Release candidate cannot be accepted."
+                    )
+                elif r_verdict != "PASS" or r_status != "VERIFIED_PAIR":
+                    errors.append(
+                        f"Cross-repo pairing evidence file records failed status (verdict: '{r_verdict}', status: '{r_status}')."
+                    )
+
+                # Source SHA pairing anti-forgery verification
+                b_ev_sha = ev_data.get("backend", {}).get("commit_sha")
+                f_ev_sha = ev_data.get("frontend", {}).get("commit_sha")
+                if b_ev_sha and b_ev_sha != backend_sha:
+                    errors.append(
+                        f"Cross-repo report backend SHA mismatch! Manifest source is '{backend_sha}', but report recorded '{b_ev_sha}'."
+                    )
+                if f_ev_sha and f_ev_sha != frontend_sha:
+                    errors.append(
+                        f"Cross-repo report frontend SHA mismatch! Manifest source is '{frontend_sha}', but report recorded '{f_ev_sha}'."
+                    )
+
     # 6. Governance & Deployment Authorization Gate
     gov = manifest_data.get("governance_and_approval", {})
     deployment_authorized = gov.get("deployment_authorized", False)
@@ -222,11 +460,15 @@ def validate_manifest(
     return errors
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Validate CollectFlow Release Manifest (WP05-01, WP05-03, WP05-04)")
+    parser = argparse.ArgumentParser(
+        description="Validate CollectFlow Release Manifest (WP05-01, WP05-03, WP05-04, WP05-R01, WP05-R04)"
+    )
     parser.add_argument("--manifest", required=True, help="Path to release-manifest.json")
     parser.add_argument("--backend-dir", help="Path to backend git repo (for SHA verification)")
     parser.add_argument("--frontend-dir", help="Path to frontend git repo (for SHA verification)")
     parser.add_argument("--skip-git-verify", action="store_true", help="Skip verifying SHAs against local git repos")
+    parser.add_argument("--skip-evidence-verify", action="store_true", help="Skip evidence file content and checksum verification")
+    parser.add_argument("--skip-docker-verify", action="store_true", help="Skip Docker daemon image inspection")
     parser.add_argument("--require-approved", action="store_true", help="Enforce deployment_authorized=true")
     args = parser.parse_args()
 
@@ -250,6 +492,8 @@ def main() -> int:
         backend_dir=backend_dir,
         frontend_dir=frontend_dir,
         verify_git_shas=not args.skip_git_verify,
+        verify_evidence_integrity=not args.skip_evidence_verify,
+        verify_docker_images=not args.skip_docker_verify,
         require_deployment_approved=args.require_approved
     )
 
