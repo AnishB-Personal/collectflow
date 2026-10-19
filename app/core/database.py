@@ -4,10 +4,14 @@ SQLAlchemy 2.0 Database Session and Engine Configuration for PostgreSQL Parity.
 Enforces:
 - Hardened loopback isolation for test and local development environments
 - Cloud-agnostic portable PostgreSQL connectivity for containerized, on-premises, and cloud production environments
-- Strict DSN parsing via sqlalchemy.engine.make_url
+- Strict DSN parsing and safe URL construction via sqlalchemy.engine.URL and make_url
 - Whitelist validation of host, port, database name, user, and environment mode
-- Mandatory TLS (sslmode=require, verify-ca, verify-full) on remote/public endpoints
-- Sensitive credential and password masking in all validation errors, traces, and logs
+- Explicit driver contract: explicit postgresql+psycopg preferred, plain postgresql normalized, unsupported dialects rejected
+- Offline engine constructibility validation without network connection
+- Defensible TLS trust classification: standard container service names (postgres, db) trusted by default,
+  custom container exceptions permitted only through COLLECTFLOW_TRUSTED_CONTAINER_HOSTS,
+  mandatory secure TLS (sslmode=require, verify-ca, verify-full) on all remote and untrusted endpoints
+- Safe database credential handling preventing leaks of passwords or password fragments in traces and parser errors
 - Fail-closed security with zero silent fallbacks across all environment modes
 """
 
@@ -17,7 +21,7 @@ import re
 from contextlib import contextmanager
 from typing import Generator
 from sqlalchemy import create_engine
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import make_url, URL
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 # Declarative Base
@@ -55,30 +59,38 @@ PERMITTED_ENV_MODES = PERMITTED_TEST_MODES | PERMITTED_DEV_MODES | PERMITTED_PRO
 STANDARD_PG_SSL_MODES = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
 SECURE_SSL_MODES = {"require", "verify-ca", "verify-full"}
 
-# RFC 1918 private IPv4 networks
-RFC1918_NETWORKS = (
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-)
+# Standard Docker Compose / container service names permitted for local container networking
+DEFAULT_TRUSTED_CONTAINER_HOSTS = {
+    "postgres",
+    "db",
+    "collectflow-postgres",
+    "collectflow-db",
+}
 
 
 def sanitize_credentials(text: str) -> str:
     """Mask credentials in database connection strings, error messages, and traces."""
     if not text:
         return ""
-    # Scrub DSN format ://username:password@host
-    redacted = re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", str(text))
+    s = str(text)
+    # Scrub any URL pattern ://username:password@host
+    s = re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", s)
     # Scrub query param passwords
-    redacted = re.sub(r"([?&]pass(?:word)?=)[^&]+", r"\1***", redacted, flags=re.IGNORECASE)
-    return redacted
+    s = re.sub(r"([?&]pass(?:word)?=)[^&]+", r"\1***", s, flags=re.IGNORECASE)
+    # Scrub known environment password if present
+    env_pass = os.environ.get("COLLECTFLOW_DB_PASSWORD")
+    if env_pass and len(env_pass) >= 4 and env_pass in s:
+        s = s.replace(env_pass, "***")
+    return s
 
 
-def sanitize_dsn(url_str_or_obj: str) -> str:
+def sanitize_dsn(url_str_or_obj: str | URL) -> str:
     """Mask credentials in database URL objects or connection strings."""
     if not url_str_or_obj:
         return ""
     try:
+        if isinstance(url_str_or_obj, URL):
+            return url_str_or_obj.render_as_string(hide_password=True)
         u = make_url(str(url_str_or_obj))
         return u.render_as_string(hide_password=True)
     except Exception:
@@ -99,34 +111,55 @@ def is_loopback_host(host: str) -> bool:
         return False
 
 
-def is_internal_or_container_host(host: str) -> bool:
+def get_trusted_container_hosts() -> set[str]:
+    """Return set of explicitly trusted local container hostnames."""
+    trusted = set(DEFAULT_TRUSTED_CONTAINER_HOSTS)
+    extra = os.environ.get("COLLECTFLOW_TRUSTED_CONTAINER_HOSTS", "")
+    if extra:
+        for item in extra.split(","):
+            clean = item.strip().lower().strip("[]")
+            if clean:
+                trusted.add(clean)
+    return trusted
+
+
+def is_trusted_container_host(host: str) -> bool:
     """
-    Determine if a hostname/IP is an internal container, loopback, or private RFC1918 address.
-    Returns True for loopback, RFC1918 private IPs, single-label container names (e.g. 'postgres'),
-    and internal domain names (.internal, .local, .lan, .cluster.local).
+    Determine if a hostname is an explicitly trusted local container service.
+    Only permitted default Docker Compose service names ('postgres', 'db', 'collectflow-postgres', 'collectflow-db')
+    or hostnames explicitly declared in COLLECTFLOW_TRUSTED_CONTAINER_HOSTS are trusted.
+    Arbitrary single-label hostnames, internal domain suffixes, and unlisted IPs are NOT trusted.
     """
     if not host:
         return False
-    host_clean = host.strip().lower().strip("[]")
-    if is_loopback_host(host_clean):
-        return True
+    clean = host.strip().lower().strip("[]")
+    return clean in get_trusted_container_hosts()
+
+
+def validate_engine_constructible(url_obj: URL) -> None:
+    """
+    Validate that SQLAlchemy can construct an engine and load the dialect/driver without connecting.
+    Executes offline with zero external network or database connections.
+    """
     try:
-        ip = ipaddress.ip_address(host_clean)
-        if ip.is_loopback:
-            return True
-        if ip.version == 4:
-            return any(ip in net for net in RFC1918_NETWORKS)
-        return False
+        test_url = url_obj
+        if test_url.drivername == "postgresql":
+            test_url = test_url.set(drivername="postgresql+psycopg")
+        eng = create_engine(test_url)
+        if eng.dialect.name != "postgresql" or eng.dialect.driver != "psycopg":
+            eng.dispose()
+            raise ValueError(
+                f"Unsupported dialect/driver combination: {eng.dialect.name}+{eng.dialect.driver}. "
+                "Must be postgresql+psycopg."
+            )
+        eng.dispose()
     except ValueError:
-        pass
-    # Single-label container hostname (e.g. 'postgres', 'db', 'collectflow-db')
-    if "." not in host_clean:
-        return True
-    # Internal domain suffixes
-    internal_suffixes = (".internal", ".local", ".lan", ".cluster.local")
-    if any(host_clean.endswith(suffix) for suffix in internal_suffixes):
-        return True
-    return False
+        raise
+    except Exception as e:
+        safe_err = sanitize_credentials(str(e))
+        raise ValueError(
+            f"CRITICAL ISOLATION ERROR: Failed to construct engine for database URL: {safe_err}"
+        ) from None
 
 
 def validate_isolated_database_url(url_str: str, env_mode: str) -> None:
@@ -145,18 +178,17 @@ def validate_isolated_database_url(url_str: str, env_mode: str) -> None:
     if not url_str or not isinstance(url_str, str):
         raise ValueError("CRITICAL ISOLATION ERROR: Database URL cannot be empty.")
 
-    safe_url = sanitize_dsn(url_str)
     try:
         url = make_url(url_str)
         if url.drivername.startswith("postgresql") and not url.host:
-            raise ValueError(f"CRITICAL ISOLATION ERROR: Missing host in PostgreSQL URL '{safe_url}'.")
+            raise ValueError("CRITICAL ISOLATION ERROR: Missing host in PostgreSQL URL.")
         if url.drivername.startswith("postgresql") and not url.database:
-            raise ValueError(f"CRITICAL ISOLATION ERROR: Missing database in PostgreSQL URL '{safe_url}'.")
+            raise ValueError("CRITICAL ISOLATION ERROR: Missing database in PostgreSQL URL.")
     except ValueError:
         raise
-    except Exception as e:
-        safe_msg = sanitize_credentials(str(e))
-        raise ValueError(f"CRITICAL ISOLATION ERROR: Malformed database URL: {safe_msg}") from None
+    except Exception:
+        # Avoid leaking unencoded password fragments or invalid tokens from parser errors
+        raise ValueError("CRITICAL ISOLATION ERROR: Malformed database URL: Unable to parse connection string.") from None
 
     # Driver check
     if not (url.drivername.startswith("postgresql") or url.drivername.startswith("sqlite")):
@@ -202,9 +234,18 @@ def validate_isolated_database_url(url_str: str, env_mode: str) -> None:
             )
         return
 
+    # Validate driver contract: explicit postgresql+psycopg preferred; plain postgresql accepted
+    if url.drivername not in ("postgresql+psycopg", "postgresql"):
+        raise ValueError(
+            f"CRITICAL ISOLATION ERROR: Driver '{url.drivername}' is not supported. Must be postgresql+psycopg."
+        )
+
+    # Validate SQLAlchemy engine constructibility offline
+    validate_engine_constructible(url)
+
     # PostgreSQL strict isolation enforcement
     # 1. Host validation: MUST be strictly loopback in test mode
-    host = (url.host or "").strip().lower()
+    host = (url.host or "").strip().lower().strip("[]")
     if mode == "test":
         if not is_loopback_host(host):
             raise RuntimeError(
@@ -212,11 +253,11 @@ def validate_isolated_database_url(url_str: str, env_mode: str) -> None:
                 f"Database must reside strictly on loopback {PERMITTED_LOOPBACK_HOSTS}."
             )
     else:
-        # Dev / Sandbox / Integration modes allow loopback or local container hostname 'postgres'
-        if not (is_loopback_host(host) or host == "postgres"):
+        # Dev / Sandbox / Integration modes allow loopback or trusted container service
+        if not (is_loopback_host(host) or is_trusted_container_host(host)):
             raise RuntimeError(
                 f"CRITICAL ISOLATION ERROR: Remote host '{url.host}' is prohibited in '{mode}' mode. "
-                f"Database must reside strictly on loopback {PERMITTED_LOOPBACK_HOSTS} or local container network."
+                f"Database must reside strictly on loopback {PERMITTED_LOOPBACK_HOSTS} or trusted local container network."
             )
 
     # 2. Port validation: Must be loopback/standard port (5432, 5433, 5434)
@@ -276,12 +317,13 @@ def validate_production_database_url(url_str: str, env_mode: str) -> None:
     if not url_str or not isinstance(url_str, str):
         raise ValueError("CRITICAL ISOLATION ERROR: Database URL cannot be empty.")
 
-    safe_url = sanitize_dsn(url_str)
     try:
         url = make_url(url_str)
-    except Exception as e:
-        safe_msg = sanitize_credentials(str(e))
-        raise ValueError(f"CRITICAL ISOLATION ERROR: Malformed database URL: {safe_msg}") from None
+    except Exception:
+        # Avoid leaking unencoded password fragments or invalid tokens from parser errors
+        raise ValueError("CRITICAL ISOLATION ERROR: Malformed database URL: Unable to parse connection string.") from None
+
+    safe_url = sanitize_dsn(url)
 
     # SQLite is strictly forbidden in production and staging
     if url.drivername.startswith("sqlite"):
@@ -289,11 +331,14 @@ def validate_production_database_url(url_str: str, env_mode: str) -> None:
             f"CRITICAL ISOLATION ERROR: SQLite driver is not permitted in '{mode}' mode. PostgreSQL is required."
         )
 
-    # PostgreSQL driver check
-    if not (url.drivername == "postgresql" or url.drivername.startswith("postgresql+")):
+    # Driver contract: explicit postgresql+psycopg preferred, plain postgresql normalized, unsupported variants rejected
+    if url.drivername not in ("postgresql+psycopg", "postgresql"):
         raise ValueError(
-            f"CRITICAL ISOLATION ERROR: Driver '{url.drivername}' is not supported in '{mode}' mode. Must be postgresql or postgresql+psycopg."
+            f"CRITICAL ISOLATION ERROR: Driver '{url.drivername}' is not supported in '{mode}' mode. Must be postgresql+psycopg."
         )
+
+    # Validate SQLAlchemy engine constructibility offline
+    validate_engine_constructible(url)
 
     # Required host, database, user, and password
     host = (url.host or "").strip()
@@ -338,16 +383,16 @@ def validate_production_database_url(url_str: str, env_mode: str) -> None:
                 f"Must be one of {STANDARD_PG_SSL_MODES}."
             )
 
-    is_internal = is_internal_or_container_host(host)
-    if not is_internal:
-        # Remote cloud endpoint or public network: TLS encryption is mandatory
+    is_trusted_local = is_loopback_host(host) or is_trusted_container_host(host)
+    if not is_trusted_local:
+        # Untrusted single-label hostnames, internal-looking domains, private IPs, or remote cloud endpoints:
+        # Secure TLS encryption (sslmode=require, verify-ca, verify-full) is mandatory by default.
         if sslmode not in SECURE_SSL_MODES:
             raise RuntimeError(
-                f"CRITICAL ISOLATION ERROR: Remote host '{host}' requires TLS encryption (sslmode=require, verify-ca, or verify-full) in '{mode}' mode. URL: '{safe_url}'."
+                f"CRITICAL ISOLATION ERROR: Host '{host}' is not a trusted local container and requires secure TLS encryption "
+                f"(sslmode=require, verify-ca, or verify-full) in '{mode}' mode. URL: '{safe_url}'. "
+                "To permit local unencrypted container networking, configure host in COLLECTFLOW_TRUSTED_CONTAINER_HOSTS."
             )
-    else:
-        # Internal container or RFC1918 private network: TLS recommended, unencrypted allowed for internal meshes
-        pass
 
 
 def validate_database_url(url_str: str, env_mode: str) -> None:
@@ -397,9 +442,20 @@ def get_database_url() -> str:
                     f"'{env_mode}' mode. Missing required database configuration."
                 )
             db_port = os.environ.get("COLLECTFLOW_DB_PORT", "5432")
+            port_val = int(db_port) if (db_port and str(db_port).isdigit()) else 5432
             db_sslmode = os.environ.get("COLLECTFLOW_DB_SSLMODE")
-            ssl_query = f"?sslmode={db_sslmode}" if db_sslmode else ""
-            custom_url = f"postgresql+psycopg://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}{ssl_query}"
+            query_params = {"sslmode": db_sslmode} if db_sslmode else {}
+            # Safe URL construction via URL.create() with automatic character escaping
+            url_obj = URL.create(
+                drivername="postgresql+psycopg",
+                username=db_user,
+                password=db_pass,
+                host=db_host,
+                port=port_val,
+                database=db_name,
+                query=query_params,
+            )
+            custom_url = url_obj.render_as_string(hide_password=False)
         else:
             # Non-test development/sandbox modes
             db_user = os.environ.get("COLLECTFLOW_DB_USER")
@@ -411,10 +467,26 @@ def get_database_url() -> str:
                 )
             db_host = os.environ.get("COLLECTFLOW_DB_HOST", "127.0.0.1")
             db_port = os.environ.get("COLLECTFLOW_DB_PORT", "5432")
+            port_val = int(db_port) if (db_port and str(db_port).isdigit()) else 5432
             db_name = os.environ.get("COLLECTFLOW_DB_NAME", "collectflow_dev")
-            custom_url = f"postgresql+psycopg://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
+            # Safe URL construction via URL.create() with automatic character escaping
+            url_obj = URL.create(
+                drivername="postgresql+psycopg",
+                username=db_user,
+                password=db_pass,
+                host=db_host,
+                port=port_val,
+                database=db_name,
+            )
+            custom_url = url_obj.render_as_string(hide_password=False)
 
     validate_database_url(custom_url, env_mode)
+
+    # Normalize plain postgresql to postgresql+psycopg
+    parsed = make_url(custom_url)
+    if parsed.drivername == "postgresql":
+        custom_url = parsed.set(drivername="postgresql+psycopg").render_as_string(hide_password=False)
+
     return custom_url
 
 

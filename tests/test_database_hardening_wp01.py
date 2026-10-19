@@ -1,22 +1,26 @@
 """Automated Security & PostgreSQL Isolation Hardening Tests (Release Preparation WP-01).
 
 Validates:
-1. Rejection of remote host in test mode.
+1. Rejection of remote host in test mode (preserved loopback isolation).
 2. Rejection of production database name in test mode.
 3. Rejection of production database name in dev mode.
 4. Rejection of SQLite driver in production mode.
-5. Acceptance of valid container hostname ('postgres') in production mode.
-6. Acceptance of valid internal IP ('10.0.1.50', '172.20.0.5', '192.168.1.100') in production mode.
-7. Acceptance of valid cloud endpoint ('mydb.xyz.rds.amazonaws.com') with sslmode=require in production mode.
-8. Rejection of remote cloud endpoint without TLS (sslmode=disable or missing sslmode).
+5. Acceptance of valid container hostnames ('postgres', 'db') in production mode.
+6. Defensible TLS classification: RFC 1918 private IPs require TLS unless explicitly in COLLECTFLOW_TRUSTED_CONTAINER_HOSTS.
+7. Acceptance of valid cloud endpoints with TLS (require, verify-ca, verify-full) in production mode.
+8. Rejection of remote cloud endpoints and public IPs without TLS.
 9. Password redaction in error messages when validation fails.
-10. Rejection of malformed DSN.
+10. Rejection of malformed DSN without leaking credential fragments.
 11. Rejection of missing credentials in production mode.
 12. Rejection of unrecognized COLLECTFLOW_ENV.
 13. Preserved test mode pass with valid loopback test DSN.
+14. Driver contract: explicit postgresql+psycopg preferred, plain postgresql normalized, unsupported drivers rejected.
+15. TLS trust classification: untrusted single-label and internal-looking hostnames fail closed without TLS.
+16. Safe credential handling: special reserved characters (@, :, /, #, ?) via URL.create roundtrip without parser errors.
 """
 
 import pytest
+from sqlalchemy.engine import make_url
 from app.core.database import (
     validate_isolated_database_url,
     validate_production_database_url,
@@ -25,8 +29,9 @@ from app.core.database import (
 )
 
 
-def test_01_reject_remote_host_in_test_mode():
-    """1. Test mode strictly forbids remote hosts and private non-loopback hosts."""
+def test_01_reject_remote_host_in_test_mode(monkeypatch):
+    """1. Test mode strictly forbids remote hosts, private non-loopback hosts, and container names."""
+    monkeypatch.delenv("COLLECTFLOW_TRUSTED_CONTAINER_HOSTS", raising=False)
     remote_urls = [
         "postgresql+psycopg://collectflow_user:secret@192.168.1.50:5432/collectflow_test",
         "postgresql+psycopg://collectflow_user:secret@10.0.0.5:5432/collectflow_test",
@@ -91,30 +96,45 @@ def test_04_reject_sqlite_driver_in_production_mode():
 
 
 def test_05_accept_valid_container_hostname_in_production_mode():
-    """5. Container networking hostnames (e.g. 'postgres') are accepted in production/staging mode."""
+    """5. Container networking hostnames ('postgres', 'db') are accepted in production/staging mode."""
     container_urls = [
         "postgresql+psycopg://collectflow_admin:ProdPassword123!@postgres:5432/collectflow_prod",
         "postgresql://collectflow_admin:ProdPassword123!@db:5432/collectflow_prod",
         "postgresql+psycopg://collectflow_admin:ProdPassword123!@collectflow-postgres:5432/collectflow_prod",
     ]
     for url in container_urls:
-        # Must not raise any exceptions
         validate_production_database_url(url, "production")
         validate_production_database_url(url, "staging")
         validate_database_url(url, "production")
 
 
-def test_06_accept_valid_internal_ips_in_production_mode():
-    """6. RFC1918 private IPs are accepted in production/staging mode."""
-    internal_ip_urls = [
+def test_06_rfc1918_private_ips_require_tls_or_trusted_configuration(monkeypatch):
+    """6. RFC 1918 private IPs require TLS unless explicitly configured in COLLECTFLOW_TRUSTED_CONTAINER_HOSTS."""
+    monkeypatch.delenv("COLLECTFLOW_TRUSTED_CONTAINER_HOSTS", raising=False)
+    insecure_ip_urls = [
         "postgresql+psycopg://collectflow_admin:ProdPassword123!@10.0.1.50:5432/collectflow_prod",
         "postgresql+psycopg://collectflow_admin:ProdPassword123!@172.20.0.5:5432/collectflow_staging",
         "postgresql+psycopg://collectflow_admin:ProdPassword123!@192.168.1.100:5432/collectflow_prod",
     ]
-    for url in internal_ip_urls:
+    # Without TLS or explicit trust, unencrypted private IPs must fail closed
+    for url in insecure_ip_urls:
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_production_database_url(url, "production")
+        assert "requires secure TLS encryption" in str(exc_info.value)
+
+    # With TLS (sslmode=require), private IPs pass cleanly
+    secure_ip_urls = [
+        "postgresql+psycopg://collectflow_admin:ProdPassword123!@10.0.1.50:5432/collectflow_prod?sslmode=require",
+        "postgresql+psycopg://collectflow_admin:ProdPassword123!@172.20.0.5:5432/collectflow_staging?sslmode=verify-ca",
+        "postgresql+psycopg://collectflow_admin:ProdPassword123!@192.168.1.100:5432/collectflow_prod?sslmode=verify-full",
+    ]
+    for url in secure_ip_urls:
         validate_production_database_url(url, "production")
-        validate_production_database_url(url, "staging")
         validate_database_url(url, "production")
+
+    # With explicit configuration in COLLECTFLOW_TRUSTED_CONTAINER_HOSTS, private IP is accepted
+    monkeypatch.setenv("COLLECTFLOW_TRUSTED_CONTAINER_HOSTS", "10.0.1.50,172.20.0.5")
+    validate_production_database_url("postgresql+psycopg://collectflow_admin:ProdPassword123!@10.0.1.50:5432/collectflow_prod", "production")
 
 
 def test_07_accept_valid_cloud_endpoint_with_tls_in_production_mode():
@@ -123,7 +143,6 @@ def test_07_accept_valid_cloud_endpoint_with_tls_in_production_mode():
         "postgresql+psycopg://collectflow_admin:ProdPassword123!@mydb.xyz.rds.amazonaws.com:5432/collectflow_prod?sslmode=require",
         "postgresql+psycopg://collectflow_admin:ProdPassword123!@mydb.xyz.rds.amazonaws.com:5432/collectflow_prod?sslmode=verify-ca",
         "postgresql+psycopg://collectflow_admin:ProdPassword123!@postgres.database.azure.com:5432/collectflow_prod?sslmode=verify-full",
-        "postgresql+psycopg://collectflow_admin:ProdPassword123!@cloudsql.gcp.internal:5432/collectflow_prod?sslmode=require",
     ]
     for url in cloud_urls:
         validate_production_database_url(url, "production")
@@ -131,8 +150,9 @@ def test_07_accept_valid_cloud_endpoint_with_tls_in_production_mode():
         validate_database_url(url, "production")
 
 
-def test_08_reject_remote_cloud_endpoint_without_tls():
+def test_08_reject_remote_cloud_endpoint_without_tls(monkeypatch):
     """8. Remote cloud endpoints or public IPs without required TLS encryption are rejected."""
+    monkeypatch.delenv("COLLECTFLOW_TRUSTED_CONTAINER_HOSTS", raising=False)
     insecure_urls = [
         # Missing sslmode
         "postgresql+psycopg://collectflow_admin:ProdPassword123!@mydb.xyz.rds.amazonaws.com:5432/collectflow_prod",
@@ -141,17 +161,17 @@ def test_08_reject_remote_cloud_endpoint_without_tls():
         # sslmode=prefer
         "postgresql+psycopg://collectflow_admin:ProdPassword123!@mydb.xyz.rds.amazonaws.com:5432/collectflow_prod?sslmode=prefer",
         # Public IP without TLS
-        "postgresql+psycopg://collectflow_admin:ProdPassword123!@198.51.100.25:5432/collectflow_prod",
-        "postgresql+psycopg://collectflow_admin:ProdPassword123!@198.51.100.25:5432/collectflow_prod?sslmode=disable",
+        "postgresql+psycopg://collectflow_admin:ProdPassword123!@54.215.10.25:5432/collectflow_prod",
+        "postgresql+psycopg://collectflow_admin:ProdPassword123!@54.215.10.25:5432/collectflow_prod?sslmode=disable",
     ]
     for url in insecure_urls:
         with pytest.raises(RuntimeError) as exc_info:
             validate_production_database_url(url, "production")
-        assert "requires TLS encryption" in str(exc_info.value)
+        assert "requires secure TLS encryption" in str(exc_info.value)
 
         with pytest.raises(RuntimeError) as exc_info2:
             validate_database_url(url, "production")
-        assert "requires TLS encryption" in str(exc_info2.value)
+        assert "requires secure TLS encryption" in str(exc_info2.value)
 
 
 def test_09_password_redaction_in_error_messages():
@@ -182,7 +202,7 @@ def test_09_password_redaction_in_error_messages():
 
 
 def test_10_reject_malformed_dsn():
-    """10. Malformed or empty database URLs are rejected with fail-closed errors."""
+    """10. Malformed or empty database URLs are rejected with fail-closed errors without leaking fragments."""
     malformed_cases = [
         "",
         None,
@@ -259,3 +279,94 @@ def test_13_preserved_test_mode_pass_with_valid_loopback_dsn(monkeypatch):
         monkeypatch.setenv("COLLECTFLOW_DATABASE_URL", url)
         resolved_url = get_database_url()
         assert resolved_url == url
+
+
+def test_14_driver_contract_validation_and_normalization(monkeypatch):
+    """14. WP01-01: Explicit postgresql+psycopg preferred, plain postgresql normalized, unsupported dialects rejected."""
+    # Positive A: explicit postgresql+psycopg
+    psycopg3_url = "postgresql+psycopg://collectflow_admin:SecretPass123!@postgres:5432/collectflow_prod"
+    validate_production_database_url(psycopg3_url, "production")
+
+    # Positive B: plain postgresql is normalized to postgresql+psycopg
+    plain_url = "postgresql://collectflow_admin:SecretPass123!@postgres:5432/collectflow_prod"
+    validate_production_database_url(plain_url, "production")
+    monkeypatch.setenv("COLLECTFLOW_ENV", "production")
+    monkeypatch.setenv("COLLECTFLOW_DATABASE_URL", plain_url)
+    resolved = get_database_url()
+    assert resolved.startswith("postgresql+psycopg://"), f"Failed to normalize: {resolved}"
+
+    # Negative C: unsupported drivers are rejected
+    unsupported_drivers = [
+        "postgresql+psycopg2://collectflow_admin:SecretPass123!@postgres:5432/collectflow_prod",
+        "postgresql+asyncpg://collectflow_admin:SecretPass123!@postgres:5432/collectflow_prod",
+        "postgresql+pg8000://collectflow_admin:SecretPass123!@postgres:5432/collectflow_prod",
+        "mysql+pymysql://collectflow_admin:SecretPass123!@postgres:3306/collectflow_prod",
+    ]
+    for bad_url in unsupported_drivers:
+        with pytest.raises(ValueError) as exc:
+            validate_production_database_url(bad_url, "production")
+        assert "not supported" in str(exc.value) or "Driver" in str(exc.value)
+
+
+def test_15_tls_trust_classification_untrusted_hostnames(monkeypatch):
+    """15. WP01-02: Untrusted single-label hostnames and internal-looking domain suffixes fail closed without TLS."""
+    monkeypatch.delenv("COLLECTFLOW_TRUSTED_CONTAINER_HOSTS", raising=False)
+
+    untrusted_hosts = [
+        "evilhost",
+        "untrusted-container",
+        "pgserver",
+        "database.internal",
+        "db.local",
+        "postgres.lan",
+        "pg.cluster.local",
+    ]
+    for host in untrusted_hosts:
+        bad_url = f"postgresql+psycopg://collectflow_admin:Secret123!@{host}:5432/collectflow_prod"
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_production_database_url(bad_url, "production")
+        assert "requires secure TLS encryption" in str(exc_info.value)
+        assert "not a trusted local container" in str(exc_info.value)
+
+    # When explicitly configured via COLLECTFLOW_TRUSTED_CONTAINER_HOSTS, custom host is allowed
+    monkeypatch.setenv("COLLECTFLOW_TRUSTED_CONTAINER_HOSTS", "custom-pg,my-mesh-db")
+    allowed_custom = "postgresql+psycopg://collectflow_admin:Secret123!@custom-pg:5432/collectflow_prod"
+    validate_production_database_url(allowed_custom, "production")
+
+    # In test mode, custom-pg and postgres are STILL forbidden (strict loopback only)
+    with pytest.raises(RuntimeError) as exc_test:
+        validate_isolated_database_url(allowed_custom, "test")
+    assert "Remote host" in str(exc_test.value)
+
+
+def test_16_safe_database_credential_handling(monkeypatch):
+    """16. WP01-03: Special characters in credentials safely roundtrip via URL.create; malformed DSNs fail closed."""
+    # Special characters in password (@, :, /, ?, #, &, !)
+    complex_password = "P@ss:w0rd!#/?&=%"
+    monkeypatch.setenv("COLLECTFLOW_ENV", "production")
+    monkeypatch.delenv("COLLECTFLOW_DATABASE_URL", raising=False)
+    monkeypatch.setenv("COLLECTFLOW_DB_USER", "admin_user")
+    monkeypatch.setenv("COLLECTFLOW_DB_PASSWORD", complex_password)
+    monkeypatch.setenv("COLLECTFLOW_DB_HOST", "postgres")
+    monkeypatch.setenv("COLLECTFLOW_DB_NAME", "collectflow_prod")
+
+    resolved_url = get_database_url()
+    parsed = make_url(resolved_url)
+    assert parsed.password == complex_password, f"Password mismatch: expected {complex_password}, got {parsed.password}"
+    assert parsed.username == "admin_user"
+    assert parsed.host == "postgres"
+
+    # Verify that raw complex password never appears in sanitized DSN
+    from app.core.database import sanitize_dsn
+    safe_rendered = sanitize_dsn(resolved_url)
+    assert complex_password not in safe_rendered
+    assert "***" in safe_rendered
+
+    # Malformed raw DSN with unencoded '@' fails closed without leaking password fragments
+    malformed_raw = "postgresql+psycopg://admin:my@secret:fragment@postgres:5432/collectflow_prod"
+    with pytest.raises(ValueError) as exc_info:
+        validate_production_database_url(malformed_raw, "production")
+    err_text = str(exc_info.value)
+    assert "fragment" not in err_text
+    assert "secret" not in err_text
+    assert "CRITICAL ISOLATION ERROR" in err_text
