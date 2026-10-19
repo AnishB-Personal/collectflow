@@ -196,14 +196,25 @@ def authenticate_and_consume_export_ticket(
     Authenticates export requests:
     - Every download requires a valid single-use export ticket; bearer authorization alone
       CANNOT bypass ticket validation.
-    - User identity and admin/finance RBAC checks enforced.
+    - Every download requires a valid single-use export ticket.
+    - User identity and active session required (caller authenticated via session cookie or bearer).
+    - Caller must have admin or finance role and must not have pending password rotation.
+    - Caller identity must match the user to whom the ticket was issued.
     - Format, FY and scope validated against exact canonical values recorded at issuance.
-    - Atomically consumed under PostgreSQL row lock (SELECT FOR UPDATE).
+    - Atomically consumed under PostgreSQL row lock (SELECT FOR UPDATE) ONLY after all authorization checks pass.
     """
     if not ticket or not ticket.strip():
         raise HTTPException(
             status_code=401,
             detail="Export download requires a valid single-use export ticket. Bearer authorization alone cannot bypass ticket requirement.",
+        )
+
+    # 1. Authenticate caller (cookie session or bearer) and enforce active status + password rotation policy
+    caller = get_current_user(request=request, authorization=authorization)
+    if caller.get("role") not in ("admin", "finance"):
+        raise HTTPException(
+            status_code=403,
+            detail="Export generation requires admin or finance privileges.",
         )
 
     req_path = request.url.path.lower()
@@ -244,26 +255,19 @@ def authenticate_and_consume_export_ticket(
                 detail="Invalid, expired, or already consumed export ticket.",
             )
 
+        # 2. Verify ticket ownership: caller must match ticket recipient
+        if caller.get("id") != ticket_row.user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Export ticket was issued to a different user.",
+            )
+
         owner = db.query(User).filter(User.id == ticket_row.user_id).first()
-        if not owner or owner.role not in ("admin", "finance"):
+        if not owner or not owner.is_active or owner.role not in ("admin", "finance"):
             raise HTTPException(
                 status_code=403,
                 detail="Export generation requires admin or finance privileges.",
             )
-
-        # User binding: If Bearer header is present, ensure caller matches ticket owner
-        if authorization and authorization.startswith("Bearer "):
-            bearer_user = get_current_user(authorization=authorization, bearer_creds=None)
-            if bearer_user.get("id") != ticket_row.user_id:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Export ticket was issued to a different user.",
-                )
-            if bearer_user.get("role") not in ("admin", "finance"):
-                raise HTTPException(
-                    status_code=403,
-                    detail="Export generation requires admin or finance privileges.",
-                )
 
         # Format binding check
         if ticket_row.format and req_format:

@@ -49,13 +49,44 @@ def is_production_or_staging_env(env_mode: Optional[str] = None) -> bool:
     return any(token in mode for token in PRODUCTION_STAGING_ENV_TOKENS)
 
 
+def _read_secret_from_env_or_file(env_var: str, file_var: str) -> Optional[str]:
+    file_path = os.environ.get(file_var)
+    if file_path and os.path.isfile(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            val = f.read().strip()
+            if val:
+                return val
+    val = os.environ.get(env_var)
+    if val and val.strip():
+        return val.strip()
+    return None
+
+
 def get_csrf_secret() -> bytes:
-    """Return the secret key used for HMAC-SHA256 CSRF token binding."""
+    """Return the secret key used for HMAC-SHA256 CSRF token binding.
+
+    In production and staging, strictly requires a persistent configured secret
+    via COLLECTFLOW_CSRF_SECRET_FILE, COLLECTFLOW_CSRF_SECRET,
+    COLLECTFLOW_SECRET_KEY_FILE, or COLLECTFLOW_SECRET_KEY (minimum 32 characters).
+    Fails closed if missing or insecure.
+    In local dev/test, falls back to a persistent startup secret.
+    """
     secret = (
-        os.environ.get("COLLECTFLOW_CSRF_SECRET")
-        or os.environ.get("COLLECTFLOW_SECRET_KEY")
-        or _STARTUP_SECRET
+        _read_secret_from_env_or_file("COLLECTFLOW_CSRF_SECRET", "COLLECTFLOW_CSRF_SECRET_FILE")
+        or _read_secret_from_env_or_file("COLLECTFLOW_SECRET_KEY", "COLLECTFLOW_SECRET_KEY_FILE")
     )
+
+    if is_production_or_staging_env():
+        if not secret or len(secret) < 32:
+            raise RuntimeError(
+                "CRITICAL SECURITY VIOLATION: Stable CSRF secret must be configured in production/staging "
+                "environments via COLLECTFLOW_CSRF_SECRET, COLLECTFLOW_CSRF_SECRET_FILE, "
+                "COLLECTFLOW_SECRET_KEY, or COLLECTFLOW_SECRET_KEY_FILE (minimum 32 characters)."
+            )
+        return secret.encode("utf-8")
+
+    if not secret:
+        secret = _STARTUP_SECRET
     return secret.encode("utf-8")
 
 
@@ -142,15 +173,35 @@ def set_session_cookies(response: Response, raw_token: str, csrf_token: str) -> 
 
 
 def clear_session_cookies(response: Response) -> None:
-    """Clear all possible authentication and CSRF cookies from the client browser."""
-    cookie_names = ["__Host-collectflow_session", "collectflow_dev_session", "collectflow_csrf_token"]
-    for name in cookie_names:
-        response.delete_cookie(
-            key=name,
-            path="/",
-            domain=None,
-            samesite="lax",
-        )
+    """Clear all possible authentication and CSRF cookies from the client browser.
+
+    RFC 6265bis requires that '__Host-' cookies must be deleted with secure=True, path='/',
+    and domain=None to be accepted by secure browsers.
+    """
+    response.delete_cookie(
+        key="__Host-collectflow_session",
+        path="/",
+        domain=None,
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+    response.delete_cookie(
+        key="collectflow_dev_session",
+        path="/",
+        domain=None,
+        secure=is_session_cookie_secure(),
+        httponly=True,
+        samesite="lax",
+    )
+    response.delete_cookie(
+        key="collectflow_csrf_token",
+        path="/",
+        domain=None,
+        secure=is_session_cookie_secure(),
+        httponly=False,
+        samesite="lax",
+    )
 
 
 def generate_csrf_token(session_token_hash: str) -> str:

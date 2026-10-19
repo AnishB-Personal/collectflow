@@ -282,6 +282,17 @@ def setup_db(test_db_path):
     ]:
         conn.execute(f"DELETE FROM {tbl};")
 
+    try:
+        from app.core.database import get_db_session
+        from app.models.domain_models import LoginAttempt, User
+        from sqlalchemy import delete, update
+        with get_db_session() as db:
+            db.execute(delete(LoginAttempt))
+            db.execute(update(User).where(User.username.like("sandbox_%")).values(must_change_password=False))
+            db.commit()
+    except Exception:
+        pass
+
     # Seed standard FYs
     conn.execute(
         "INSERT INTO financial_years (code, start_date, end_date, is_active) VALUES ('FY 2026-27', '2026-04-01', '2027-03-31', 1);"

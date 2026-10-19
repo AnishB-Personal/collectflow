@@ -189,12 +189,29 @@ def extract_auth_credential(
     """
     raw_cookie_token = None
     if request is not None:
-        cookie_name = get_session_cookie_name()
-        raw_cookie_token = request.cookies.get(cookie_name)
-        if not raw_cookie_token:
-            # Check alternate dev/host cookie in non-prod
-            alt_name = "collectflow_dev_session" if cookie_name == "__Host-collectflow_session" else "__Host-collectflow_session"
-            raw_cookie_token = request.cookies.get(alt_name)
+        host_cookie = request.cookies.get("__Host-collectflow_session")
+        dev_cookie = request.cookies.get("collectflow_dev_session")
+
+        # Reject conflicting session cookies if both are provided
+        if host_cookie and dev_cookie and host_cookie != dev_cookie:
+            raise HTTPException(
+                status_code=401,
+                detail="Ambiguous authentication: conflicting session cookies provided.",
+            )
+
+        if is_production_or_staging_env():
+            if dev_cookie is not None:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Development session cookie 'collectflow_dev_session' is forbidden in production/staging environments. Secure cookie '__Host-collectflow_session' required.",
+                )
+            raw_cookie_token = host_cookie
+        else:
+            cookie_name = get_session_cookie_name()
+            if cookie_name == "__Host-collectflow_session":
+                raw_cookie_token = host_cookie or dev_cookie
+            else:
+                raw_cookie_token = dev_cookie or host_cookie
 
     raw_bearer_token = None
     if bearer_creds and hasattr(bearer_creds, "credentials") and bearer_creds.credentials:

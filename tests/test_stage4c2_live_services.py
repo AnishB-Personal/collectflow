@@ -115,7 +115,7 @@ def test_user_management_rbac_and_crud():
     # Admin creates new user
     create_resp = client.post(
         "/api/users",
-        json={"username": "new_consultant", "password": "password123", "full_name": "Test Consultant", "role": "sales"},
+        json={"username": "new_consultant", "password": "ConsultantPass123!", "full_name": "Test Consultant", "role": "sales"},
         headers=admin_headers,
     )
     assert create_resp.status_code == 200, create_resp.text

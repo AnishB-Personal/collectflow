@@ -225,6 +225,12 @@ def test_h07_concurrent_last_admin_demotion_race():
     assert c_res.status_code == 200
     admin2_id = c_res.json()["user_id"]
 
+    with get_db_session() as db:
+        u2 = db.scalar(select(User).where(User.id == admin2_id))
+        if u2:
+            u2.must_change_password = False
+            db.commit()
+
     login_admin2 = client.post("/api/auth/login", json={"username": "temp_admin_2", "password": "AdminPass456!"})
     assert login_admin2.status_code == 200
     admin2_token = login_admin2.json()["token"]

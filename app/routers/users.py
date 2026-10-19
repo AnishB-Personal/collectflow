@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy import delete, func, select, text
 from app.core.database import get_db_session
 from app.models.domain_models import CommercialInvoice, SessionModel, User
+from app.core.auth_security import validate_strong_password
 from app.routers.auth import (
     get_current_user,
     hash_password_argon2,
@@ -80,8 +81,7 @@ def list_users(current_user: dict = Depends(get_current_user)):
 @router.post("")
 def create_user(item: UserCreate, current_user: dict = Depends(require_admin)):
     uname = validate_username(item.username)
-    if len(item.password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    validate_strong_password(item.password)
 
     role = (item.role or "sales").lower()
     if role not in VALID_ROLES:
@@ -98,6 +98,7 @@ def create_user(item: UserCreate, current_user: dict = Depends(require_admin)):
             role=role,
             full_name=item.full_name.strip() if item.full_name else None,
             is_active=True,
+            must_change_password=True,
         )
         db.add(new_user)
         db.flush()
@@ -123,8 +124,7 @@ def create_user(item: UserCreate, current_user: dict = Depends(require_admin)):
 @router.put("/{user_id}/password")
 def reset_user_password(user_id: int, item: PasswordReset, current_user: dict = Depends(require_admin)):
     """Admin-only password reset for managed accounts."""
-    if len(item.new_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    validate_strong_password(item.new_password)
 
     with get_db_session() as db:
         user = db.scalar(select(User).where(User.id == user_id).with_for_update())
@@ -132,6 +132,7 @@ def reset_user_password(user_id: int, item: PasswordReset, current_user: dict = 
             raise HTTPException(status_code=404, detail="User not found")
 
         user.password_hash = hash_password_argon2(item.new_password)
+        user.must_change_password = True
         # Immediately invalidate all active sessions for the target user
         db.execute(delete(SessionModel).where(SessionModel.user_id == user_id))
 
