@@ -70,6 +70,7 @@ def list_users(current_user: dict = Depends(get_current_user)):
                 "role": u.role,
                 "full_name": u.full_name,
                 "is_active": u.is_active,
+                "must_change_password": getattr(u, "must_change_password", False),
                 "created_at": u.created_at.isoformat() if u.created_at else None,
             }
             for u in users

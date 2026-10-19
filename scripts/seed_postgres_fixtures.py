@@ -54,26 +54,65 @@ from app.models.domain_models import (
 ph = PasswordHasher()
 
 
+def verify_seeder_safety(db):
+    """
+    Rigorously enforce synthetic fixture seeder safety invariants.
+    Every invocation of fixture seeding (whether reset or non-reset) MUST require:
+    - COLLECTFLOW_ENV='test'
+    - Database name exactly 'collectflow_test'
+    - Strict loopback-only database host (127.0.0.1, localhost, ::1)
+    - Approved non-production database user ('collectflow_test', 'collectflow_user', 'postgres')
+    - Disallow all production tokens in db_name, host, and username
+    """
+    db_url = db.bind.url
+    raw_host = getattr(db_url, "host", "") or ""
+    host = str(raw_host).strip().lower().strip("[]")
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise RuntimeError(
+            f"CRITICAL SAFETY ABORT: Synthetic fixture seeding forbidden on non-loopback host '{host}'. "
+            "Database must reside strictly on loopback interfaces ('127.0.0.1', 'localhost', '::1')."
+        )
+
+    env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
+    raw_db_name = getattr(db_url, "database", "") or ""
+    db_name = str(raw_db_name).strip().lower()
+
+    if env_mode != "test" or db_name != "collectflow_test":
+        raise RuntimeError(
+            f"CRITICAL SAFETY ABORT: Synthetic fixture seeding is strictly restricted to test environment only. "
+            f"Requires BOTH COLLECTFLOW_ENV='test' (got '{env_mode}') and database name 'collectflow_test' (got '{db_name}'). "
+            f"Reset attempts against development ('collectflow_dev'), sandbox ('collectflow_sandbox'), "
+            f"integration ('collectflow_integration'), or production databases are strictly rejected."
+        )
+
+    # Disallow production tokens in host, database name, and username
+    for token in ("prod", "production", "live_prod"):
+        if token in db_name or token in host:
+            raise RuntimeError(
+                f"CRITICAL SAFETY ABORT: Production token '{token}' detected in database target (db='{db_name}', host='{host}')."
+            )
+
+    raw_user = getattr(db_url, "username", None)
+    if isinstance(raw_user, str) and raw_user:
+        user = raw_user.strip().lower()
+        for token in ("prod", "production", "live_prod"):
+            if token in user:
+                raise RuntimeError(
+                    f"CRITICAL SAFETY ABORT: Production token '{token}' detected in database user '{user}'."
+                )
+        if user not in {"collectflow_test", "collectflow_user", "postgres"}:
+            raise RuntimeError(
+                f"CRITICAL SAFETY ABORT: Synthetic fixture seeding forbidden with database user '{user}'. "
+                "Requires approved non-production database user ('collectflow_test', 'collectflow_user', 'postgres')."
+            )
+
+
 def seed_fixtures(reset: bool = False):
     with get_db_session() as db:
+        verify_seeder_safety(db)
+
         if reset:
-            env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
-            db_name = (db.bind.url.database or "").strip().lower()
-            host = (db.bind.url.host or "").strip().lower()
-
-            if host not in {"127.0.0.1", "localhost", "::1"}:
-                raise RuntimeError(
-                    f"CRITICAL SAFETY ABORT: Destructive reset forbidden on non-loopback host '{host}'."
-                )
-
-            if env_mode != "test" or db_name != "collectflow_test":
-                raise RuntimeError(
-                    f"CRITICAL SAFETY ABORT: Destructive baseline reset is strictly restricted to test environment only. "
-                    f"Requires BOTH COLLECTFLOW_ENV='test' (got '{env_mode}') and database name 'collectflow_test' (got '{db_name}'). "
-                    f"Reset attempts against development ('collectflow_dev'), sandbox ('collectflow_sandbox'), "
-                    f"integration ('collectflow_integration'), or production databases are strictly rejected."
-                )
-            print(f"Resetting database '{db_name}' (env='{env_mode}') to pure baseline fixtures...")
+            print(f"Resetting database '{db.bind.url.database}' to pure baseline fixtures...")
             from sqlalchemy import text
             db.execute(text("TRUNCATE TABLE export_tickets, sessions, payment_transactions, commercial_invoice_items, commercial_invoices, purchase_order_items, purchase_orders, sales_targets, audit_logs, customers, users RESTART IDENTITY CASCADE;"))
             db.commit()
@@ -122,10 +161,10 @@ def seed_fixtures(reset: bool = False):
 
         # 4. Synthetic Users with Argon2id
         users = [
-            User(username="sandbox_admin", password_hash=ph.hash("AdminPass123!"), full_name="Sandbox Administrator", role="admin", is_active=True),
-            User(username="sandbox_finance", password_hash=ph.hash("FinancePass123!"), full_name="Sandbox Finance Lead", role="finance", is_active=True),
-            User(username="sandbox_sales", password_hash=ph.hash("SalesPass123!"), full_name="Sandbox Sales Executive", role="sales", is_active=True),
-            User(username="sandbox_viewer", password_hash=ph.hash("ViewerPass123!"), full_name="Sandbox Audit Viewer", role="viewer", is_active=True),
+            User(username="sandbox_admin", password_hash=ph.hash("AdminPass123!"), full_name="Sandbox Administrator", role="admin", is_active=True, must_change_password=False),
+            User(username="sandbox_finance", password_hash=ph.hash("FinancePass123!"), full_name="Sandbox Finance Lead", role="finance", is_active=True, must_change_password=False),
+            User(username="sandbox_sales", password_hash=ph.hash("SalesPass123!"), full_name="Sandbox Sales Executive", role="sales", is_active=True, must_change_password=False),
+            User(username="sandbox_viewer", password_hash=ph.hash("ViewerPass123!"), full_name="Sandbox Audit Viewer", role="viewer", is_active=True, must_change_password=False),
         ]
         for u in users:
             if not db.scalar(select(User).where(User.username == u.username)):

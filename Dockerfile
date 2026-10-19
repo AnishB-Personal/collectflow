@@ -30,6 +30,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
 COPY --chown=collectflow:collectflow app/ ./app/
 COPY --chown=collectflow:collectflow migrations/ ./migrations/
 COPY --chown=collectflow:collectflow static/ ./static/
+COPY --chown=collectflow:collectflow scripts/init_production_db.py ./scripts/init_production_db.py
 COPY --chown=collectflow:collectflow alembic.ini ./
 
 USER collectflow:collectflow

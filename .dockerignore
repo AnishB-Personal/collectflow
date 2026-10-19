@@ -16,3 +16,4 @@ tests
 docs
 *.log
 .env*
+scripts/seed_postgres_fixtures.py

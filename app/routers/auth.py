@@ -200,6 +200,7 @@ def get_current_user(
             "role": user.role,
             "full_name": user.full_name,
             "is_active": user.is_active,
+            "must_change_password": getattr(user, "must_change_password", False),
             "expires_at": session.expires_at.isoformat() if session.expires_at else None,
         }
 
@@ -289,6 +290,7 @@ def login(req: LoginRequest, request: Request):
                 "username": user.username,
                 "role": user.role,
                 "full_name": user.full_name,
+                "must_change_password": getattr(user, "must_change_password", False),
             },
         }
 
