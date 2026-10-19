@@ -7,10 +7,10 @@
 
 ### 1. Git Baseline and Implementation Checkpoints
 
-| Repository | Branch | Commit Hash | Baseline (Accepted WP-03 / WP-02) |
+| Repository | Branch | Commit Hash (Security Corrections Applied) | Baseline (Accepted WP-03 / WP-02) |
 | :--- | :--- | :--- | :--- |
-| **Backend (`collectflow`)** | `feature/release-wp04-secure-auth-sessions` | `a3f871013ecc78d82d9d8dd6aad7b28231944cb2` | `b21f26a82ffd50f67b17d0ca0b20b5df9c3907d0` |
-| **Frontend (`cash-flow-buddy-101`)** | `feature/release-wp04-secure-auth-sessions` | `4b058aa8f444ee6c41428f44cd9de47b0658604d` | `8907890900fff40d5eafebe2a08540da17e697a7` |
+| **Backend (`collectflow`)** | `feature/release-wp04-secure-auth-sessions` | `c3887267669945c407458afbf85483b9dde8646b` | `b21f26a82ffd50f67b17d0ca0b20b5df9c3907d0` |
+| **Frontend (`cash-flow-buddy-101`)** | `feature/release-wp04-secure-auth-sessions` | `3476b7f715d428320f766f0d93ea4b0d6da0f64a` | `8907890900fff40d5eafebe2a08540da17e697a7` |
 
 Both branches were branched directly from their respective accepted parent baselines, pushed to remote origins, and verified with clean working trees.
 
