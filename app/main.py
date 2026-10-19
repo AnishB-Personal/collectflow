@@ -30,16 +30,19 @@ logger = logging.getLogger("collectflow")
 
 app = FastAPI(title="CollectFlow", description="Order-to-Cash & Accounts Receivable Management System")
 
-# Configure exact-origin CORS middleware
-raw_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000")
+# Configure exact-origin CORS middleware (strictly non-wildcard for credentialed requests)
+raw_origins = os.environ.get(
+    "CORS_ALLOWED_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://127.0.0.1:8080",
+)
 allowed_origins = [o.strip() for o in raw_origins.split(",") if o.strip() and o.strip() != "*"]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_credentials=False,
+    allow_credentials=bool(allowed_origins and "*" not in allowed_origins),
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID", "X-CSRF-Token"],
     max_age=600,
 )
 

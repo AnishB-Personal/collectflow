@@ -11,6 +11,7 @@ if os.path.exists(test_env_path):
                 os.environ.setdefault(k.strip(), v.strip())
 
 os.environ.setdefault("COLLECTFLOW_ENV", "test")
+os.environ.setdefault("COLLECTFLOW_ALLOW_BEARER_AUTH", "true")
 
 import pytest
 from fastapi.testclient import TestClient
