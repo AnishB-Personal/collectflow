@@ -6,15 +6,17 @@ Enforces:
 1. Verification of environment mode and target database configuration.
 2. Verification of expected Alembic schema revision ('77e73a1cb221').
 3. Strict refusal of test databases ('collectflow_test') or unknown/unsafe targets.
-4. Pre-existing business and identity data validation (fails closed if non-empty or inconsistent).
+4. Pre-existing business and identity data validation (fails closed if non-empty, inconsistent, or unprovenanced).
 5. Transaction-scoped PostgreSQL advisory lock serialization (pg_advisory_xact_lock) for administrator bootstrap.
-6. Secure bootstrap of exactly one administrator with Argon2id hash and must_change_password=True.
-7. Refusal of missing, empty, weak, or known synthetic/demo passwords and usernames.
-8. Atomic idempotent execution: repeated runs perform a safe verified no-op without resetting passwords.
-9. Controlled statutory reference data initialization: DEFERRED by default pending formal Finance sign-offs,
-   only populated when an explicit, versioned, Finance-approved configuration is supplied.
-10. Safe verification-only mode (--verify-only) performing zero writes.
-11. Strict omission of synthetic customers, orders, invoices, payments, or targets.
+6. Verification of bootstrap provenance on repeat initialization using stable identifiers (user_id / entity_id).
+7. Secure bootstrap of exactly one administrator with Argon2id hash and must_change_password=True.
+8. Refusal of missing, empty, weak, or known synthetic/demo passwords and usernames.
+9. Atomic idempotent execution: repeated runs perform a safe verified no-op without resetting passwords.
+10. Controlled statutory reference data initialization: DEFERRED by default pending formal Finance sign-offs,
+    only populated when an explicit, versioned, genuine Finance-approved configuration is supplied.
+11. Explicit rejection of synthetic test fixtures for production authorization (TEST ONLY — NOT FINANCE APPROVED).
+12. Safe verification-only mode (--verify-only) performing zero writes.
+13. Strict omission of synthetic customers, orders, invoices, payments, or targets.
 """
 
 import argparse
@@ -132,8 +134,8 @@ def get_bootstrap_admin_credentials() -> tuple[str, str | None]:
 def verify_target_environment(db) -> dict:
     """
     Rigorously verify environment mode, database configuration, Alembic schema revision,
-    and pre-existing business and identity state.
-    Fails closed on unsafe, test, corrupted, or mismatched database targets.
+    pre-existing business data, and identity provenance (WP03-R01).
+    Fails closed on unsafe, test, corrupted, unprovenanced, or mismatched database targets.
     """
     env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
     if not env_mode:
@@ -186,7 +188,7 @@ def verify_target_environment(db) -> dict:
             "Production initializer can only initialize clean application databases."
         )
 
-    # Check identity and session state (WP03-03)
+    # Check identity and session state (WP03-03 and WP03-R01)
     user_count = db.scalar(select(func.count()).select_from(User)) or 0
     admin_count = db.scalar(select(func.count()).select_from(User).where(User.role == "admin")) or 0
     session_count = db.scalar(select(func.count()).select_from(SessionModel)) or 0
@@ -210,14 +212,48 @@ def verify_target_environment(db) -> dict:
                 "CRITICAL INITIALIZATION ERROR: Administrator account exists but is inactive. "
                 "Cannot verify legitimate bootstrap state."
             )
-        bootstrap_audit = db.scalar(select(AuditLog).where(AuditLog.action == "ADMIN_BOOTSTRAPPED").limit(1))
-        if bootstrap_audit and not any(a.username == bootstrap_audit.username for a in active_admins):
+
+        # WP03-R01: Rigorous Bootstrap Provenance Verification
+        bootstrap_audits = db.scalars(select(AuditLog).where(AuditLog.action == "ADMIN_BOOTSTRAPPED")).all()
+        if len(bootstrap_audits) == 0:
             raise RuntimeError(
-                f"CRITICAL INITIALIZATION ERROR: Bootstrap audit trail inconsistency detected. "
-                f"Audit record is for '{bootstrap_audit.username}', but active admin accounts are {[a.username for a in active_admins]}."
+                "CRITICAL INITIALIZATION ERROR: Pre-existing administrator account exists, "
+                "but required bootstrap provenance audit evidence (action='ADMIN_BOOTSTRAPPED') is completely missing. "
+                "Cannot verify legitimate initialization provenance on repeat run."
+            )
+        if len(bootstrap_audits) > 1:
+            raise RuntimeError(
+                f"CRITICAL INITIALIZATION ERROR: Ambiguous or duplicate bootstrap audit records detected ({len(bootstrap_audits)} records). "
+                "Exactly one initial bootstrap provenance record is permitted."
+            )
+
+        audit = bootstrap_audits[0]
+        # Match using stable identifiers: user_id or entity_id
+        matching_admin = next(
+            (a for a in active_admins if a.id == audit.user_id or str(a.id) == str(audit.entity_id)),
+            None,
+        )
+        if not matching_admin:
+            raise RuntimeError(
+                f"CRITICAL INITIALIZATION ERROR: Bootstrap provenance mismatch. "
+                f"Bootstrap audit record user_id={audit.user_id} (entity_id='{audit.entity_id}') "
+                f"does not match any active administrator account (active admin IDs: {[a.id for a in active_admins]})."
+            )
+        if matching_admin.username != audit.username or matching_admin.role != "admin":
+            raise RuntimeError(
+                f"CRITICAL INITIALIZATION ERROR: Bootstrap provenance identifier conflict. "
+                f"Audit record user_id={audit.user_id} specifies username '{audit.username}' and role 'admin', "
+                f"but active user #{matching_admin.id} has username '{matching_admin.username}' / role '{matching_admin.role}'."
             )
         identity_state = "already_initialized"
     else:
+        # Check that no orphaned bootstrap audit logs exist in empty user table
+        orphaned_audits = db.scalar(select(func.count()).select_from(AuditLog).where(AuditLog.action == "ADMIN_BOOTSTRAPPED")) or 0
+        if orphaned_audits > 0:
+            raise RuntimeError(
+                f"CRITICAL INITIALIZATION ERROR: Inconsistent identity state: {orphaned_audits} bootstrap audit records "
+                "exist, but user table is empty. Target database identity state is corrupted."
+            )
         identity_state = "clean_first_time"
 
     return {
@@ -231,11 +267,18 @@ def verify_target_environment(db) -> dict:
     }
 
 
-def load_reference_config(config_path: str | None = None) -> dict | None:
+def load_reference_config(
+    config_path: str | None = None,
+    allow_test_fixture: bool = False,
+) -> dict | None:
     """
     Load and validate an explicit, versioned, Finance-approved statutory reference configuration file.
     Returns None if no configuration file is provided (indicating reference data should be deferred).
-    Fails closed if the file is missing, invalid JSON, or not approved by Finance.
+    Fails closed if the file is missing, invalid JSON, a synthetic test fixture in production,
+    or not approved by Finance.
+
+    NOTE: Self-declared JSON fields alone do not independently prove Finance authorization.
+    Configuration provenance must be corroborated against formal signed corporate finance governance records (BPD-01/02).
     """
     path_str = config_path or os.environ.get("COLLECTFLOW_STATUTORY_REFERENCE_CONFIG_FILE")
     if not path_str:
@@ -254,29 +297,66 @@ def load_reference_config(config_path: str | None = None) -> dict | None:
     if not isinstance(data, dict):
         raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config must be a JSON object.")
 
-    # 1. Validation of approval metadata
-    approval_status = str(data.get("approval_status", "")).strip().lower()
-    if approval_status != "approved":
-        raise ValueError(
-            f"CRITICAL CONFIGURATION ERROR: Statutory reference config is not approved by Finance "
-            f"(approval_status='{data.get('approval_status')}', expected 'approved'). "
-            "Unapproved statutory reference values cannot be populated."
-        )
+    # 1. Detection and rejection of synthetic test fixtures (WP03-R02)
+    is_test_fixture = bool(data.get("is_test_fixture", False))
+    raw_status = str(data.get("approval_status", "")).strip()
+    raw_approver = str(data.get("approved_by", "")).strip()
+    raw_ref = str(data.get("approval_reference", "")).strip()
 
-    approved_by = str(data.get("approved_by", "")).strip()
-    if not approved_by:
+    if is_test_fixture or "TEST" in raw_status.upper() or "TEST" in raw_approver.upper() or "TEST" in raw_ref.upper():
+        if not allow_test_fixture:
+            raise ValueError(
+                "CRITICAL CONFIGURATION REJECTED: Synthetic test configuration fixture detected ('TEST ONLY — NOT FINANCE APPROVED'). "
+                "Synthetic test fixtures cannot authorize production reference-data insertion. "
+                "Genuine Finance Directorate authorization provenance is required."
+            )
+
+    # 2. Validation of approval metadata and provenance
+    approval_status = raw_status.lower()
+    if approval_status not in {"approved", "finance_approved"}:
+        if not (allow_test_fixture and "test" in approval_status):
+            raise ValueError(
+                f"CRITICAL CONFIGURATION ERROR: Statutory reference config is not approved by Finance "
+                f"(approval_status='{data.get('approval_status')}', expected 'finance_approved'). "
+                "Unapproved statutory reference values cannot be populated."
+            )
+
+    if not raw_approver:
         raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config missing required 'approved_by' metadata.")
+
+    if not raw_ref:
+        raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config missing required 'approval_reference' governance ID.")
+
+    approval_date = str(data.get("approval_date", "")).strip()
+    if not approval_date:
+        raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config missing required 'approval_date' metadata.")
+    try:
+        date.fromisoformat(approval_date)
+    except Exception:
+        raise ValueError(f"CRITICAL CONFIGURATION ERROR: Invalid approval_date format '{approval_date}', expected ISO YYYY-MM-DD.")
+
+    controlled_source = str(data.get("controlled_source", "")).strip()
+    if not controlled_source:
+        raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config missing required 'controlled_source' metadata.")
 
     config_version = str(data.get("config_version", "")).strip()
     if not config_version:
         raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config missing required 'config_version' metadata.")
 
-    # 2. Validation of policy references
+    effective_date = str(data.get("effective_date", "")).strip()
+    if not effective_date:
+        raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config missing required 'effective_date' metadata.")
+    try:
+        date.fromisoformat(effective_date)
+    except Exception:
+        raise ValueError(f"CRITICAL CONFIGURATION ERROR: Invalid effective_date format '{effective_date}', expected ISO YYYY-MM-DD.")
+
+    # 3. Validation of policy references
     policy_refs = data.get("policy_references", [])
     if not isinstance(policy_refs, list) or not policy_refs:
         raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config must list applicable policy references (e.g. BPD-01, BPD-02).")
 
-    # 3. Payload validation
+    # 4. Payload validation
     if "financial_years" not in data or not isinstance(data["financial_years"], list):
         raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config missing 'financial_years' list.")
     if "gst_rates" not in data or not isinstance(data["gst_rates"], list):
@@ -365,12 +445,14 @@ def init_reference_data(db, ref_config: dict | None = None, verify_only: bool = 
         "status": "initialized",
         "config_version": ref_config.get("config_version"),
         "approved_by": ref_config.get("approved_by"),
+        "approval_reference": ref_config.get("approval_reference"),
         "financial_years": results["financial_years"],
         "gst_rates": results["gst_rates"],
         "tds_sections": results["tds_sections"],
         "message": (
             f"Successfully populated reference data from Finance-approved config "
-            f"v{ref_config.get('config_version')} (approved by {ref_config.get('approved_by')})."
+            f"v{ref_config.get('config_version')} (approved by {ref_config.get('approved_by')}, "
+            f"ref: {ref_config.get('approval_reference')})."
         ),
     }
 
@@ -397,6 +479,22 @@ def bootstrap_administrator(
                 f"CRITICAL INITIALIZATION ERROR: Administrator account '{existing_admin.username}' exists but is inactive. "
                 "Cannot perform safe bootstrap or verification with an inactive administrator."
             )
+        # Verify bootstrap provenance on repeat bootstrap call (WP03-R01)
+        bootstrap_audits = db.scalars(select(AuditLog).where(AuditLog.action == "ADMIN_BOOTSTRAPPED")).all()
+        if len(bootstrap_audits) == 0:
+            raise RuntimeError(
+                f"CRITICAL INITIALIZATION ERROR: Administrator account '{existing_admin.username}' exists, "
+                "but expected bootstrap provenance audit record is missing. Refusing repeat bootstrap."
+            )
+        if len(bootstrap_audits) > 1:
+            raise RuntimeError(
+                f"CRITICAL INITIALIZATION ERROR: Ambiguous or duplicate bootstrap audit records detected ({len(bootstrap_audits)} records)."
+            )
+        audit = bootstrap_audits[0]
+        if audit.user_id != existing_admin.id and str(audit.entity_id) != str(existing_admin.id):
+            raise RuntimeError(
+                f"CRITICAL INITIALIZATION ERROR: Bootstrap provenance mismatch for administrator '{existing_admin.username}'."
+            )
         return {
             "status": "already_exists",
             "username": existing_admin.username,
@@ -404,7 +502,7 @@ def bootstrap_administrator(
             "message": f"Administrator account '{existing_admin.username}' already established. Skipping bootstrap (no-op).",
         }
 
-    # 3. Check for unexpected identity data (WP03-03)
+    # 3. Check for unexpected identity data (WP03-03 and WP03-R01)
     user_count = db.scalar(select(func.count()).select_from(User)) or 0
     if user_count > 0:
         raise RuntimeError(
@@ -451,7 +549,7 @@ def bootstrap_administrator(
     db.add(new_admin)
     db.flush()
 
-    # 6. Record sanitized audit log
+    # 6. Record sanitized audit log with stable identifier (user_id and entity_id)
     audit_entry = AuditLog(
         user_id=new_admin.id,
         username=new_admin.username,
@@ -480,19 +578,23 @@ def bootstrap_administrator(
     }
 
 
-def init_production_database(reference_config_path: str | None = None, verify_only: bool = False) -> dict:
+def init_production_database(
+    reference_config_path: str | None = None,
+    allow_test_fixture: bool = False,
+    verify_only: bool = False,
+) -> dict:
     """Execute complete production database verification, initialization, and bootstrap workflow."""
     admin_username, admin_password = get_bootstrap_admin_credentials()
-    ref_config = load_reference_config(reference_config_path)
+    ref_config = load_reference_config(reference_config_path, allow_test_fixture=allow_test_fixture)
 
     with get_db_session() as db:
-        # 1. Environment & Database Safety Verification
+        # 1. Environment & Database Safety Verification (including bootstrap provenance WP03-R01)
         env_status = verify_target_environment(db)
 
-        # 2. Administrator Bootstrap Verification / Execution (with advisory lock serialization)
+        # 2. Administrator Bootstrap Verification / Execution (with advisory lock serialization WP03-02)
         admin_status = bootstrap_administrator(db, admin_username, admin_password, verify_only=verify_only)
 
-        # 3. Statutory Reference Data Initialization (deferred if no approved config)
+        # 3. Statutory Reference Data Initialization (deferred if no approved config WP03-01 / WP03-R02)
         ref_status = init_reference_data(db, ref_config=ref_config, verify_only=verify_only)
 
         if not verify_only:
@@ -521,13 +623,28 @@ def main():
         default=None,
         help="Path to versioned, Finance-approved statutory reference configuration file (JSON)",
     )
+    parser.add_argument(
+        "--allow-test-fixture",
+        action="store_true",
+        default=False,
+        help="Allow synthetic test reference configuration fixtures (strictly for testing, forbidden in production)",
+    )
     args = parser.parse_args()
 
     mode_label = "VERIFICATION ONLY" if args.verify_only else "INITIALIZATION"
     print(f"==> CollectFlow Production Initializer [{mode_label}] Starting...")
 
+    env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
+    if env_mode == "production" and args.allow_test_fixture:
+        print("ERROR: CRITICAL SAFETY ABORT: --allow-test-fixture is strictly forbidden in production mode.", file=sys.stderr)
+        sys.exit(1)
+
     try:
-        report = init_production_database(reference_config_path=args.reference_config, verify_only=args.verify_only)
+        report = init_production_database(
+            reference_config_path=args.reference_config,
+            allow_test_fixture=args.allow_test_fixture,
+            verify_only=args.verify_only,
+        )
         print(f"==> Environment: {report['environment']['env_mode']} | Database: {report['environment']['database']}")
         print(f"==> Schema Revision: {report['environment']['alembic_revision']} (MATCH)")
         print(f"==> Administrator: {report['administrator']['message']}")

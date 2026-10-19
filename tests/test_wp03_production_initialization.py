@@ -13,18 +13,23 @@ Validates:
 10. Real concurrent PostgreSQL integration test with two competing connections (WP03-02).
 11. Verification-only mode (--verify-only) performs no writes.
 12. Initializer creates no synthetic business records (customers, orders, invoices, etc.).
-13. Reference data initialization is DEFERRED by default (WP03-01: no unapproved rates inserted).
+13. Reference data initialization is DEFERRED by default (WP03-01: no unapproved records inserted).
 14. Reference data initialization rejects unapproved / draft configurations (WP03-01).
-15. Reference data initialization succeeds with Finance-approved configuration (WP03-01).
-16. Identity validation: pre-existing users without admin fail closed (WP03-03).
-17. Identity validation: orphaned sessions fail closed (WP03-03).
-18. Identity validation: inactive administrator fails closed (WP03-03).
-19. Identity validation: audit trail inconsistency fails closed (WP03-03).
-20. Identity validation: clean first-time vs already-initialized distinguished (WP03-03).
-21. Fixture seeding without --reset is rejected outside collectflow_test.
-22. Fixture seeding with --reset remains strictly test-only.
-23. Remote and production database targets cannot be used for synthetic fixtures.
-24. Existing financial test fixtures remain unchanged.
+15. Reference data initialization succeeds with synthetic test fixture when explicitly allowed (WP03-01).
+16. Committed synthetic test fixture CANNOT authorize production reference data (WP03-R02).
+17. Reference data initialization accepts valid genuine Finance-approved configuration (WP03-R02).
+18. Identity validation: pre-existing users without admin fail closed (WP03-03).
+19. Identity validation: orphaned sessions fail closed (WP03-03).
+20. Identity validation: inactive administrator fails closed (WP03-03).
+21. Identity validation: missing bootstrap audit record on repeat run fails closed (WP03-R01).
+22. Identity validation: duplicate bootstrap audit records fail closed (WP03-R01).
+23. Identity validation: bootstrap audit stable ID mismatch fails closed (WP03-R01).
+24. Identity validation: audit trail username mismatch fails closed (WP03-03 / WP03-R01).
+25. Identity validation: clean first-time vs legitimate already-initialized distinguished (WP03-R01).
+26. Fixture seeding without --reset is rejected outside collectflow_test.
+27. Fixture seeding with --reset remains strictly test-only.
+28. Remote and production database targets cannot be used for synthetic fixtures.
+29. Existing financial test fixtures remain unchanged.
 """
 
 import json
@@ -111,7 +116,7 @@ def test_03_new_bootstrap_administrator_receives_true():
     """3. Initial bootstrap administrator account is created with must_change_password=true."""
     mock_db = MagicMock()
     mock_db.bind.dialect.name = "postgresql"
-    mock_db.scalar.return_value = None  # No existing admin, no existing users, no sessions
+    mock_db.scalar.return_value = None
 
     admin_username = "prod_admin"
     admin_password = "SecureAdminPass2026!#"
@@ -121,7 +126,6 @@ def test_03_new_bootstrap_administrator_receives_true():
     assert result["status"] == "bootstrapped"
     assert result["username"] == "prod_admin"
 
-    # Verify User instance passed to mock_db.add
     added_user = None
     for call_args in mock_db.add.call_args_list:
         obj = call_args[0][0]
@@ -181,7 +185,6 @@ def test_05_no_plaintext_password_in_logs_or_exceptions():
     audit_str = str(added_audit.details)
     assert secret_pass not in audit_str
 
-    # Bad password exception does not leak password
     bad_pass = "Weak1!"
     with pytest.raises(ValueError) as exc_info:
         validate_admin_password(bad_pass)
@@ -195,27 +198,22 @@ def test_06_initializer_rejects_missing_or_empty_bootstrap_secrets():
     mock_db.bind.dialect.name = "postgresql"
     mock_db.scalar.return_value = None
 
-    # Missing password
     with pytest.raises(ValueError) as exc_info:
         bootstrap_administrator(mock_db, "admin", None)
     assert "No administrator exists, but no bootstrap password was provided" in str(exc_info.value)
 
-    # Empty password
     with pytest.raises(ValueError) as exc_info:
         validate_admin_password("")
     assert "password cannot be empty" in str(exc_info.value)
 
-    # Short password
     with pytest.raises(ValueError) as exc_info:
         validate_admin_password("Short1!Aa")
     assert "at least 12 characters" in str(exc_info.value)
 
-    # Prohibited synthetic test password
     with pytest.raises(ValueError) as exc_info:
         validate_admin_password("AdminPass123!")
     assert "known weak or synthetic test password" in str(exc_info.value)
 
-    # Prohibited synthetic test username
     with pytest.raises(ValueError) as exc_info:
         validate_admin_username("sandbox_admin")
     assert "Prohibited username" in str(exc_info.value)
@@ -256,6 +254,8 @@ def test_08_repeated_initialization_idempotent_no_op():
         must_change_password=True,
     )
     mock_db.scalar.return_value = existing_user
+    audit = AuditLog(id=1, user_id=42, entity_id="42", username="existing_admin", action="ADMIN_BOOTSTRAPPED")
+    mock_db.scalars.return_value.all.return_value = [audit]
 
     result = bootstrap_administrator(mock_db, "existing_admin", "DifferentPass2026!#", verify_only=False)
 
@@ -274,7 +274,6 @@ def test_09_advisory_lock_acquired_for_bootstrap():
 
     bootstrap_administrator(mock_db, "admin", "SecureAdminPass2026!#", verify_only=False)
 
-    # Verify advisory lock was acquired
     lock_called = False
     for call_args in mock_db.execute.call_args_list:
         query_text = str(call_args[0][0])
@@ -286,11 +285,9 @@ def test_09_advisory_lock_acquired_for_bootstrap():
 
 def test_10_real_concurrent_postgresql_bootstrap():
     """10. Real concurrent PostgreSQL integration test with two competing connections (WP03-02)."""
-    # Create isolated temporary database for concurrency test
     test_db_name = "collectflow_wp03_concurrency_test"
     admin_conn_url = "postgresql://collectflow_user:collectflow_secret@127.0.0.1:5432/postgres"
 
-    # Ensure clean database
     with psycopg.connect(admin_conn_url, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(f"DROP DATABASE IF EXISTS {test_db_name}")
@@ -299,7 +296,6 @@ def test_10_real_concurrent_postgresql_bootstrap():
     test_dsn = f"postgresql+psycopg://collectflow_user:collectflow_secret@127.0.0.1:5432/{test_db_name}"
 
     try:
-        # Run migrations on isolated database
         import subprocess
         mig_env = os.environ.copy()
         mig_env["COLLECTFLOW_ENV"] = "production"
@@ -314,7 +310,6 @@ def test_10_real_concurrent_postgresql_bootstrap():
         )
         assert res.returncode == 0, f"Migration failed on temporary database: {res.stderr}"
 
-        # Setup barrier for two concurrent threads
         barrier = threading.Barrier(2)
         results = [None, None]
         errors = [None, None]
@@ -323,10 +318,8 @@ def test_10_real_concurrent_postgresql_bootstrap():
             engine = create_engine(test_dsn)
             Session = sessionmaker(bind=engine)
             try:
-                # Wait for both threads to reach start point
                 barrier.wait(timeout=10)
                 with Session() as session:
-                    # Run bootstrap in transaction
                     res = bootstrap_administrator(session, username, password, verify_only=False)
                     session.commit()
                     results[thread_idx] = res
@@ -346,7 +339,6 @@ def test_10_real_concurrent_postgresql_bootstrap():
         assert errors[0] is None, f"Thread 1 errored: {errors[0]}"
         assert errors[1] is None, f"Thread 2 errored: {errors[1]}"
 
-        # Verify results: Exactly one bootstrapped, exactly one already_exists
         statuses = [r["status"] for r in results if r]
         assert "bootstrapped" in statuses, "Expected at least one bootstrapped result"
         assert "already_exists" in statuses, "Expected at least one already_exists result"
@@ -354,7 +346,6 @@ def test_10_real_concurrent_postgresql_bootstrap():
         assert created_counts.count(True) == 1, "Exactly one thread must create the administrator"
         assert created_counts.count(False) == 1, "The competing thread must receive created=False"
 
-        # Verify database state
         engine = create_engine(test_dsn)
         with engine.connect() as conn:
             user_rows = conn.execute(text("SELECT id, username, role, must_change_password FROM users;")).fetchall()
@@ -395,9 +386,8 @@ def test_12_initializer_creates_no_synthetic_business_records():
     mock_db.bind.dialect.name = "postgresql"
     mock_db.scalar.return_value = None
 
-    # Load approved fixture
     fixture_path = os.path.join(os.path.dirname(__file__), "fixtures/approved_reference_config.json")
-    config = load_reference_config(fixture_path)
+    config = load_reference_config(fixture_path, allow_test_fixture=True)
     init_reference_data(mock_db, ref_config=config, verify_only=False)
 
     added_types = {type(call_args[0][0]) for call_args in mock_db.add.call_args_list}
@@ -410,7 +400,6 @@ def test_13_reference_data_deferred_by_default_without_approved_config():
     mock_db = MagicMock()
     mock_db.bind.dialect.name = "postgresql"
 
-    # Call init_reference_data without configuration
     result = init_reference_data(mock_db, ref_config=None, verify_only=False)
     assert result["status"] == "deferred"
     assert result["financial_years"] == 0
@@ -427,6 +416,9 @@ def test_14_reference_data_rejects_unapproved_or_draft_config():
         "config_version": "2026.0-draft",
         "approved_by": "Draft Author",
         "approval_status": "draft",
+        "approval_reference": "DRAFT-001",
+        "approval_date": "2026-04-01",
+        "controlled_source": "internal",
         "effective_date": "2026-04-01",
         "policy_references": ["BPD-01"],
         "financial_years": [],
@@ -440,34 +432,82 @@ def test_14_reference_data_rejects_unapproved_or_draft_config():
 
     try:
         with pytest.raises(ValueError) as exc_info:
-            load_reference_config(tmp_path)
+            load_reference_config(tmp_path, allow_test_fixture=False)
         assert "not approved by Finance" in str(exc_info.value)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
 
-def test_15_reference_data_initialization_with_finance_approved_config():
-    """15. Reference data populates when Finance-approved configuration is provided (WP03-01)."""
+def test_15_reference_data_initialization_with_synthetic_test_fixture():
+    """15. Reference data populates when synthetic test fixture is explicitly allowed (WP03-01 / WP03-R02)."""
     mock_db = MagicMock()
     mock_db.bind.dialect.name = "postgresql"
     mock_db.scalar.return_value = None
 
     fixture_path = os.path.join(os.path.dirname(__file__), "fixtures/approved_reference_config.json")
-    config = load_reference_config(fixture_path)
+    config = load_reference_config(fixture_path, allow_test_fixture=True)
     assert config is not None
-    assert config["approval_status"] == "approved"
+    assert config["is_test_fixture"] is True
 
     result = init_reference_data(mock_db, ref_config=config, verify_only=False)
     assert result["status"] == "initialized"
     assert result["financial_years"] == 1
     assert result["gst_rates"] == 3
     assert result["tds_sections"] == 2
-    assert result["approved_by"] == "Finance Directorate"
+    assert "Test Harness" in result["approved_by"]
 
 
-def test_16_identity_validation_rejects_users_without_admin():
-    """16. Refuse initialization if non-admin users exist but no admin exists (WP03-03)."""
+def test_16_committed_test_fixture_rejected_in_production():
+    """16. Committed synthetic test fixture CANNOT authorize production reference-data insertion (WP03-R02)."""
+    fixture_path = os.path.join(os.path.dirname(__file__), "fixtures/approved_reference_config.json")
+
+    # When allow_test_fixture=False (default production behavior), it MUST be rejected
+    with pytest.raises(ValueError) as exc_info:
+        load_reference_config(fixture_path, allow_test_fixture=False)
+    assert "Synthetic test configuration fixture detected ('TEST ONLY — NOT FINANCE APPROVED')" in str(exc_info.value)
+    assert "cannot authorize production reference-data insertion" in str(exc_info.value)
+
+
+def test_17_genuine_production_configuration_validation():
+    """17. Production configuration requires formal provenance: reference, approver, date, source (WP03-R02)."""
+    genuine_config = {
+        "config_version": "2026.1",
+        "approval_status": "finance_approved",
+        "approval_reference": "FIN-DIR-2026-BPD-01",
+        "approved_by": "Finance Directorate - Head of Financial Operations",
+        "approval_date": "2026-04-01",
+        "controlled_source": "internal-governance://finance/statutory/2026.1",
+        "effective_date": "2026-04-01",
+        "policy_references": ["BPD-01", "BPD-02"],
+        "financial_years": [
+            {"code": "FY 2026-27", "start_date": "2026-04-01", "end_date": "2027-03-31", "is_active": True}
+        ],
+        "gst_rates": [
+            {"name": "GST 18%", "rate": "0.1800", "cgst_rate": "0.0900", "sgst_rate": "0.0900", "igst_rate": "0.1800", "is_default": True, "is_active": True}
+        ],
+        "tds_sections": [
+            {"section_code": "194C", "description": "Contractors", "default_rate": "0.0200", "is_active": True}
+        ],
+    }
+
+    tmp_path = "/tmp/collectflow_genuine_ref_config.json"
+    with open(tmp_path, "w") as f:
+        json.dump(genuine_config, f)
+
+    try:
+        # Passes with allow_test_fixture=False
+        parsed = load_reference_config(tmp_path, allow_test_fixture=False)
+        assert parsed["approval_reference"] == "FIN-DIR-2026-BPD-01"
+        assert parsed["approved_by"] == "Finance Directorate - Head of Financial Operations"
+        assert parsed["controlled_source"] == "internal-governance://finance/statutory/2026.1"
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def test_18_identity_validation_rejects_users_without_admin():
+    """18. Refuse initialization if non-admin users exist but no admin exists (WP03-03)."""
     mock_db = MagicMock()
     mock_db.bind.dialect.name = "postgresql"
     mock_db.bind.url.database = "collectflow_prod"
@@ -476,9 +516,9 @@ def test_16_identity_validation_rejects_users_without_admin():
     def mock_scalar(query):
         query_str = str(query)
         if "users" in query_str and "role" not in query_str:
-            return 3  # 3 total users
+            return 3
         if "role" in query_str:
-            return 0  # 0 admins
+            return 0
         return 0
 
     mock_db.scalar.side_effect = mock_scalar
@@ -490,8 +530,8 @@ def test_16_identity_validation_rejects_users_without_admin():
         assert "no legitimate administrator exists" in str(exc_info.value)
 
 
-def test_17_identity_validation_rejects_orphaned_sessions():
-    """17. Refuse initialization if orphaned sessions exist in empty database (WP03-03)."""
+def test_19_identity_validation_rejects_orphaned_sessions():
+    """19. Refuse initialization if orphaned sessions exist in empty database (WP03-03)."""
     mock_db = MagicMock()
     mock_db.bind.dialect.name = "postgresql"
     mock_db.bind.url.database = "collectflow_prod"
@@ -500,7 +540,7 @@ def test_17_identity_validation_rejects_orphaned_sessions():
     def mock_scalar(query):
         query_str = str(query)
         if "sessions" in query_str:
-            return 2  # 2 orphaned sessions
+            return 2
         return 0
 
     mock_db.scalar.side_effect = mock_scalar
@@ -512,8 +552,8 @@ def test_17_identity_validation_rejects_orphaned_sessions():
         assert "Orphaned active sessions detected" in str(exc_info.value)
 
 
-def test_18_identity_validation_rejects_inactive_admin():
-    """18. Refuse initialization if existing administrator is inactive/disabled (WP03-03)."""
+def test_20_identity_validation_rejects_inactive_admin():
+    """20. Refuse initialization if existing administrator is inactive/disabled (WP03-03)."""
     mock_db = MagicMock()
     mock_db.bind.dialect.name = "postgresql"
     mock_db.bind.url.database = "collectflow_prod"
@@ -528,7 +568,7 @@ def test_18_identity_validation_rejects_inactive_admin():
         return 0
 
     mock_db.scalar.side_effect = mock_scalar
-    mock_db.scalars.return_value.all.return_value = []  # No active admins
+    mock_db.scalars.return_value.all.return_value = []
 
     with patch.dict(os.environ, {"COLLECTFLOW_ENV": "production"}):
         with pytest.raises(RuntimeError) as exc_info:
@@ -536,33 +576,141 @@ def test_18_identity_validation_rejects_inactive_admin():
         assert "Administrator account exists but is inactive" in str(exc_info.value)
 
 
-def test_19_identity_validation_detects_audit_trail_inconsistency():
-    """19. Detect bootstrap audit trail inconsistency on repeat execution (WP03-03)."""
+def test_21_identity_validation_rejects_admin_without_bootstrap_audit():
+    """21. Refuse repeat initialization if active admin exists but bootstrap audit record is missing (WP03-R01)."""
     mock_db = MagicMock()
     mock_db.bind.dialect.name = "postgresql"
     mock_db.bind.url.database = "collectflow_prod"
     mock_db.execute.return_value.scalar.return_value = EXPECTED_ALEMBIC_REVISION
 
-    def mock_scalar(query):
+    active_admin = User(id=1, username="admin", role="admin", is_active=True)
+
+    def mock_scalars(query):
         query_str = str(query)
+        res = MagicMock()
         if "users" in query_str:
-            return 1
-        if "audit_logs" in query_str:
-            return AuditLog(action="ADMIN_BOOTSTRAPPED", username="original_admin")
-        return 0
+            res.all.return_value = [active_admin]
+        elif "audit_logs" in query_str:
+            res.all.return_value = []  # No bootstrap audit!
+        else:
+            res.all.return_value = []
+        return res
+
+    def mock_scalar(query):
+        return 1 if "users" in str(query) else 0
 
     mock_db.scalar.side_effect = mock_scalar
-    active_admin = User(id=1, username="different_admin", role="admin", is_active=True)
-    mock_db.scalars.return_value.all.return_value = [active_admin]
 
     with patch.dict(os.environ, {"COLLECTFLOW_ENV": "production"}):
         with pytest.raises(RuntimeError) as exc_info:
             verify_target_environment(mock_db)
-        assert "Bootstrap audit trail inconsistency detected" in str(exc_info.value)
+        assert "required bootstrap provenance audit evidence (action='ADMIN_BOOTSTRAPPED') is completely missing" in str(exc_info.value)
 
 
-def test_20_identity_validation_distinguishes_first_time_from_initialized():
-    """20. Distinguish clean first-time initialization from already initialized (WP03-03)."""
+def test_22_identity_validation_rejects_duplicate_bootstrap_audits():
+    """22. Refuse initialization if ambiguous/duplicate bootstrap audit records exist (WP03-R01)."""
+    mock_db = MagicMock()
+    mock_db.bind.dialect.name = "postgresql"
+    mock_db.bind.url.database = "collectflow_prod"
+    mock_db.execute.return_value.scalar.return_value = EXPECTED_ALEMBIC_REVISION
+
+    active_admin = User(id=1, username="admin", role="admin", is_active=True)
+    audits = [
+        AuditLog(id=1, user_id=1, entity_id="1", username="admin", action="ADMIN_BOOTSTRAPPED"),
+        AuditLog(id=2, user_id=1, entity_id="1", username="admin", action="ADMIN_BOOTSTRAPPED"),
+    ]
+
+    def mock_scalars(query):
+        query_str = str(query)
+        res = MagicMock()
+        if "users" in query_str:
+            res.all.return_value = [active_admin]
+        elif "audit_logs" in query_str:
+            res.all.return_value = audits
+        else:
+            res.all.return_value = []
+        return res
+
+    def mock_scalar(query):
+        return 1 if "users" in str(query) else 0
+
+    mock_db.scalars.side_effect = mock_scalars
+    mock_db.scalar.side_effect = mock_scalar
+
+    with patch.dict(os.environ, {"COLLECTFLOW_ENV": "production"}):
+        with pytest.raises(RuntimeError) as exc_info:
+            verify_target_environment(mock_db)
+        assert "Ambiguous or duplicate bootstrap audit records detected (2 records)" in str(exc_info.value)
+
+
+def test_23_identity_validation_rejects_bootstrap_audit_id_mismatch():
+    """23. Refuse initialization if bootstrap audit stable ID does not match active admin ID (WP03-R01)."""
+    mock_db = MagicMock()
+    mock_db.bind.dialect.name = "postgresql"
+    mock_db.bind.url.database = "collectflow_prod"
+    mock_db.execute.return_value.scalar.return_value = EXPECTED_ALEMBIC_REVISION
+
+    active_admin = User(id=99, username="admin", role="admin", is_active=True)
+    audit = AuditLog(id=1, user_id=1, entity_id="1", username="admin", action="ADMIN_BOOTSTRAPPED")
+
+    def mock_scalars(query):
+        query_str = str(query)
+        res = MagicMock()
+        if "users" in query_str:
+            res.all.return_value = [active_admin]
+        elif "audit_logs" in query_str:
+            res.all.return_value = [audit]
+        else:
+            res.all.return_value = []
+        return res
+
+    def mock_scalar(query):
+        return 1 if "users" in str(query) else 0
+
+    mock_db.scalars.side_effect = mock_scalars
+    mock_db.scalar.side_effect = mock_scalar
+
+    with patch.dict(os.environ, {"COLLECTFLOW_ENV": "production"}):
+        with pytest.raises(RuntimeError) as exc_info:
+            verify_target_environment(mock_db)
+        assert "Bootstrap provenance mismatch" in str(exc_info.value)
+
+
+def test_24_identity_validation_detects_audit_trail_username_mismatch():
+    """24. Detect bootstrap audit trail username/role conflict on repeat execution (WP03-03 / WP03-R01)."""
+    mock_db = MagicMock()
+    mock_db.bind.dialect.name = "postgresql"
+    mock_db.bind.url.database = "collectflow_prod"
+    mock_db.execute.return_value.scalar.return_value = EXPECTED_ALEMBIC_REVISION
+
+    active_admin = User(id=1, username="different_admin", role="admin", is_active=True)
+    audit = AuditLog(id=1, user_id=1, entity_id="1", username="original_admin", action="ADMIN_BOOTSTRAPPED")
+
+    def mock_scalars(query):
+        query_str = str(query)
+        res = MagicMock()
+        if "users" in query_str:
+            res.all.return_value = [active_admin]
+        elif "audit_logs" in query_str:
+            res.all.return_value = [audit]
+        else:
+            res.all.return_value = []
+        return res
+
+    def mock_scalar(query):
+        return 1 if "users" in str(query) else 0
+
+    mock_db.scalars.side_effect = mock_scalars
+    mock_db.scalar.side_effect = mock_scalar
+
+    with patch.dict(os.environ, {"COLLECTFLOW_ENV": "production"}):
+        with pytest.raises(RuntimeError) as exc_info:
+            verify_target_environment(mock_db)
+        assert "Bootstrap provenance identifier conflict" in str(exc_info.value)
+
+
+def test_25_identity_validation_distinguishes_first_time_from_initialized():
+    """25. Distinguish clean first-time initialization from legitimate already initialized (WP03-R01)."""
     mock_db = MagicMock()
     mock_db.bind.dialect.name = "postgresql"
     mock_db.bind.url.database = "collectflow_prod"
@@ -574,26 +722,34 @@ def test_20_identity_validation_distinguishes_first_time_from_initialized():
         status = verify_target_environment(mock_db)
         assert status["identity_state"] == "clean_first_time"
 
-    # Already initialized
-    def mock_scalar(query):
-        query_str = str(query)
-        if "users" in query_str:
-            return 1
-        if "audit_logs" in query_str:
-            return AuditLog(action="ADMIN_BOOTSTRAPPED", username="admin")
-        return 0
-
-    mock_db.scalar.side_effect = mock_scalar
+    # Already initialized with matching provenance
     active_admin = User(id=1, username="admin", role="admin", is_active=True)
-    mock_db.scalars.return_value.all.return_value = [active_admin]
+    audit = AuditLog(id=1, user_id=1, entity_id="1", username="admin", action="ADMIN_BOOTSTRAPPED")
+
+    def mock_scalars(query):
+        query_str = str(query)
+        res = MagicMock()
+        if "users" in query_str:
+            res.all.return_value = [active_admin]
+        elif "audit_logs" in query_str:
+            res.all.return_value = [audit]
+        else:
+            res.all.return_value = []
+        return res
+
+    def mock_scalar(query):
+        return 1 if "users" in str(query) else 0
+
+    mock_db.scalars.side_effect = mock_scalars
+    mock_db.scalar.side_effect = mock_scalar
 
     with patch.dict(os.environ, {"COLLECTFLOW_ENV": "production"}):
         status = verify_target_environment(mock_db)
         assert status["identity_state"] == "already_initialized"
 
 
-def test_21_fixture_seeding_without_reset_rejected_outside_test_env():
-    """21. Fixture seeding without --reset is rejected outside collectflow_test."""
+def test_26_fixture_seeding_without_reset_rejected_outside_test_env():
+    """26. Fixture seeding without --reset is rejected outside collectflow_test."""
     mock_db = MagicMock()
     mock_db.bind.url.database = "collectflow_dev"
     mock_db.bind.url.host = "127.0.0.1"
@@ -607,8 +763,8 @@ def test_21_fixture_seeding_without_reset_rejected_outside_test_env():
             assert not mock_db.execute.called
 
 
-def test_22_fixture_seeding_with_reset_strictly_test_only():
-    """22. Fixture seeding with --reset remains strictly test-only."""
+def test_27_fixture_seeding_with_reset_strictly_test_only():
+    """27. Fixture seeding with --reset remains strictly test-only."""
     mock_db = MagicMock()
     mock_db.bind.url.database = "collectflow_staging"
     mock_db.bind.url.host = "127.0.0.1"
@@ -622,8 +778,8 @@ def test_22_fixture_seeding_with_reset_strictly_test_only():
             assert not mock_db.execute.called
 
 
-def test_23_remote_and_production_targets_cannot_be_used_for_fixtures():
-    """23. Remote host and production database targets cannot be used for synthetic fixtures."""
+def test_28_remote_and_production_targets_cannot_be_used_for_fixtures():
+    """28. Remote host and production database targets cannot be used for synthetic fixtures."""
     remote_db = MagicMock()
     remote_db.bind.url.database = "collectflow_test"
     remote_db.bind.url.host = "10.0.1.20"
@@ -651,8 +807,8 @@ def test_23_remote_and_production_targets_cannot_be_used_for_fixtures():
         assert "CRITICAL SAFETY ABORT" in str(exc_info.value)
 
 
-def test_24_existing_financial_test_fixtures_remain_unchanged():
-    """24. Existing financial test fixtures remain valid and unchanged."""
+def test_29_existing_financial_test_fixtures_remain_unchanged():
+    """29. Existing financial test fixtures remain valid and unchanged."""
     with get_db_session() as db:
         customers = db.scalars(select(Customer)).all()
         assert len(customers) > 0, "Expected existing customers in test database"

@@ -1,11 +1,16 @@
 {
-  "config_version": "2026.1",
-  "approved_by": "Finance Directorate",
-  "approval_status": "approved",
+  "_comment": "TEST ONLY — NOT FINANCE APPROVED. Synthetic test fixture for automated test validation only. Must be rejected if supplied as production authorization.",
+  "is_test_fixture": true,
+  "config_version": "2026.1-synthetic-test",
+  "approved_by": "Test Harness (SYNTHETIC — NOT FINANCE APPROVED)",
+  "approval_status": "TEST_SYNTHETIC_ONLY_NOT_FINANCE_APPROVED",
+  "approval_reference": "SYNTHETIC-FIXTURE-NOT-FOR-PRODUCTION",
+  "approval_date": "2026-04-01",
+  "controlled_source": "tests/fixtures/approved_reference_config.json",
   "effective_date": "2026-04-01",
   "policy_references": [
-    "BPD-01: Statutory Reference Masters Policy",
-    "BPD-02: Default Tax & Statutory Configurations"
+    "TEST-SYNTHETIC-BPD-01",
+    "TEST-SYNTHETIC-BPD-02"
   ],
   "financial_years": [
     {
