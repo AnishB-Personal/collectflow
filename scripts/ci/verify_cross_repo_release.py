@@ -62,6 +62,7 @@ def main() -> int:
     parser.add_argument("--frontend-path", default="../cash-flow-buddy-101", help="Path to frontend repository")
     parser.add_argument("--expected-backend-sha", help="Expected backend commit SHA")
     parser.add_argument("--expected-frontend-sha", help="Expected frontend commit SHA")
+    parser.add_argument("--skip-worktree-check", action="store_true", help="Skip clean working tree check")
     parser.add_argument("--report", default="/tmp/cross-repo-integration-report.json", help="Output report JSON")
     args = parser.parse_args()
 
@@ -133,10 +134,11 @@ def main() -> int:
             report["details"].append(f"Frontend remote origin '{f_remote}' does not match expected CashFlowBuddy frontend repository.")
 
         # Validate clean working trees
-        if not b_clean:
-            report["details"].append(f"Backend working tree at {backend_dir} contains uncommitted changes (dirty).")
-        if not f_clean:
-            report["details"].append(f"Frontend working tree at {frontend_dir} contains uncommitted changes (dirty).")
+        if not args.skip_worktree_check:
+            if not b_clean:
+                report["details"].append(f"Backend working tree at {backend_dir} contains uncommitted changes (dirty).")
+            if not f_clean:
+                report["details"].append(f"Frontend working tree at {frontend_dir} contains uncommitted changes (dirty).")
 
         # Validate expected SHAs if provided
         if args.expected_backend_sha and b_sha != args.expected_backend_sha:

@@ -62,7 +62,7 @@ if [[ "${OCI_REVISION}" != "${COMMIT_SHA}" ]]; then
 fi
 echo "Verified OCI revision label: ${OCI_REVISION} matches git commit SHA."
 
-# 5. Fail-Closed Vulnerability Scan (WP05-R03)
+# 5. Fail-Closed Vulnerability Scan (WP05-F01, WP05-F02)
 SCAN_VERDICT="BLOCKED_SCANNER_UNAVAILABLE"
 SCAN_DETAILS="Trivy scanner is not installed or available."
 SCANNER_NAME="trivy"
@@ -70,110 +70,68 @@ SCANNER_VERSION="unavailable"
 SCAN_CHECKSUM=""
 SCAN_CRITICAL_COUNT=0
 SCAN_HIGH_COUNT=0
+UNAPPROVED_CRIT=0
+UNAPPROVED_HIGH=0
 BLOCKING_FINDINGS="[]"
+APPLIED_EXCEPTIONS="[]"
 
 if command -v trivy &>/dev/null; then
     SCANNER_VERSION="$(trivy --version | head -n 1)"
     echo "Running Trivy image vulnerability scan (${SCANNER_VERSION})..."
     
-    # Run scan without suppressing tool execution errors; do not ignore unfixed vulnerabilities (WP05-R03)
+    # Run scan without suppressing tool execution errors; do not ignore unfixed vulnerabilities (WP05-F02)
     TRIVY_RC=0
     trivy image \
+        --scanners vuln \
         --severity HIGH,CRITICAL \
         --format json \
         --output "${SCAN_REPORT_PATH}" \
         "${IMAGE_TAG}" || TRIVY_RC=$?
 
-    # Fail closed on tool execution errors even if a partial report exists
-    if [[ ${TRIVY_RC} -ne 0 && ! -s "${SCAN_REPORT_PATH}" ]]; then
-        echo "ERROR: Trivy execution failed with code ${TRIVY_RC} without producing report."
+    # Fail closed on tool execution errors (WP05-F02: Treat non-zero Trivy exit codes as failures fail-closed)
+    if [[ ${TRIVY_RC} -ne 0 ]]; then
+        echo "ERROR: Trivy execution failed with exit code ${TRIVY_RC}."
         SCAN_VERDICT="ERROR_SCANNER_EXECUTION_FAILED"
         SCAN_DETAILS="Trivy execution failed with exit code ${TRIVY_RC}."
-        exit 1
-    fi
-
-    if [[ -s "${SCAN_REPORT_PATH}" ]]; then
+    elif [[ ! -s "${SCAN_REPORT_PATH}" ]]; then
+        echo "ERROR: Trivy scan report is missing or empty: ${SCAN_REPORT_PATH}"
+        SCAN_VERDICT="ERROR_SCANNER_REPORT_MISSING"
+        SCAN_DETAILS="Trivy scan report is missing or empty."
+    else
         SCAN_CHECKSUM="$(sha256sum "${SCAN_REPORT_PATH}" | awk '{print $1}')"
         
-        # Parse counts and blocking findings strictly from JSON output
+        # Parse counts, blocking findings, and exceptions strictly using vulnerability_exceptions.py (WP05-F01, WP05-F02)
         PARSE_RESULT="$(python3 -c "
 import json, sys
+from pathlib import Path
+sys.path.insert(0, '${ROOT_DIR}')
+from scripts.ci.vulnerability_exceptions import evaluate_trivy_report
 
-try:
-    with open('${SCAN_REPORT_PATH}', 'r') as f:
-        data = json.load(f)
-    if 'Results' not in data:
-        sys.exit(3) # Incomplete report
-
-    results = data.get('Results', [])
-    crit_list = []
-    high_list = []
-    for r in results:
-        for v in r.get('Vulnerabilities', []):
-            sev = v.get('Severity', '').upper()
-            cve_id = v.get('VulnerabilityID', 'UNKNOWN')
-            pkg = v.get('PkgName', 'unknown')
-            if sev == 'CRITICAL':
-                crit_list.append(f'{cve_id} ({pkg})')
-            elif sev == 'HIGH':
-                high_list.append(f'{cve_id} ({pkg})')
-
-    # Check approved exceptions if file exists
-    approved_cves = set()
-    exceptions_path = '${EXCEPTIONS_FILE}'
-    if exceptions_path:
-        import os
-        if os.path.exists(exceptions_path):
-            with open(exceptions_path, 'r') as ef:
-                edata = json.load(ef)
-                approved_cves = set(edata.get('approved_cves', []))
-
-    unapproved_crit = [c for c in crit_list if c.split()[0] not in approved_cves]
-    unapproved_high = [c for c in high_list if c.split()[0] not in approved_cves]
-
-    out = {
-        'crit_count': len(crit_list),
-        'high_count': len(high_list),
-        'unapproved_crit_count': len(unapproved_crit),
-        'unapproved_high_count': len(unapproved_high),
-        'blocking_findings': unapproved_crit + unapproved_high
-    }
-    print(json.dumps(out))
-except Exception as e:
+exp_file = Path('${EXCEPTIONS_FILE}') if '${EXCEPTIONS_FILE}' else None
+res, errs = evaluate_trivy_report(
+    Path('${SCAN_REPORT_PATH}'),
+    exp_file,
+    '${IMAGE_NAME}'
+)
+if errs:
+    print('PARSE_ERROR: ' + '; '.join(errs), file=sys.stderr)
     sys.exit(2)
-" || echo "PARSE_ERROR")"
+print(json.dumps(res))
+" 2>&1 || echo "PARSE_ERROR")"
 
-        if [[ "${PARSE_RESULT}" == "PARSE_ERROR" ]]; then
-            echo "ERROR: Failed to parse Trivy scan report JSON or report is malformed/incomplete."
-            SCAN_VERDICT="ERROR_SCANNER_EXECUTION_FAILED"
-            SCAN_DETAILS="Malformed or incomplete scan report JSON."
-            exit 1
-        fi
-
-        SCAN_CRITICAL_COUNT="$(echo "${PARSE_RESULT}" | python3 -c 'import sys, json; print(json.load(sys.stdin)["crit_count"])')"
-        SCAN_HIGH_COUNT="$(echo "${PARSE_RESULT}" | python3 -c 'import sys, json; print(json.load(sys.stdin)["high_count"])')"
-        UNAPPROVED_CRIT="$(echo "${PARSE_RESULT}" | python3 -c 'import sys, json; print(json.load(sys.stdin)["unapproved_crit_count"])')"
-        UNAPPROVED_HIGH="$(echo "${PARSE_RESULT}" | python3 -c 'import sys, json; print(json.load(sys.stdin)["unapproved_high_count"])')"
-        BLOCKING_FINDINGS="$(echo "${PARSE_RESULT}" | python3 -c 'import sys, json; print(json.dumps(json.load(sys.stdin)["blocking_findings"]))')"
-
-        if [[ ${UNAPPROVED_CRIT} -gt 0 ]]; then
-            SCAN_VERDICT="FAIL_CRITICAL_VULNERABILITY"
-            SCAN_DETAILS="Detected ${UNAPPROVED_CRIT} unapproved CRITICAL vulnerability(ies) in ${IMAGE_TAG}."
-            echo "SECURITY GATE FAILED: ${SCAN_DETAILS}"
-            exit 1
-        elif [[ ${UNAPPROVED_HIGH} -gt 0 ]]; then
-            SCAN_VERDICT="FAIL_HIGH_VULNERABILITY"
-            SCAN_DETAILS="Detected ${UNAPPROVED_HIGH} unapproved HIGH vulnerability(ies) in ${IMAGE_TAG}."
-            echo "SECURITY GATE FAILED: ${SCAN_DETAILS}"
-            exit 1
-        elif [[ ${SCAN_CRITICAL_COUNT} -gt 0 || ${SCAN_HIGH_COUNT} -gt 0 ]]; then
-            SCAN_VERDICT="PASS_WITH_APPROVED_EXCEPTIONS"
-            SCAN_DETAILS="All findings (${SCAN_CRITICAL_COUNT} CRITICAL, ${SCAN_HIGH_COUNT} HIGH) covered by documented approved exceptions."
-            echo "SECURITY GATE PASSED (WITH APPROVED EXCEPTIONS): ${SCAN_DETAILS}"
+        if [[ "${PARSE_RESULT}" == *"PARSE_ERROR"* ]]; then
+            echo "ERROR: Failed to parse Trivy scan report JSON or invalid exceptions: ${PARSE_RESULT}"
+            SCAN_VERDICT="ERROR_MALFORMED_SCAN_OR_EXCEPTIONS"
+            SCAN_DETAILS="Scan report or exceptions validation failed: ${PARSE_RESULT}"
         else
-            SCAN_VERDICT="PASS"
-            SCAN_DETAILS="0 CRITICAL and 0 HIGH vulnerabilities detected in container image."
-            echo "SECURITY GATE PASSED: ${SCAN_DETAILS}"
+            SCAN_VERDICT="$(echo "${PARSE_RESULT}" | python3 -c 'import sys, json; print(json.load(sys.stdin)["verdict"])')"
+            SCAN_DETAILS="$(echo "${PARSE_RESULT}" | python3 -c 'import sys, json; print(json.load(sys.stdin)["details"])')"
+            SCAN_CRITICAL_COUNT="$(echo "${PARSE_RESULT}" | python3 -c 'import sys, json; print(json.load(sys.stdin)["critical_count"])')"
+            SCAN_HIGH_COUNT="$(echo "${PARSE_RESULT}" | python3 -c 'import sys, json; print(json.load(sys.stdin)["high_count"])')"
+            UNAPPROVED_CRIT="$(echo "${PARSE_RESULT}" | python3 -c 'import sys, json; print(json.load(sys.stdin)["unapproved_critical_count"])')"
+            UNAPPROVED_HIGH="$(echo "${PARSE_RESULT}" | python3 -c 'import sys, json; print(json.load(sys.stdin)["unapproved_high_count"])')"
+            BLOCKING_FINDINGS="$(echo "${PARSE_RESULT}" | python3 -c 'import sys, json; print(json.dumps(json.load(sys.stdin)["blocking_findings"]))')"
+            APPLIED_EXCEPTIONS="$(echo "${PARSE_RESULT}" | python3 -c 'import sys, json; print(json.dumps(json.load(sys.stdin)["applied_exceptions"]))')"
         fi
     fi
 else
@@ -181,7 +139,6 @@ else
     # Strict scan gate fails closed when scanner is missing (WP05-R03)
     if [[ "${STRICT_SCAN_GATE}" == "true" ]]; then
         echo "ERROR: Mandatory container vulnerability scan cannot pass because Trivy is unavailable."
-        exit 1
     fi
 fi
 
@@ -208,7 +165,10 @@ cat <<EOF > "${METADATA_OUTPUT}"
     "details": "${SCAN_DETAILS}",
     "critical_count": ${SCAN_CRITICAL_COUNT},
     "high_count": ${SCAN_HIGH_COUNT},
+    "unapproved_critical_count": ${UNAPPROVED_CRIT},
+    "unapproved_high_count": ${UNAPPROVED_HIGH},
     "blocking_findings": ${BLOCKING_FINDINGS},
+    "applied_exceptions": ${APPLIED_EXCEPTIONS},
     "evidence_file": "${SCAN_REPORT_PATH}",
     "evidence_sha256": "${SCAN_CHECKSUM}"
   },
@@ -222,3 +182,9 @@ EOF
 
 echo "Image metadata written to ${METADATA_OUTPUT}"
 echo "Build and scan complete: ${SCAN_VERDICT}"
+
+if [[ "${SCAN_VERDICT}" != "PASS" && "${SCAN_VERDICT}" != "PASS_WITH_APPROVED_EXCEPTIONS" ]]; then
+    echo "SECURITY GATE FAILED: ${SCAN_DETAILS}"
+    exit 1
+fi
+

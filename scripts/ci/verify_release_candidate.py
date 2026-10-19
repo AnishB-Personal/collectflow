@@ -114,6 +114,8 @@ def main() -> int:
         cross_cmd.extend(["--expected-backend-sha", args.expected_backend_sha])
     if args.expected_frontend_sha:
         cross_cmd.extend(["--expected-frontend-sha", args.expected_frontend_sha])
+    if args.skip_git_verify:
+        cross_cmd.append("--skip-worktree-check")
 
     cross_res = run_command(cross_cmd, "Verifying Cross-Repository Pairing Gate")
     if not cross_repo_out.exists():
@@ -137,7 +139,18 @@ def main() -> int:
         print(f"\n[RC GATE FAILED] Cross-repository pairing failed (verdict: {c_verdict}, status: {c_status}).", file=sys.stderr)
         return 1
 
-    # Step 3: Ensure SBOM artifacts exist
+    # Step 3: Verify clean working trees (WP05-01)
+    if not args.skip_git_verify:
+        b_status = subprocess.run(["git", "-C", str(backend_dir), "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
+        f_status = subprocess.run(["git", "-C", str(frontend_dir), "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
+        if b_status:
+            print(f"ERROR: Backend working tree is dirty:\n{b_status}", file=sys.stderr)
+            return 1
+        if f_status:
+            print(f"ERROR: Frontend working tree is dirty:\n{f_status}", file=sys.stderr)
+            return 1
+
+    # Step 4: Ensure SBOM artifacts exist
     backend_sbom_path = Path(args.backend_sbom).resolve()
     frontend_sbom_path = Path(args.frontend_sbom).resolve()
 
@@ -159,7 +172,40 @@ def main() -> int:
             "--output", str(frontend_sbom_path)
         ], "Generating Frontend CycloneDX SBOM")
 
-    # Step 4: Generate Release Candidate Manifest
+    # Step 5: Verify presence of Docker images in daemon (WP05-F03)
+    if not args.skip_docker_verify:
+        for comp, sha in [("backend", act_b_sha), ("frontend", act_f_sha)]:
+            tag = f"collectflow-{comp}:{sha}"
+            res = subprocess.run(["docker", "image", "inspect", tag], capture_output=True, text=True)
+            if res.returncode != 0:
+                print(f"ERROR: Docker image '{tag}' is not present in local Docker daemon.", file=sys.stderr)
+                print(f"Build and scan the image using scripts/ci/build_and_scan_image.sh before running RC verification.", file=sys.stderr)
+                return 1
+
+    # Step 6: Verify mandatory quality gate evidence exists (WP05-F03)
+    mandatory_files = [
+        ("Backend test report", args.backend_test_report),
+        ("Frontend test report", args.frontend_test_report),
+        ("Backend dependency audit", args.backend_audit_report),
+        ("Frontend dependency audit", args.frontend_audit_report),
+        ("Secret scan report", args.secret_scan_report),
+        ("SAST lint report", args.sast_lint_report),
+        ("Backend image metadata", args.backend_meta),
+        ("Frontend image metadata", args.frontend_meta),
+    ]
+    missing_evidence = []
+    for name, p_str in mandatory_files:
+        if not p_str or not Path(p_str).exists():
+            missing_evidence.append(f"{name} ({p_str})")
+
+    if missing_evidence:
+        print("ERROR: Mandatory release candidate quality gate evidence is missing:", file=sys.stderr)
+        for m in missing_evidence:
+            print(f"  - {m}", file=sys.stderr)
+        print("Release candidate cannot be accepted without complete, verifiable evidence (WP05-F03).", file=sys.stderr)
+        return 1
+
+    # Step 7: Generate Release Candidate Manifest
     gen_script = backend_dir / "scripts" / "ci" / "generate_release_manifest.py"
     gen_cmd = [
         sys.executable, str(gen_script),
@@ -184,7 +230,7 @@ def main() -> int:
         print(f"\n[RC GATE FAILED] Release manifest generation failed with exit code {gen_res.returncode}.", file=sys.stderr)
         return 1
 
-    # Step 5: Strictly Validate Release Candidate Manifest
+    # Step 8: Strictly Validate Release Candidate Manifest
     val_script = backend_dir / "scripts" / "ci" / "validate_release_manifest.py"
     val_cmd = [
         sys.executable, str(val_script),

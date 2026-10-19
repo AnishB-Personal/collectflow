@@ -102,20 +102,16 @@ except Exception as e:
     sys.exit(1)
 "
 
-      - name: Build Backend OCI Image
+      - name: Install and Verify Trivy Scanner
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy --version
+
+      - name: Build and Scan Backend OCI Image
         run: |
           chmod +x scripts/ci/build_and_scan_image.sh
-          ./scripts/ci/build_and_scan_image.sh backend collectflow-backend /tmp/backend-image-meta.json no-publish
+          ./scripts/ci/build_and_scan_image.sh backend collectflow-backend /tmp/backend-image-meta.json no-publish /tmp/backend-trivy-report.json
 
-      - name: Scan Backend Container Image (Trivy)
-        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # 0.28.0
-        with:
-          image-ref: "collectflow-backend:${{ github.sha }}"
-          format: "json"
-          output: "/tmp/backend-trivy-report.json"
-          exit-code: "1"
-          vuln-type: "os,library"
-          severity: "HIGH,CRITICAL"
 
       - name: Generate CycloneDX SBOM
         run: |

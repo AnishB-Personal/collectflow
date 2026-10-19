@@ -21,26 +21,132 @@ jobs:
   verify-release-candidate:
     name: Consolidated Release Candidate Verification
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Checkout Backend Source
+        id: checkout_backend
+        continue-on-error: true
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          repository: AnishB-Personal/collectflow
           path: collectflow
           ref: ${{ github.event.inputs.backend_sha }}
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+
+      - name: Handle Backend Checkout Failure (RC_BLOCKED)
+        if: steps.checkout_backend.outcome != 'success'
+        run: |
+          echo "::error::Checkout failed for backend repository AnishB-Personal/collectflow at ref ${{ github.event.inputs.backend_sha }}."
+          echo "Release candidate verification is BLOCKED due to inaccessible backend source or missing credentials."
+          echo "Status: RC_BLOCKED"
+          exit 2
 
       - name: Checkout Frontend Source
+        id: checkout_frontend
+        continue-on-error: true
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: AnishB-Personal/cash-flow-buddy-101
           path: cash-flow-buddy-101
           ref: ${{ github.event.inputs.frontend_sha }}
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+
+      - name: Handle Frontend Checkout Failure (RC_BLOCKED)
+        if: steps.checkout_frontend.outcome != 'success'
+        run: |
+          echo "::error::Checkout failed for frontend repository AnishB-Personal/cash-flow-buddy-101 at ref ${{ github.event.inputs.frontend_sha }}."
+          echo "Release candidate verification is BLOCKED due to inaccessible frontend source or missing credentials."
+          echo "Status: RC_BLOCKED"
+          exit 2
+
+      - name: Verify Exact Immutable Git Revisions
+        run: |
+          ACT_B_SHA=$(git -C collectflow rev-parse HEAD)
+          ACT_F_SHA=$(git -C cash-flow-buddy-101 rev-parse HEAD)
+          echo "Backend HEAD:  ${ACT_B_SHA} (expected: ${{ github.event.inputs.backend_sha }})"
+          echo "Frontend HEAD: ${ACT_F_SHA} (expected: ${{ github.event.inputs.frontend_sha }})"
+          if [[ "${ACT_B_SHA}" != "${{ github.event.inputs.backend_sha }}" ]]; then
+            echo "ERROR: Backend commit SHA mismatch! Expected ${{ github.event.inputs.backend_sha }}, got ${ACT_B_SHA}"
+            exit 1
+          fi
+          if [[ "${ACT_F_SHA}" != "${{ github.event.inputs.frontend_sha }}" ]]; then
+            echo "ERROR: Frontend commit SHA mismatch! Expected ${{ github.event.inputs.frontend_sha }}, got ${ACT_F_SHA}"
+            exit 1
+          fi
 
       - name: Set up Python 3.12
         uses: actions/setup-python@0b93645e9fb737c336084004c238c36e99f829f0 # v5.3.0
         with:
           python-version: "3.12"
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: "22"
+
+      - name: Install and Verify Trivy Scanner
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy --version
+
+      - name: Build & Scan Backend OCI Image
+        run: |
+          cd collectflow
+          chmod +x scripts/ci/build_and_scan_image.sh
+          ./scripts/ci/build_and_scan_image.sh backend collectflow-backend /tmp/backend-image-meta.json no-publish /tmp/backend-trivy-report.json
+
+      - name: Build & Scan Frontend OCI Image
+        run: |
+          cd cash-flow-buddy-101
+          chmod +x scripts/ci/build_and_scan_image.sh
+          ./scripts/ci/build_and_scan_image.sh frontend collectflow-frontend /tmp/frontend-image-meta.json no-publish /tmp/frontend-trivy-report.json
+
+      - name: Execute Backend Quality Verification & Generate Evidence
+        run: |
+          cd collectflow
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pip-audit pytest
+          ruff check . --output-format json -o /tmp/backend-lint-report.json || ruff check .
+          pip-audit -r requirements.txt -f json -o /tmp/backend-pip-audit.json || true
+          python3 scripts/ci/scan_secrets.py --root . --json-output /tmp/backend-secret-scan.json
+          pytest tests/ci/test_wp05_ci_release_gates.py --junitxml=/tmp/backend-pytest.xml
+          python3 -c "
+          import xml.etree.ElementTree as ET, json
+          tree = ET.parse('/tmp/backend-pytest.xml')
+          root = tree.getroot()
+          s = root if root.tag == 'testsuite' else root.find('testsuite')
+          tests = int(s.attrib.get('tests', 0))
+          failures = int(s.attrib.get('failures', 0)) + int(s.attrib.get('errors', 0))
+          skipped = int(s.attrib.get('skipped', 0))
+          passed = tests - failures - skipped
+          verdict = 'PASS' if failures == 0 and passed > 0 else 'FAIL'
+          with open('/tmp/backend-test-summary.json', 'w') as f:
+              json.dump({'passed': passed, 'failed': failures, 'skipped': skipped, 'verdict': verdict}, f, indent=2)
+          "
+
+      - name: Execute Frontend Quality Verification & Generate Evidence
+        run: |
+          cd cash-flow-buddy-101
+          npm ci --prefer-offline || npm install
+          npm audit --json > /tmp/frontend-npm-audit.json || true
+          npx vitest run --reporter=json --outputFile=/tmp/frontend-vitest-report.json || true
+          python3 -c "
+          import json
+          try:
+              with open('/tmp/frontend-vitest-report.json') as f:
+                  d = json.load(f)
+              passed = d.get('numPassedTests', 0)
+              failed = d.get('numFailedTests', 0)
+              verdict = 'PASS' if failed == 0 and passed > 0 else 'FAIL'
+          except Exception:
+              passed = 0
+              failed = 1
+              verdict = 'FAIL'
+          with open('/tmp/frontend-test-summary.json', 'w') as f:
+              json.dump({'passed': passed, 'failed': failed, 'verdict': verdict}, f, indent=2)
+          "
 
       - name: Run Consolidated Release Candidate Gate
         run: |
@@ -51,10 +157,19 @@ jobs:
             --frontend-dir ../cash-flow-buddy-101 \
             --expected-backend-sha "${{ github.event.inputs.backend_sha }}" \
             --expected-frontend-sha "${{ github.event.inputs.frontend_sha }}" \
+            --backend-meta /tmp/backend-image-meta.json \
+            --frontend-meta /tmp/frontend-image-meta.json \
+            --backend-test-report /tmp/backend-test-summary.json \
+            --frontend-test-report /tmp/frontend-test-summary.json \
+            --backend-audit-report /tmp/backend-pip-audit.json \
+            --frontend-audit-report /tmp/frontend-npm-audit.json \
+            --secret-scan-report /tmp/backend-secret-scan.json \
+            --sast-lint-report /tmp/backend-lint-report.json \
             --output-manifest /tmp/release-manifest.json
 
       - name: Upload Release Candidate Manifest
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        if: always()
         with:
           name: ${{ github.event.inputs.rc_id }}-manifest
           path: /tmp/release-manifest.json

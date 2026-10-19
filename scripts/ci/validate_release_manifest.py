@@ -24,6 +24,14 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from scripts.ci.vulnerability_exceptions import validate_exception_record
+except ImportError:
+    try:
+        from vulnerability_exceptions import validate_exception_record
+    except ImportError:
+        validate_exception_record = None
+
 def compute_sha256(file_path: Path) -> str:
     h = hashlib.sha256()
     with open(file_path, "rb") as f:
@@ -187,23 +195,102 @@ def validate_manifest(
                 f"{component} OCI revision mismatch! Expected commit SHA '{expected_sha}', but recorded '{oci_rev}'"
             )
 
-        # Enforce fail-closed scan verdict (WP05-02, WP05-R03)
-        scan_verdict = c_info.get("scan_verdict", "")
+        # Enforce fail-closed scan verdict & mandatory evidence (WP05-F02)
+        sec_scan_meta = c_info.get("security_scan")
+        if not isinstance(sec_scan_meta, dict) or not sec_scan_meta:
+            errors.append(f"Missing mandatory container security scan evidence object for {component}")
+            continue
+
+        ev_file_str = sec_scan_meta.get("evidence_file")
+        ev_sha_str = sec_scan_meta.get("evidence_sha256")
+        if not ev_file_str:
+            errors.append(f"Missing mandatory container scan evidence_file for {component} (cannot accept unverified scan_verdict)")
+        if not ev_sha_str:
+            errors.append(f"Missing mandatory container scan evidence_sha256 for {component}")
+
+        scan_verdict = c_info.get("scan_verdict") or sec_scan_meta.get("verdict", "")
         if scan_verdict not in ["PASS", "PASS_WITH_APPROVED_EXCEPTIONS"]:
             errors.append(
                 f"{component} container vulnerability scan did not pass verified gate (verdict: '{scan_verdict}')"
             )
 
-        # Container scan evidence file verification
-        sec_scan_meta = c_info.get("security_scan", {})
-        if verify_evidence_integrity and isinstance(sec_scan_meta, dict) and sec_scan_meta.get("evidence_file"):
-            ev_path = Path(sec_scan_meta["evidence_file"])
+        # Independent verification of Trivy report integrity and vulnerability counts (WP05-F02)
+        if verify_evidence_integrity and ev_file_str:
+            ev_path = Path(ev_file_str)
             if not ev_path.exists():
                 errors.append(f"{component} container scan evidence file not found: {ev_path}")
-            elif sec_scan_meta.get("evidence_sha256"):
+            else:
                 act_sha = compute_sha256(ev_path)
-                if act_sha != sec_scan_meta["evidence_sha256"]:
+                if ev_sha_str and act_sha != ev_sha_str:
                     errors.append(f"{component} container scan evidence checksum mismatch: {ev_path}")
+
+                scanner_name = sec_scan_meta.get("scanner", "")
+                if scanner_name != "trivy":
+                    errors.append(f"{component} container scanner must be 'trivy', found '{scanner_name}'")
+
+                scanner_version = sec_scan_meta.get("scanner_version", "")
+                if not scanner_version or scanner_version == "unavailable":
+                    errors.append(f"{component} container scanner version is missing or unavailable")
+
+                try:
+                    rep_data = json.loads(ev_path.read_text(encoding="utf-8"))
+                    if "SchemaVersion" not in rep_data or "Results" not in rep_data:
+                        errors.append(f"{component} container scan evidence is missing required SchemaVersion or Results: {ev_path}")
+                    else:
+                        rep_crit = 0
+                        rep_high = 0
+                        findings_list = []
+                        for r in rep_data.get("Results", []) or []:
+                            for v in r.get("Vulnerabilities", []) or []:
+                                sev = str(v.get("Severity", "")).upper()
+                                cve = str(v.get("VulnerabilityID", "UNKNOWN")).strip().upper()
+                                pkg = str(v.get("PkgName", "unknown")).strip()
+                                if sev == "CRITICAL":
+                                    rep_crit += 1
+                                    findings_list.append((cve, pkg, sev))
+                                elif sev == "HIGH":
+                                    rep_high += 1
+                                    findings_list.append((cve, pkg, sev))
+
+                        claim_crit = sec_scan_meta.get("critical_count")
+                        claim_high = sec_scan_meta.get("high_count")
+                        if claim_crit is not None and claim_crit != rep_crit:
+                            errors.append(
+                                f"{component} container scan CRITICAL count mismatch! Manifest claims {claim_crit} but report contains {rep_crit}"
+                            )
+                        if claim_high is not None and claim_high != rep_high:
+                            errors.append(
+                                f"{component} container scan HIGH count mismatch! Manifest claims {claim_high} but report contains {rep_high}"
+                            )
+
+                        if scan_verdict == "PASS":
+                            if rep_crit > 0 or rep_high > 0:
+                                errors.append(
+                                    f"{component} container scan claimed PASS, but report contains {rep_crit} CRITICAL and {rep_high} HIGH vulnerabilities (forgery detected)"
+                                )
+                        elif scan_verdict == "PASS_WITH_APPROVED_EXCEPTIONS":
+                            applied = sec_scan_meta.get("applied_exceptions", [])
+                            if not isinstance(applied, list):
+                                errors.append(f"{component} container scan applied_exceptions must be a structured list")
+                            else:
+                                target_img = c_info.get("image_name", f"collectflow-{component}")
+                                for f_cve, f_pkg, f_sev in findings_list:
+                                    matched = any(
+                                        exp.get("cve_id") == f_cve and exp.get("package_name") == f_pkg
+                                        for exp in applied
+                                    )
+                                    if not matched:
+                                        errors.append(
+                                            f"{component} container finding {f_cve} in {f_pkg} ({f_sev}) is not covered by approved exceptions"
+                                        )
+                                for exp in applied:
+                                    if validate_exception_record:
+                                        is_val, val_err, _ = validate_exception_record(exp, target_img)
+                                        if not is_val:
+                                            errors.append(f"{component} invalid applied exception ({exp.get('cve_id')}): {val_err}")
+                except Exception as e:
+                    errors.append(f"Failed to parse {component} container scan report JSON: {e}")
+
 
         # Docker daemon image inspection (WP05-R04)
         if verify_docker_images and image_id:

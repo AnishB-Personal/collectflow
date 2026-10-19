@@ -29,6 +29,11 @@ from scripts.ci.generate_release_manifest import (
     parse_lint_report,
     parse_cross_repo_report
 )
+from scripts.ci.vulnerability_exceptions import (
+    validate_exception_record,
+    load_and_validate_exceptions,
+    evaluate_trivy_report
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -66,6 +71,22 @@ def create_valid_evidence_bundle(tmp_path, b_sha="a" * 40, f_sha="b" * 40):
     b_sbom.write_text('{"components": []}', encoding="utf-8")
     f_sbom.write_text('{"components": []}', encoding="utf-8")
 
+    trivy_clean = {
+        "SchemaVersion": 2,
+        "Results": [
+            {
+                "Target": "app",
+                "Class": "os-pkgs",
+                "Type": "alpine",
+                "Vulnerabilities": []
+            }
+        ]
+    }
+    b_trivy = tmp_path / "b_trivy.json"
+    f_trivy = tmp_path / "f_trivy.json"
+    b_trivy.write_text(json.dumps(trivy_clean), encoding="utf-8")
+    f_trivy.write_text(json.dumps(trivy_clean), encoding="utf-8")
+
     def sha(p):
         return hashlib.sha256(p.read_bytes()).hexdigest()
 
@@ -82,6 +103,17 @@ def create_valid_evidence_bundle(tmp_path, b_sha="a" * 40, f_sha="b" * 40):
                 "image_id": "sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff",
                 "oci_revision": b_sha,
                 "scan_verdict": "PASS",
+                "security_scan": {
+                    "scanner": "trivy",
+                    "scanner_version": "Version: 0.76.0",
+                    "verdict": "PASS",
+                    "details": "0 CRITICAL and 0 HIGH vulnerabilities detected in container image.",
+                    "critical_count": 0,
+                    "high_count": 0,
+                    "blocking_findings": [],
+                    "evidence_file": str(b_trivy),
+                    "evidence_sha256": sha(b_trivy)
+                },
                 "publication_status": "DISABLED_BY_DEFAULT",
                 "registry_published": False
             },
@@ -91,6 +123,17 @@ def create_valid_evidence_bundle(tmp_path, b_sha="a" * 40, f_sha="b" * 40):
                 "image_id": "sha256:555566667777888899990000aaaabbbbccccddddeeeeffff1111222233334444",
                 "oci_revision": f_sha,
                 "scan_verdict": "PASS",
+                "security_scan": {
+                    "scanner": "trivy",
+                    "scanner_version": "Version: 0.76.0",
+                    "verdict": "PASS",
+                    "details": "0 CRITICAL and 0 HIGH vulnerabilities detected in container image.",
+                    "critical_count": 0,
+                    "high_count": 0,
+                    "blocking_findings": [],
+                    "evidence_file": str(f_trivy),
+                    "evidence_sha256": sha(f_trivy)
+                },
                 "publication_status": "DISABLED_BY_DEFAULT",
                 "registry_published": False
             }
@@ -318,3 +361,167 @@ def test_secret_free_logging(tmp_path):
     for line_no, desc, masked in findings:
         assert secret_text not in masked
         assert "REDACTED" in masked
+
+def test_blanket_approved_cves_rejection(tmp_path):
+    """Bypass using blanket approved_cves array is rejected fail-closed (WP05-F01)."""
+    bad_exp_file = tmp_path / "bad_exceptions.json"
+    bad_exp_file.write_text(json.dumps({
+        "schema_version": "1.0.0",
+        "approved_cves": ["CVE-2025-7458", "CVE-2023-45853"],
+        "exceptions": []
+    }), encoding="utf-8")
+
+    valid_exps, errors = load_and_validate_exceptions(bad_exp_file, "collectflow-backend")
+    assert any("Blanket 'approved_cves' list found" in e for e in errors)
+    assert any("strictly rejected under WP05-F01" in e for e in errors)
+
+def test_exception_missing_mandatory_fields(tmp_path):
+    """Exception missing any required field (e.g. approver, expires_at, approval_reference) fails closed (WP05-F01)."""
+    incomplete_rec = {
+        "cve_id": "CVE-2026-9999",
+        "package_name": "libssl3",
+        "affected_image": "collectflow-backend",
+        "rationale": "Missing approval fields"
+    }
+    is_val, err, _ = validate_exception_record(incomplete_rec, "collectflow-backend")
+    assert not is_val
+    assert "missing mandatory field" in err
+
+def test_exception_expired_date_rejection(tmp_path):
+    """Exception with an expired date is rejected fail-closed (WP05-F01)."""
+    expired_rec = {
+        "cve_id": "CVE-2026-9999",
+        "package_name": "libssl3",
+        "affected_image": "collectflow-backend",
+        "rationale": "Old exception",
+        "approver": "SecTeam",
+        "approval_reference": "SEC-1234",
+        "expires_at": "2020-01-01"
+    }
+    is_val, err, _ = validate_exception_record(expired_rec, "collectflow-backend")
+    assert not is_val
+    assert "is EXPIRED" in err
+
+def test_exception_package_and_image_scope_mismatch(tmp_path):
+    """Exception for frontend or different package does not suppress backend finding (WP05-F01)."""
+    mismatched_img_rec = {
+        "cve_id": "CVE-2026-9999",
+        "package_name": "libssl3",
+        "affected_image": "collectflow-frontend",
+        "rationale": "Applies only to frontend",
+        "approver": "SecTeam",
+        "approval_reference": "SEC-1234",
+        "expires_at": "2030-01-01"
+    }
+    is_val, err, _ = validate_exception_record(mismatched_img_rec, "collectflow-backend")
+    assert not is_val
+    assert "image scope" in err and "does not match target image" in err
+
+def test_valid_exception_evaluation(tmp_path):
+    """Valid exception with full schema and future expiry properly resolves finding (WP05-F01)."""
+    valid_exp_file = tmp_path / "valid_exceptions.json"
+    valid_exp_file.write_text(json.dumps({
+        "schema_version": "2.0.0",
+        "exceptions": [
+            {
+                "cve_id": "CVE-2026-1234",
+                "package_name": "zlib1g",
+                "affected_image": "collectflow-backend",
+                "rationale": "Patch pending upstream, mitigated in container",
+                "approver": "SecGovernance",
+                "approval_reference": "SEC-2026-001",
+                "expires_at": "2030-12-31"
+            }
+        ]
+    }), encoding="utf-8")
+
+    trivy_report = tmp_path / "trivy_report.json"
+    trivy_report.write_text(json.dumps({
+        "SchemaVersion": 2,
+        "Results": [
+            {
+                "Target": "collectflow-backend",
+                "Vulnerabilities": [
+                    {
+                        "VulnerabilityID": "CVE-2026-1234",
+                        "PkgName": "zlib1g",
+                        "Severity": "HIGH"
+                    }
+                ]
+            }
+        ]
+    }), encoding="utf-8")
+
+    res, errs = evaluate_trivy_report(trivy_report, valid_exp_file, "collectflow-backend")
+    assert errs == []
+    assert res["verdict"] == "PASS_WITH_APPROVED_EXCEPTIONS"
+    assert res["high_count"] == 1
+    assert res["unapproved_high_count"] == 0
+    assert len(res["applied_exceptions"]) == 1
+
+def test_container_scan_missing_evidence_rejection(tmp_path):
+    """Container scan missing evidence_file or checksum is rejected (WP05-F02)."""
+    manifest = create_valid_evidence_bundle(tmp_path)
+    del manifest["container_artifacts"]["backend"]["security_scan"]["evidence_file"]
+    errors = validate_manifest(manifest, verify_git_shas=False, verify_docker_images=False)
+    assert any("Missing mandatory container scan evidence_file for backend" in e for e in errors)
+
+def test_container_scan_evidence_checksum_mismatch(tmp_path):
+    """Tampered or altered container scan report failing SHA-256 is rejected (WP05-F02)."""
+    manifest = create_valid_evidence_bundle(tmp_path)
+    manifest["container_artifacts"]["backend"]["security_scan"]["evidence_sha256"] = "0" * 64
+    errors = validate_manifest(manifest, verify_git_shas=False, verify_docker_images=False)
+    assert any("backend container scan evidence checksum mismatch" in e for e in errors)
+
+def test_forged_scan_pass_verdict_rejection(tmp_path):
+    """Manifest claiming scan_verdict=PASS when Trivy report actually contains HIGH/CRITICAL vulnerabilities is rejected (WP05-F02)."""
+    manifest = create_valid_evidence_bundle(tmp_path)
+    b_trivy = Path(manifest["container_artifacts"]["backend"]["security_scan"]["evidence_file"])
+    b_trivy.write_text(json.dumps({
+        "SchemaVersion": 2,
+        "Results": [
+            {
+                "Target": "app",
+                "Vulnerabilities": [
+                    {
+                        "VulnerabilityID": "CVE-2026-9999",
+                        "PkgName": "libsqlite3-0",
+                        "Severity": "CRITICAL"
+                    }
+                ]
+            }
+        ]
+    }), encoding="utf-8")
+    manifest["container_artifacts"]["backend"]["security_scan"]["evidence_sha256"] = hashlib.sha256(b_trivy.read_bytes()).hexdigest()
+    manifest["container_artifacts"]["backend"]["scan_verdict"] = "PASS"
+    manifest["container_artifacts"]["backend"]["security_scan"]["critical_count"] = 0
+
+    errors = validate_manifest(manifest, verify_git_shas=False, verify_docker_images=False)
+    assert any("forgery detected" in e or "CRITICAL count mismatch" in e for e in errors)
+
+def test_malformed_trivy_report_rejection(tmp_path):
+    """Trivy report missing SchemaVersion or Results is rejected fail-closed (WP05-F02)."""
+    manifest = create_valid_evidence_bundle(tmp_path)
+    b_trivy = Path(manifest["container_artifacts"]["backend"]["security_scan"]["evidence_file"])
+    b_trivy.write_text(json.dumps({"incomplete": True}), encoding="utf-8")
+    manifest["container_artifacts"]["backend"]["security_scan"]["evidence_sha256"] = hashlib.sha256(b_trivy.read_bytes()).hexdigest()
+
+    errors = validate_manifest(manifest, verify_git_shas=False, verify_docker_images=False)
+    assert any("missing required SchemaVersion or Results" in e for e in errors)
+
+def test_verify_release_candidate_fails_when_evidence_missing(tmp_path):
+    """verify_release_candidate fails closed (exit code 1) when mandatory evidence files are missing (WP05-F03)."""
+    rc_script = PROJECT_ROOT / "scripts/ci/verify_release_candidate.py"
+    cmd = [
+        sys.executable,
+        str(rc_script),
+        "--backend-dir", str(PROJECT_ROOT),
+        "--frontend-dir", str(PROJECT_ROOT / "../cash-flow-buddy-101"),
+        "--backend-test-report", str(tmp_path / "nonexistent-test.json"),
+        "--skip-docker-verify",
+        "--skip-git-verify"
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    assert res.returncode == 1
+    assert "Mandatory release candidate quality gate evidence is missing" in res.stderr
+
