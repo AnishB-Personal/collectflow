@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: collectflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-collectflow_integration}
+      POSTGRES_USER: ${POSTGRES_USER:-collectflow_user}
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-collectflow_user} -d ${POSTGRES_DB:-collectflow_integration}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  backend:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: collectflow-backend:latest
+    container_name: collectflow-backend
+    restart: unless-stopped
+    environment:
+      COLLECTFLOW_ENV: ${COLLECTFLOW_ENV:-integration}
+      COLLECTFLOW_DB_PATH: /app/data/collectflow_integration.db
+      COLLECTFLOW_DB_HOST: postgres
+      COLLECTFLOW_DB_PORT: "5432"
+      COLLECTFLOW_DB_NAME: ${POSTGRES_DB:-collectflow_integration}
+      COLLECTFLOW_DB_USER: ${POSTGRES_USER:-collectflow_user}
+      COLLECTFLOW_DB_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+
+  frontend:
+    build:
+      context: ../../../cash-flow-buddy-101
+      dockerfile: Dockerfile
+    image: collectflow-frontend:latest
+    container_name: collectflow-frontend
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      HOST: 0.0.0.0
+      NODE_ENV: production
+    networks:
+      - internal
+
+  proxy:
+    image: nginx:1.27-alpine
+    container_name: collectflow-proxy
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  pgdata:
+    driver: local
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt

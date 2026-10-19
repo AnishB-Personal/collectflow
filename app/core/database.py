@@ -19,6 +19,7 @@ import ipaddress
 import os
 import re
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Generator
 from sqlalchemy import create_engine
 from sqlalchemy.engine import make_url, URL
@@ -68,6 +69,60 @@ DEFAULT_TRUSTED_CONTAINER_HOSTS = {
 }
 
 
+def read_secret_file(file_path: str) -> str:
+    """Safely read secret content from file path, trimming whitespace and newlines."""
+    if not file_path:
+        raise ValueError("Secret file path cannot be empty.")
+    p = Path(file_path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Secret file not found: {file_path}")
+    content = p.read_text(encoding="utf-8").strip()
+    if not content:
+        raise ValueError(f"Secret file '{file_path}' is empty.")
+    return content
+
+
+def get_db_password() -> str | None:
+    """Retrieve database password from environment variable or secret file."""
+    pw = os.environ.get("COLLECTFLOW_DB_PASSWORD")
+    if pw:
+        return pw
+    pw_file = os.environ.get("COLLECTFLOW_DB_PASSWORD_FILE")
+    if pw_file:
+        return read_secret_file(pw_file)
+    return None
+
+
+def get_custom_database_url() -> str | None:
+    """Retrieve database URL from environment variable or secret file."""
+    url = os.environ.get("COLLECTFLOW_DATABASE_URL")
+    if url:
+        return url
+    url_file = os.environ.get("COLLECTFLOW_DATABASE_URL_FILE")
+    if url_file:
+        return read_secret_file(url_file)
+    return None
+
+
+def parse_db_port(raw_port: str | int | None) -> int:
+    """
+    Strictly parse and validate database port.
+    Defaults to 5432 when omitted or empty.
+    Raises ValueError if provided value is not an integer between 1 and 65535.
+    """
+    if raw_port is None:
+        return 5432
+    if isinstance(raw_port, str) and raw_port.strip() == "":
+        return 5432
+    try:
+        port = int(raw_port)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid database port '{raw_port}': must be an integer between 1 and 65535.")
+    if not (1 <= port <= 65535):
+        raise ValueError(f"Invalid database port '{port}': out of range (must be 1-65535).")
+    return port
+
+
 def sanitize_credentials(text: str) -> str:
     """Mask credentials in database connection strings, error messages, and traces."""
     if not text:
@@ -78,7 +133,10 @@ def sanitize_credentials(text: str) -> str:
     # Scrub query param passwords
     s = re.sub(r"([?&]pass(?:word)?=)[^&]+", r"\1***", s, flags=re.IGNORECASE)
     # Scrub known environment password if present
-    env_pass = os.environ.get("COLLECTFLOW_DB_PASSWORD")
+    try:
+        env_pass = get_db_password()
+    except Exception:
+        env_pass = os.environ.get("COLLECTFLOW_DB_PASSWORD")
     if env_pass and len(env_pass) >= 4 and env_pass in s:
         s = s.replace(env_pass, "***")
     return s
@@ -423,7 +481,7 @@ def get_database_url() -> str:
     if env_mode not in PERMITTED_ENV_MODES:
         raise RuntimeError(f"CRITICAL ISOLATION ERROR: Unauthorized COLLECTFLOW_ENV '{raw_env}'.")
 
-    custom_url = os.environ.get("COLLECTFLOW_DATABASE_URL")
+    custom_url = get_custom_database_url()
     if not custom_url:
         if env_mode == "test":
             raise RuntimeError(
@@ -432,7 +490,7 @@ def get_database_url() -> str:
             )
         elif env_mode in PERMITTED_PROD_MODES:
             db_user = os.environ.get("COLLECTFLOW_DB_USER")
-            db_pass = os.environ.get("COLLECTFLOW_DB_PASSWORD")
+            db_pass = get_db_password()
             db_host = os.environ.get("COLLECTFLOW_DB_HOST")
             db_name = os.environ.get("COLLECTFLOW_DB_NAME")
             if not all([db_user, db_pass, db_host, db_name]):
@@ -441,8 +499,7 @@ def get_database_url() -> str:
                     "COLLECTFLOW_DB_PASSWORD, COLLECTFLOW_DB_HOST, and COLLECTFLOW_DB_NAME) is required in "
                     f"'{env_mode}' mode. Missing required database configuration."
                 )
-            db_port = os.environ.get("COLLECTFLOW_DB_PORT", "5432")
-            port_val = int(db_port) if (db_port and str(db_port).isdigit()) else 5432
+            port_val = parse_db_port(os.environ.get("COLLECTFLOW_DB_PORT"))
             db_sslmode = os.environ.get("COLLECTFLOW_DB_SSLMODE")
             query_params = {"sslmode": db_sslmode} if db_sslmode else {}
             # Safe URL construction via URL.create() with automatic character escaping
@@ -459,16 +516,16 @@ def get_database_url() -> str:
         else:
             # Non-test development/sandbox modes
             db_user = os.environ.get("COLLECTFLOW_DB_USER")
-            db_pass = os.environ.get("COLLECTFLOW_DB_PASSWORD")
+            db_pass = get_db_password()
             if not db_user or not db_pass:
                 raise RuntimeError(
                     "CRITICAL ISOLATION ERROR: Explicit COLLECTFLOW_DATABASE_URL (or COLLECTFLOW_DB_USER and "
                     "COLLECTFLOW_DB_PASSWORD) is required. Hardcoded reusable credentials are not permitted in application source."
                 )
             db_host = os.environ.get("COLLECTFLOW_DB_HOST", "127.0.0.1")
-            db_port = os.environ.get("COLLECTFLOW_DB_PORT", "5432")
-            port_val = int(db_port) if (db_port and str(db_port).isdigit()) else 5432
-            db_name = os.environ.get("COLLECTFLOW_DB_NAME", "collectflow_dev")
+            port_val = parse_db_port(os.environ.get("COLLECTFLOW_DB_PORT"))
+            default_db = "collectflow_integration" if env_mode == "integration" else "collectflow_dev"
+            db_name = os.environ.get("COLLECTFLOW_DB_NAME", default_db)
             # Safe URL construction via URL.create() with automatic character escaping
             url_obj = URL.create(
                 drivername="postgresql+psycopg",

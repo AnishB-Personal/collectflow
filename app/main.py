@@ -108,6 +108,7 @@ TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "templates", "index.html
 
 
 @app.get("/health")
+@app.get("/api/health")
 def health_check():
     """Liveness probe."""
     return {"status": "healthy", "service": "CollectFlow", "version": "1.0.0"}
@@ -119,6 +120,7 @@ from app.models.domain_models import Customer, FinancialYear, GstRateMaster, Tds
 
 
 @app.get("/ready")
+@app.get("/api/ready")
 def readiness_check():
     """Readiness probe checking database connectivity (sanitized against exception leakage)."""
     try:
