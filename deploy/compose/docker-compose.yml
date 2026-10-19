@@ -45,7 +45,9 @@ services:
 
   frontend:
     build:
-      context: ../../../cash-flow-buddy-101
+      # Sibling-repository layout: assumes cash-flow-buddy-101 and collectflow share parent directory
+      # Can be overridden via FRONTEND_BUILD_CONTEXT environment variable
+      context: ${FRONTEND_BUILD_CONTEXT:-../../../cash-flow-buddy-101}
       dockerfile: Dockerfile
     image: collectflow-frontend:latest
     container_name: collectflow-frontend
@@ -61,8 +63,14 @@ services:
     image: nginx:1.27-alpine
     container_name: collectflow-proxy
     restart: unless-stopped
+    # SECURITY NOTICE:
+    # 1. Binds to loopback 127.0.0.1 by default to prevent unencrypted HTTP exposure.
+    # 2. Configurable via APP_BIND_IP for controlled local networks.
+    # 3. HTTP-only configuration intended strictly for isolated local integration.
+    # 4. PROHIBITED AS-IS FOR PUBLIC / AWS DEPLOYMENTS: Any production or cloud deployment
+    #    MUST terminate TLS externally (e.g., via AWS ALB, Cloudflare, or ingress proxy).
     ports:
-      - "${APP_PORT:-8080}:80"
+      - "${APP_BIND_IP:-127.0.0.1}:${APP_PORT:-8080}:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
