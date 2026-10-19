@@ -9,10 +9,12 @@
 
 | Repository | Branch | Commit Hash (Security Corrections Applied) | Baseline (Accepted WP-03 / WP-02) |
 | :--- | :--- | :--- | :--- |
-| **Backend (`collectflow`)** | `feature/release-wp04-secure-auth-sessions` | `c3887267669945c407458afbf85483b9dde8646b` | `b21f26a82ffd50f67b17d0ca0b20b5df9c3907d0` |
-| **Frontend (`cash-flow-buddy-101`)** | `feature/release-wp04-secure-auth-sessions` | `3476b7f715d428320f766f0d93ea4b0d6da0f64a` | `8907890900fff40d5eafebe2a08540da17e697a7` |
+| **Backend (`collectflow`)** | `feature/release-wp04-secure-auth-sessions` | `1eace2a636750938bfbbea04ab84fc6c48b8992a` | `b21f26a82ffd50f67b17d0ca0b20b5df9c3907d0` |
+| **Frontend (`cash-flow-buddy-101`)** | `feature/release-wp04-secure-auth-sessions` | `93e47e0756a80fa1ebf5afd41e9dc0f78655d7ca` | `8907890900fff40d5eafebe2a08540da17e697a7` |
 
 Both branches were branched directly from their respective accepted parent baselines, pushed to remote origins, and verified with clean working trees.
+
+> **Note on Backend SHA Reconciliation:** The previously submitted text contained an errant representation `1eace2aa021c1f5e88fcce36d078170c069c991e`. The verified remote HEAD is confirmed as `1eace2a636750938bfbbea04ab84fc6c48b8992a` (with source security corrections at commit `c3887267669945c407458afbf85483b9dde8646b`).
 
 ---
 
@@ -110,10 +112,10 @@ Both branches were branched directly from their respective accepted parent basel
 #### 4.2 Frontend Test Results (`cash-flow-buddy-101`)
 ```text
  Test Files  44 passed (44)
-      Tests  612 passed (612)
-   Duration  39.54s
+      Tests  620 passed (620)
+   Duration  36.01s
 ```
-- **New Test Suite:** `src/test/wp04-auth-sessions-csrf.test.tsx` (16/16 passed)
+- **Test Suite:** `src/test/wp04-auth-sessions-csrf.test.tsx` (24/24 passed)
   - `credentials: "same-origin"` attached on all requests.
   - Automated `X-CSRF-Token` attachment on mutations.
   - 403 CSRF auto-retry with `/api/auth/csrf-token` refresh.
@@ -126,7 +128,17 @@ Both branches were branched directly from their respective accepted parent basel
   - `PasswordRotationModal` sign out action.
   - **WP04-02**: `logout()` returns typed `LogoutResult` handling 200, 401, 403, 500, and network error.
   - **WP04-03**: `downloadExport()` attaches `credentials: "same-origin"`.
-- **Frontend Production Build:** `npm run build` executed and passed cleanly with Nitro SSR artifacts emitted.
+  - **WP04-R01**: Workspace UI logout integration:
+    - Confirmed logout (200 OK) navigates to `/login` without warning screen.
+    - Logout server rejection (HTTP 403) displays warning alert, clears local session, and enables manual navigation.
+    - Logout server error (HTTP 500) displays warning alert with status code.
+    - Logout network failure displays warning alert and allows Retry Logout recovery.
+    - Logout from PasswordRotationModal handles server revocation failure gracefully.
+  - **WP04-R02**: Stale session state restoration prevention:
+    - In-flight `/me` request does NOT restore user or CSRF token if logout occurs before response.
+    - In-flight CSRF refresh does NOT restore CSRF token if logout occurs before response.
+    - Late `/me` from an older session does NOT overwrite a newly authenticated user.
+- **Frontend Production Build:** `npm run build` executed and passed cleanly in 917ms with Nitro SSR artifacts emitted.
 
 ---
 
@@ -165,7 +177,44 @@ Both branches were branched directly from their respective accepted parent basel
 
 ---
 
-### 6. Summary of Modified Files
+### 6. Focused Re-Review Corrections Implemented (WP04-R01 & WP04-R02)
+
+1. **WP04-R01 — Complete Logout UI Integration (`src/components/collectflow/workspace.tsx`)**:
+   - `handleLogout()` inspects the structured `LogoutResult` returned by `apiClient.logout()`.
+   - On confirmed revocation (`serverRevoked: true`): Clears previous warnings, clears `mustRotatePassword(false)`, and executes `void routerNavigate({ to: "/login" })`.
+   - On failed or unconfirmed revocation (`serverRevoked: false`):
+     - Clears the local UI session (`setMustRotatePassword(false)`, `setLiveAuthState("unauthenticated")`).
+     - Suppresses normal workspace financial queries and data tables.
+     - Does NOT display a normal logout-success message.
+     - Displays an accessible alert banner (`role="alert"`, `"Server Logout Incomplete"`) containing `logoutWarning.message`.
+     - Provides recovery actions without exposing tokens, cookies, or credentials:
+       - `"Retry Logout"` (re-attempts server revocation with disabled state during flight).
+       - `"Proceed to Login"` (allows user to navigate to `/login` explicitly).
+   - Preserves `PasswordRotationModal` behavior (`onLogout={handleLogout}`). If revocation fails, modal is dismissed and alert warning screen is rendered.
+   - Preserves same-origin credentials on logout requests.
+
+2. **WP04-R02 — Prevent Stale Session State Restoration (`src/lib/api-client.ts`)**:
+   - `fetchCurrentUser()`: Validates `this.sessionGeneration === requestGeneration` before assigning `this.csrfToken` or `this.inMemoryUser`. If session generation changed (due to logout, session clearance, or new login), ignores the response and throws `ApiError(401, "Session invalidated during user verification.")`.
+   - `fetchCsrfToken()`: Captures `requestGeneration = this.sessionGeneration` and checks `this.sessionGeneration === requestGeneration` before assigning `this.csrfToken`. Prevents late CSRF responses from restoring tokens post-logout.
+   - `ensureAuthenticated()`: Checks `this.sessionGeneration === requestGeneration` before calling `clearSession()` on error, preventing redundant state mutation.
+   - Preserves login-sequence and cancellation safeguards.
+   - Verified via comprehensive deferred-promise race tests.
+
+---
+
+### 7. Additional Verification & Operational Boundaries
+
+1. **Production CSRF Fail-Closed Safety**: Verified in `test_wp04_auth_sessions_csrf.py:test_production_fails_closed_without_csrf_secret`. In staging/production environments, FastAPI engine startup fails immediately with `RuntimeError` if a stable 32+ character CSRF secret is absent.
+2. **Export Download Flow**: Verified in `test_export_ticket_caller_authentication_and_isolation` and `downloadExport` frontend tests. Export tickets strictly validate active session, user ownership, and admin/finance role. Unauthenticated or mismatched requests fail closed with 401/403, and tickets remain unconsumed.
+3. **Mandatory Password Rotation & RBAC Regressions**: All 214 Phase 4C financial logic, reconciliation, and RBAC tests pass with 0 regressions.
+4. **Local HTTPS Browser & Docker Compose Integration**:
+   - The local Docker Compose setup (`docker-compose.yml`) binds Nginx to `127.0.0.1:8080` over HTTP for isolated local development and integration testing.
+   - It is strictly prohibited to expose this local HTTP configuration directly to the public Internet or use it unmodified for AWS production.
+   - Production HTTPS termination must be handled by an upstream TLS reverse proxy / load balancer (e.g., AWS ALB or TLS-terminating ingress), allowing `COLLECTFLOW_ENV=production` to enforce `__Host-` prefixed, `Secure=True`, host-only cookies under RFC 6265bis.
+
+---
+
+### 8. Summary of Modified Files
 
 #### Backend (`collectflow`):
 - `app/core/auth_security.py` (updated: CSRF secret from env/file validation, RFC 6265bis secure cookie deletion)
@@ -176,8 +225,9 @@ Both branches were branched directly from their respective accepted parent basel
 - `tests/test_audit_remediation_regressions.py` (updated: test_h07 user flag handling)
 - `tests/test_stage4c2_live_services.py` (updated: strong password in user creation test)
 - `tests/test_wp04_auth_sessions_csrf.py` (expanded: 20 negative and positive tests covering WP04-01 through WP04-06)
-- `docs/reviews/COLLECTFLOW_RELEASE_WP04_IMPLEMENTATION_REPORT.md` (updated)
+- `docs/reviews/COLLECTFLOW_RELEASE_WP04_IMPLEMENTATION_REPORT.md` (updated with WP04-R01 and WP04-R02 resolutions)
 
 #### Frontend (`cash-flow-buddy-101`):
-- `src/lib/api-client.ts` (updated: LogoutResult interface, typed logout semantics, export download credentials)
-- `src/test/wp04-auth-sessions-csrf.test.tsx` (expanded: 16 tests covering logout semantics, status codes, and credentials)
+- `src/lib/api-client.ts` (updated: LogoutResult interface, session generation validation in fetchCurrentUser/fetchCsrfToken)
+- `src/components/collectflow/workspace.tsx` (updated: LogoutResult inspection, incomplete logout alert screen, recovery actions)
+- `src/test/wp04-auth-sessions-csrf.test.tsx` (expanded: 24 tests covering logout semantics, UI integration, and race conditions)
