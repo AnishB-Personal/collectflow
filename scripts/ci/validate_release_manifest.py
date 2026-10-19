@@ -285,12 +285,13 @@ def validate_manifest(
                                     f"{component} container scan claimed PASS, but report contains {rep_crit} CRITICAL and {rep_high} HIGH vulnerabilities (forgery detected)"
                                 )
                         elif scan_verdict == "PASS_WITH_APPROVED_EXCEPTIONS":
-                            import os
-                            ext_token = os.environ.get("COLLECTFLOW_EXTERNAL_SECURITY_APPROVAL_TOKEN")
-                            if not ext_token or len(ext_token.strip()) < 32 or "self" in ext_token.lower() or "dummy" in ext_token.lower():
-                                errors.append(
-                                    f"{component} vulnerability exceptions rejected: repository cannot self-approve exceptions without independently controlled external approval (WP05-G01)"
-                                )
+                            # WP05-H01: Reject PASS_WITH_APPROVED_EXCEPTIONS during formal RC validation
+                            # until independently authenticated approval verification exists.
+                            errors.append(
+                                f"{component} container scan claimed verdict 'PASS_WITH_APPROVED_EXCEPTIONS', "
+                                "which is strictly rejected: vulnerability exception authorization is disabled "
+                                "pending an independently authenticated security-governance integration (WP05-H01)."
+                            )
                             applied = sec_scan_meta.get("applied_exceptions", [])
                             if not isinstance(applied, list):
                                 errors.append(f"{component} container scan applied_exceptions must be a structured list")

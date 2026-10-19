@@ -94,6 +94,19 @@ Both repositories were branched directly from their accepted baselines without d
 3. **Formal RC Mode Enforcement:** `validate_release_manifest.py` enforces `--formal-rc` mode, rejecting any validation invocation where Docker image verification, Git SHA verification, or evidence integrity checks were omitted.
 4. **Pinned Trivy Scanner & Provenance Tracking:** Declared and pinned Trivy scanner version (`v0.58.2`), verified binary installation, and recorded scanner installation provenance in container scan metadata and release manifests.
 
+### WP05-H01 — HIGH: Disable Unverified Exception Authorization
+1. **Unconditional Rejection of Nonempty Exception Lists:** Updated `scripts/ci/vulnerability_exceptions.py` so that any nonempty exception list is rejected fail-closed during CI and formal RC verification, regardless of environment tokens.
+2. **Rejection of PASS_WITH_APPROVED_EXCEPTIONS:** Updated `scripts/ci/validate_release_manifest.py` so that `PASS_WITH_APPROVED_EXCEPTIONS` is strictly rejected during formal RC validation until independently authenticated approval verification exists.
+3. **Preserved HIGH/CRITICAL Vulnerability Blocking:** Any unapproved HIGH or CRITICAL vulnerability continues to block container release.
+4. **Retained Schema-Validation Code:** Kept `validate_exception_record` intact for future governance schema evaluation without treating schema validity as approval.
+5. **Negative Test Suite Expanded:** Replaced synthetic-token success test with negative tests proving that arbitrary long environment tokens cannot authorize exceptions (`test_arbitrary_environment_token_cannot_authorize_exceptions`, `test_pass_with_approved_exceptions_rejected_in_manifest_validation`, `test_arbitrary_tokens_cannot_authorize_exceptions`).
+6. **Feature Formally Unavailable:** Documented the vulnerability exception mechanism as intentionally unavailable pending a separately approved security-governance integration.
+
+### WP05-H02 — HIGH: Establish Reproducible CI Tool Setup
+1. **Playwright Chromium & Dependency Installation:** In `.github/workflows/release-candidate.yml` and `.github/workflows/frontend-ci.yml`, added deterministic browser and Linux dependency installation: `npx playwright install --with-deps chromium` using the committed package version (`@playwright/test: ^1.64.0`), failing closed if installation fails.
+2. **Immutable Trivy Source & Cryptographic Verification:** Replaced `curl | sh` with official immutable GitHub release archive (`trivy_0.58.2_Linux-64bit.tar.gz`) pinned to SHA-256 `aa2c0ed6932ae70171b4f0f3fdb0403e29d9ce7e6fddad0ea08d440fdd695742`, verifying version output (`0.58.2`) and failing closed if download, checksum, or version check fails.
+3. **Preserved Complete Regressions & Invariants:** Maintained complete backend pytest (274 passing, 71 legacy SQLite quarantined), frontend Vitest (620 passing across 44 files), Playwright mock (10 passing), disposable Compose integration, zero external publication, and zero automatic deployment.
+
 ---
 
 ## 2. Changed-File Manifests
@@ -354,7 +367,7 @@ Executed `scripts/ci/test_disposable_compose.sh` against an ephemeral project st
 
 | Suite | Previous Accepted Baseline | Post-Implementation Result | Delta / Explanation |
 | :--- | :--- | :--- | :--- |
-| **Backend (`collectflow`)** | 240 passed, 71 skipped, 0 failed | **273 passed, 71 skipped, 0 failed** | +33 passed tests in `tests/ci/test_wp05_ci_release_gates.py`; 71 legacy SQLite tests quarantined in `conftest.py` preserved; 0 failures. |
+| **Backend (`collectflow`)** | 240 passed, 71 skipped, 0 failed | **274 passed, 71 skipped, 0 failed** | +34 passed tests in `tests/ci/test_wp05_ci_release_gates.py`; 71 legacy SQLite tests quarantined in `conftest.py` preserved; 0 failures. |
 | **Frontend (`cash-flow-buddy-101`)** | 620 passed across 44 test files, 0 failed | **620 passed across 44 test files, 0 failed** | Zero test modifications; all 44 test files passing cleanly. |
 
 ### Quarantined Legacy SQLite Tests (71 skipped)

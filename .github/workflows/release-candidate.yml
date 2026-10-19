@@ -100,16 +100,28 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install and Verify Pinned Trivy Scanner
+      - name: Install and Verify Pinned Trivy Scanner (Immutable Source & Checksum)
         env:
           TRIVY_VERSION: "0.58.2"
+          EXPECTED_SHA256: "aa2c0ed6932ae70171b4f0f3fdb0403e29d9ce7e6fddad0ea08d440fdd695742"
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin "v${TRIVY_VERSION}"
+          TAR_PATH="/tmp/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "Downloading Trivy v${TRIVY_VERSION} from official immutable release..."
+          curl -sfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o "${TAR_PATH}"
+          ACTUAL_SHA="$(sha256sum "${TAR_PATH}" | awk '{print $1}')"
+          echo "Downloaded Tarball SHA-256: ${ACTUAL_SHA}"
+          if [[ "${ACTUAL_SHA}" != "${EXPECTED_SHA256}" ]]; then
+            echo "ERROR: Trivy tarball checksum verification failed! Expected ${EXPECTED_SHA256}, got ${ACTUAL_SHA}"
+            exit 1
+          fi
+          sudo tar -xzf "${TAR_PATH}" -C /usr/local/bin trivy
+          sudo chmod +x /usr/local/bin/trivy
           TRIVY_BIN=$(which trivy)
           TRIVY_VER=$(trivy --version | head -n 1)
-          echo "Scanner binary: ${TRIVY_BIN}"
-          echo "Scanner version: ${TRIVY_VER}"
-          if [[ -z "${TRIVY_BIN}" || -z "${TRIVY_VER}" ]]; then
+          echo "Scanner binary:    ${TRIVY_BIN}"
+          echo "Scanner version:   ${TRIVY_VER}"
+          echo "Scanner checksum:  ${ACTUAL_SHA}"
+          if [[ -z "${TRIVY_BIN}" || -z "${TRIVY_VER}" || "${TRIVY_VER}" != *"0.58.2"* ]]; then
             echo "ERROR: Pinned Trivy installation verification failed"
             exit 1
           fi
@@ -167,6 +179,13 @@ jobs:
         run: |
           cd cash-flow-buddy-101
           npm ci
+          echo "Installing Playwright Chromium browser and Linux system dependencies..."
+          if ! npx playwright install --with-deps chromium; then
+            echo "ERROR: Playwright Chromium browser and system dependencies installation failed (WP05-H02)"
+            exit 1
+          fi
+          PW_VER=$(npx playwright --version)
+          echo "Verified Playwright version: ${PW_VER}"
           npm run typecheck
           npm run lint -- --format json -o /tmp/frontend-lint-report.json
           npm audit --audit-level=high

@@ -420,11 +420,11 @@ def test_exception_package_and_image_scope_mismatch(tmp_path):
     assert not is_val
     assert "image scope" in err and "does not match target image" in err
 
-def test_valid_exception_evaluation(tmp_path, monkeypatch):
-    """Valid exception with full schema and future expiry properly resolves finding when authorized (WP05-F01, WP05-G01)."""
-    monkeypatch.setenv("COLLECTFLOW_EXTERNAL_SECURITY_APPROVAL_TOKEN", "sec_gov_external_auth_token_32chars_long_verified_ok!")
-    valid_exp_file = tmp_path / "valid_exceptions.json"
-    valid_exp_file.write_text(json.dumps({
+def test_arbitrary_environment_token_cannot_authorize_exceptions(tmp_path, monkeypatch):
+    """Arbitrary long environment token cannot authorize exceptions; nonempty list is unconditionally rejected (WP05-H01)."""
+    monkeypatch.setenv("COLLECTFLOW_EXTERNAL_SECURITY_APPROVAL_TOKEN", "arbitrary_external_auth_token_at_least_64_chars_long_1234567890abcdef!")
+    exp_file = tmp_path / "exceptions.json"
+    exp_file.write_text(json.dumps({
         "schema_version": "2.0.0",
         "exceptions": [
             {
@@ -439,29 +439,16 @@ def test_valid_exception_evaluation(tmp_path, monkeypatch):
         ]
     }), encoding="utf-8")
 
-    trivy_report = tmp_path / "trivy_report.json"
-    trivy_report.write_text(json.dumps({
-        "SchemaVersion": 2,
-        "Results": [
-            {
-                "Target": "collectflow-backend",
-                "Vulnerabilities": [
-                    {
-                        "VulnerabilityID": "CVE-2026-1234",
-                        "PkgName": "zlib1g",
-                        "Severity": "HIGH"
-                    }
-                ]
-            }
-        ]
-    }), encoding="utf-8")
+    valid_exps, errors = load_and_validate_exceptions(exp_file, "collectflow-backend")
+    assert len(valid_exps) == 0
+    assert any("Vulnerability exception authorization is intentionally disabled" in e for e in errors)
 
-    res, errs = evaluate_trivy_report(trivy_report, valid_exp_file, "collectflow-backend")
-    assert errs == []
-    assert res["verdict"] == "PASS_WITH_APPROVED_EXCEPTIONS"
-    assert res["high_count"] == 1
-    assert res["unapproved_high_count"] == 0
-    assert len(res["applied_exceptions"]) == 1
+def test_pass_with_approved_exceptions_rejected_in_manifest_validation(tmp_path):
+    """PASS_WITH_APPROVED_EXCEPTIONS is strictly rejected during release manifest validation (WP05-H01)."""
+    manifest = create_valid_evidence_bundle(tmp_path)
+    manifest["container_artifacts"]["backend"]["scan_verdict"] = "PASS_WITH_APPROVED_EXCEPTIONS"
+    errors = validate_manifest(manifest, verify_git_shas=False, verify_docker_images=False)
+    assert any("PASS_WITH_APPROVED_EXCEPTIONS" in e and "strictly rejected" in e for e in errors)
 
 
 def test_container_scan_missing_evidence_rejection(tmp_path):
@@ -531,7 +518,7 @@ def test_verify_release_candidate_fails_when_evidence_missing(tmp_path):
     assert "Mandatory release candidate quality gate evidence is missing" in res.stderr
 
 def test_self_declared_exceptions_rejected_without_external_token(tmp_path, monkeypatch):
-    """Non-empty exceptions in repository JSON are rejected fail-closed without external security token (WP05-G01)."""
+    """Non-empty exceptions in repository JSON are rejected fail-closed without external security token (WP05-G01, WP05-H01)."""
     monkeypatch.delenv("COLLECTFLOW_EXTERNAL_SECURITY_APPROVAL_TOKEN", raising=False)
     exp_file = tmp_path / "exceptions.json"
     exp_file.write_text(json.dumps({
@@ -550,7 +537,7 @@ def test_self_declared_exceptions_rejected_without_external_token(tmp_path, monk
     }), encoding="utf-8")
     valid_exps, errors = load_and_validate_exceptions(exp_file, "collectflow-backend")
     assert len(valid_exps) == 0
-    assert any("Self-declared vulnerability exceptions found" in e for e in errors)
+    assert any("Vulnerability exception authorization is intentionally disabled" in e for e in errors)
 
 def test_wildcard_image_scope_rejected():
     """Wildcard affected_image ('*') is strictly rejected (WP05-G01)."""
@@ -567,10 +554,10 @@ def test_wildcard_image_scope_rejected():
     assert not is_val
     assert "Wildcard or mismatched image scope" in err
 
-def test_fabricated_approval_token_rejected(tmp_path, monkeypatch):
-    """Short or dummy/mock external approval token is strictly rejected (WP05-G01)."""
-    for bad_token in ["dummy", "mock_token_12345", "test_token_self_approved", "short_token"]:
-        monkeypatch.setenv("COLLECTFLOW_EXTERNAL_SECURITY_APPROVAL_TOKEN", bad_token)
+def test_arbitrary_tokens_cannot_authorize_exceptions(tmp_path, monkeypatch):
+    """Arbitrary environment tokens cannot authorize exceptions; all are rejected (WP05-H01)."""
+    for test_token in ["dummy", "mock_token_12345", "test_token_self_approved", "short_token", "super_long_external_security_token_64_chars_ok!"]:
+        monkeypatch.setenv("COLLECTFLOW_EXTERNAL_SECURITY_APPROVAL_TOKEN", test_token)
         exp_file = tmp_path / "exceptions.json"
         exp_file.write_text(json.dumps({
             "schema_version": "2.0.0",
@@ -588,7 +575,7 @@ def test_fabricated_approval_token_rejected(tmp_path, monkeypatch):
         }), encoding="utf-8")
         valid_exps, errors = load_and_validate_exceptions(exp_file, "collectflow-backend")
         assert len(valid_exps) == 0
-        assert any("external security approval token" in e.lower() for e in errors)
+        assert any("Vulnerability exception authorization is intentionally disabled" in e for e in errors)
 
 def test_formal_rc_mode_rejects_diagnostic_bypasses(tmp_path):
     """formal_rc_mode strictly rejects verify_docker_images=False or verify_git_shas=False (WP05-G03)."""
