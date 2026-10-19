@@ -16,4 +16,9 @@ tests
 docs
 *.log
 .env*
+secrets*
+deploy/compose/secrets*
+*.pem
+*.key
 scripts/seed_postgres_fixtures.py
+.DS_Store

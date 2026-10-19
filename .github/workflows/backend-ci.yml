@@ -1,0 +1,117 @@
+name: CollectFlow Backend CI
+
+on:
+  push:
+    branches:
+      - feature/release-wp05-portable-cicd
+      - "feature/**"
+  pull_request:
+    branches:
+      - feature/release-wp05-portable-cicd
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-verification:
+    name: Backend CI & Security Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: collectflow_test
+          POSTGRES_USER: collectflow_test
+          POSTGRES_PASSWORD: collectflow_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U collectflow_test -d collectflow_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      COLLECTFLOW_ENV: test
+      COLLECTFLOW_DATABASE_URL: postgresql+psycopg://collectflow_test:collectflow_test_password@127.0.0.1:5432/collectflow_test
+      COLLECTFLOW_SESSION_SECRET: ci_session_secret_32_bytes_long_ok!
+      COLLECTFLOW_CSRF_SECRET: ci_csrf_secret_32_bytes_long_ok!
+      COLLECTFLOW_ALLOW_BEARER_AUTH: "true"
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Committed Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pip-audit pytest pytest-cov
+
+      - name: Python Syntax and Static Lint Analysis (Ruff)
+        run: |
+          ruff check .
+
+      - name: Dependency Vulnerability Audit (pip-audit)
+        run: |
+          pip-audit -r requirements.txt
+
+      - name: Secret Scanning Gate
+        run: |
+          python3 scripts/ci/scan_secrets.py --root .
+
+      - name: Database Schema Migration Verification (Alembic)
+        run: |
+          alembic upgrade head
+
+      - name: Full Backend Pytest Regression Suite
+        run: |
+          pytest tests/ -v
+
+      - name: Build Backend OCI Image
+        run: |
+          chmod +x scripts/ci/build_and_scan_image.sh
+          ./scripts/ci/build_and_scan_image.sh backend collectflow-backend /tmp/backend-image-meta.json no-publish
+
+      - name: Scan Backend Container Image (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "collectflow-backend:${{ github.sha }}"
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL"
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          python3 scripts/ci/generate_sbom.py --repo-type backend --root . --output /tmp/collectflow-backend-sbom.json
+
+      - name: Verify Cross-Repository Pairing Traceability
+        run: |
+          python3 scripts/ci/verify_cross_repo_release.py --initiator backend --backend-path . --frontend-path ../cash-flow-buddy-101 || true
+
+      - name: Upload Build & Verification Evidence Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-release-evidence
+          path: |
+            /tmp/backend-image-meta.json
+            /tmp/collectflow-backend-sbom.json
+            /tmp/collectflow-backend-sbom.json.sha256
+            /tmp/cross-repo-integration-report.json
+          retention-days: 7

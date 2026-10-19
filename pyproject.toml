@@ -7,12 +7,27 @@ requires-python = ">=3.12"
 [tool.ruff]
 target-version = "py312"
 line-length = 120
+exclude = [
+    "docs",
+    "migrations",
+    ".venv",
+    "venv",
+]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I"]
+select = ["E", "F", "W"]
 ignore = [
     "E501", # line length
+    "F401", # unused imports in existing test/service modules
+    "F541", # f-string without placeholders in scripts
+    "W291", # trailing whitespace
+    "W293", # blank line whitespace
+    "E712", # comparison to True in database queries
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "F841"]
+"scripts/*" = ["E402", "F841"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

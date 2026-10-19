@@ -1,5 +1,6 @@
 # Stage 1: Build virtual environment
-FROM python:3.12-slim AS builder
+ARG PYTHON_VERSION=3.12-slim-bookworm
+FROM python:${PYTHON_VERSION} AS builder
 
 WORKDIR /build
 
@@ -8,9 +9,16 @@ RUN python -m venv /opt/venv && \
     /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 # Stage 2: Minimal runtime image
-FROM python:3.12-slim AS runner
+FROM python:${PYTHON_VERSION} AS runner
 
 WORKDIR /app
+
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.title="collectflow-backend" \
+      org.opencontainers.image.description="CollectFlow FastAPI Backend" \
+      org.opencontainers.image.source="https://github.com/AnishB-Personal/collectflow" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.vendor="CollectFlow"
 
 # Create non-root group and user, ensure /app directory ownership
 RUN groupadd -g 10001 collectflow && \

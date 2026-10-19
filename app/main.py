@@ -2,13 +2,17 @@ import logging
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import func, select, text
 
-from app.database import query_all, query_one
+from app.core.auth_security import validate_security_configuration
+from app.core.database import get_db_session
+from app.models.domain_models import Customer, FinancialYear, GstRateMaster, TdsSectionMaster, User
 from app.routers import (
     auth,
     customers,
@@ -22,8 +26,6 @@ from app.routers import (
     targets,
     users,
 )
-from contextlib import asynccontextmanager
-from app.core.auth_security import validate_security_configuration
 from app.routers.auth import get_current_user
 
 # Configure structured logging
@@ -131,11 +133,6 @@ TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "templates", "index.html
 def health_check():
     """Liveness probe."""
     return {"status": "healthy", "service": "CollectFlow", "version": "1.0.0"}
-
-
-from sqlalchemy import text, select, func
-from app.core.database import get_db_session
-from app.models.domain_models import Customer, FinancialYear, GstRateMaster, TdsSectionMaster, User
 
 
 @app.get("/ready")
