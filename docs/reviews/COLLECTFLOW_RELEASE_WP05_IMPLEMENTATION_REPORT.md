@@ -74,6 +74,26 @@ Both repositories were branched directly from their accepted baselines without d
 2. **Action SHA Pinning:** Pinned all third-party GitHub Actions to immutable commit SHAs (`actions/checkout`, `actions/setup-python`, `actions/setup-node`, `actions/upload-artifact`, `aquasecurity/trivy-action`).
 3. **Explicit Environmental Status:** Formally recorded live browser and HTTPS SSL tests as `NOT_EXECUTED` with documented environmental requirements.
 
+### WP05-G01 — HIGH: Prevent Self-Declared Security Exceptions
+1. **Zero-Active-Exception Baseline Preserved:** Maintained zero active vulnerability exceptions (`exceptions: []`) in `security/vulnerability-exceptions.json` across both repositories.
+2. **Rejection of Repository-Asserted Exceptions:** `scripts/ci/vulnerability_exceptions.py` strictly prevents repository JSON files from self-approving exceptions. Any nonempty exception list requires a separately trusted external security approval token (`COLLECTFLOW_EXTERNAL_SECURITY_APPROVAL_TOKEN` with length >= 32 and no mock/dummy markers).
+3. **Wildcard Image Scope Rejection:** Wildcard image scopes (`affected_image: "*"`) and mismatched image scopes are strictly rejected.
+4. **Manifest Validator External Approval Enforcement:** `validate_release_manifest.py` verifies that `PASS_WITH_APPROVED_EXCEPTIONS` cannot be claimed without external security approval token verification.
+
+### WP05-G02 — HIGH: Comprehensive Automated Quality Gate Execution
+1. **Full Test Suite Execution:** Replaced focused test invocation with full regression suites in `.github/workflows/release-candidate.yml`.
+   - **Backend:** Executes full 344-item pytest suite against PostgreSQL 16 service container (`alembic upgrade head && pytest tests/`).
+   - **Frontend:** Executes full 620-test Vitest suite and 10-test Playwright mock browser suite.
+2. **Reproducible Dependency Installation:** Replaced loose `npm install` fallbacks with deterministic `npm ci`.
+3. **Removal of Command-Level Error Suppression:** Removed `|| true` from all linting, audit, and testing steps across backend and frontend workflows.
+4. **Disposable Compose Integration Gate:** Embedded `test_disposable_compose.sh` execution directly into the consolidated candidate workflow.
+
+### WP05-G03 — HIGH: Protect Formal Acceptance Verification
+1. **Prohibition of Diagnostic Bypass Flags:** The candidate workflow invokes `verify_release_candidate.py` without diagnostic skip flags (`--skip-docker-verify`, `--skip-git-verify`).
+2. **Fail-Closed Diagnostic Exit Code:** If diagnostic flags are passed to `verify_release_candidate.py`, the runner prints `[DIAGNOSTIC NON-ACCEPTANCE] FORMAL ACCEPTANCE NOT GRANTED` and exits with code 3 (`RC_SKIPPED_VERIFICATION`), never returning code 0 (`RC_PASSED`).
+3. **Formal RC Mode Enforcement:** `validate_release_manifest.py` enforces `--formal-rc` mode, rejecting any validation invocation where Docker image verification, Git SHA verification, or evidence integrity checks were omitted.
+4. **Pinned Trivy Scanner & Provenance Tracking:** Declared and pinned Trivy scanner version (`v0.58.2`), verified binary installation, and recorded scanner installation provenance in container scan metadata and release manifests.
+
 ---
 
 ## 2. Changed-File Manifests
@@ -334,7 +354,7 @@ Executed `scripts/ci/test_disposable_compose.sh` against an ephemeral project st
 
 | Suite | Previous Accepted Baseline | Post-Implementation Result | Delta / Explanation |
 | :--- | :--- | :--- | :--- |
-| **Backend (`collectflow`)** | 240 passed, 71 skipped, 0 failed | **249 passed, 71 skipped, 0 failed** | +9 passed tests in `tests/ci/test_wp05_ci_release_gates.py`; 71 legacy SQLite tests quarantined in `conftest.py` preserved; 0 failures. |
+| **Backend (`collectflow`)** | 240 passed, 71 skipped, 0 failed | **273 passed, 71 skipped, 0 failed** | +33 passed tests in `tests/ci/test_wp05_ci_release_gates.py`; 71 legacy SQLite tests quarantined in `conftest.py` preserved; 0 failures. |
 | **Frontend (`cash-flow-buddy-101`)** | 620 passed across 44 test files, 0 failed | **620 passed across 44 test files, 0 failed** | Zero test modifications; all 44 test files passing cleanly. |
 
 ### Quarantined Legacy SQLite Tests (71 skipped)
@@ -354,4 +374,4 @@ All deliverables for WP-05 have been completed, hardened, verified, and pushed:
 - Strictly disabled-by-default publication gate.
 
 **Verdict:**
-`READY FOR INDEPENDENT REVIEW`
+`READY FOR INDEPENDENT RE-REVIEW`

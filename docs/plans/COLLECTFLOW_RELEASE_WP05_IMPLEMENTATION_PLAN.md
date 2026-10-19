@@ -10,13 +10,16 @@
 
 ---
 
-## Review Corrections Addressed (WP05-01 through WP05-06)
+## Review Corrections Addressed (WP05-01 through WP05-06, WP05-R01 to WP05-R04, WP05-F01 to WP05-F03, WP05-G01 to WP05-G03)
 1. **WP05-01 (Eliminate Fabricated Evidence):** Removed hardcoded test counts, clean worktree flags, and arbitrary string pass values in `generate_release_manifest.py`. Enforced structured evidence ingestion (file + sha256 checksum) and fail-closed validation in `validate_release_manifest.py`.
 2. **WP05-02 (Fail-Closed Container Scans):** Removed scanner suppression in `build_and_scan_image.sh`. Enforced fail-closed behavior on missing Trivy or tool errors, scanned HIGH and CRITICAL vulnerabilities, blocked CRITICAL findings, and recorded scanner version + evidence checksum.
 3. **WP05-03 (Cross-Repository Gate Results):** Removed `|| true` from CI workflows. Allowed CI private repo limitations to be marked BLOCKED, while strictly rejecting BLOCKED status during release-manifest validation. Verified exact commit SHAs and repository identities.
 4. **WP05-04 (OCI Digest Verification):** Distinguished Image Configuration IDs from registry digests. Verified image `org.opencontainers.image.revision` label against exact git commit SHA.
 5. **WP05-05 (Disposable Compose Assertions):** Added strict HTTP status code assertions (200, 401, 403), verified database state after mutations, verified stale-session revocation (401), restricted secret permissions (`0600`), masked credentials in logs, and added executable `--test-failure-trap` integration test.
 6. **WP05-06 (CI & Supply-Chain Controls):** Executed portable Playwright mock checks in frontend CI, recorded live browser and HTTPS SSL tests as `NOT_EXECUTED` with environmental justification, pinned third-party actions to immutable commit SHAs, and attached structured reports.
+7. **WP05-G01 (Prevent Self-Declared Security Exceptions):** Preserved zero-active-exception baseline (`security/vulnerability-exceptions.json`). Repository JSON files cannot self-approve exceptions. Strict rejection of wildcard image scopes (`*`) and requirement of separately trusted external security approval token (`COLLECTFLOW_EXTERNAL_SECURITY_APPROVAL_TOKEN` with length >= 32 and no mock/dummy markers).
+8. **WP05-G02 (Comprehensive Quality Gate Execution):** Candidate workflow executes full test suites: backend executes full 344-test pytest suite against PostgreSQL 16 service container (`alembic upgrade head && pytest tests/`); frontend executes full 620-test Vitest suite and Playwright mock suite. Replaced loose `npm install` with strict `npm ci`. Removed command-level error suppression (`|| true`) from audit, lint, and test steps. Integrated disposable Compose integration test runner (`test_disposable_compose.sh`).
+9. **WP05-G03 (Protect Formal Acceptance Verification):** Candidate workflow invokes `verify_release_candidate.py` without diagnostic bypass flags (`--skip-docker-verify`, `--skip-git-verify`). If diagnostic flags are passed, candidate is marked `[DIAGNOSTIC NON-ACCEPTANCE] FORMAL ACCEPTANCE NOT GRANTED` with exit code 3 (`RC_SKIPPED_VERIFICATION`). Pinned Trivy scanner version (`v0.58.2`), verified binary installation, and recorded scanner installation provenance in container metadata and manifest.
 
 ---
 

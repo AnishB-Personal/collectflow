@@ -67,6 +67,7 @@ SCAN_VERDICT="BLOCKED_SCANNER_UNAVAILABLE"
 SCAN_DETAILS="Trivy scanner is not installed or available."
 SCANNER_NAME="trivy"
 SCANNER_VERSION="unavailable"
+SCANNER_PROVENANCE="unavailable"
 SCAN_CHECKSUM=""
 SCAN_CRITICAL_COUNT=0
 SCAN_HIGH_COUNT=0
@@ -76,8 +77,11 @@ BLOCKING_FINDINGS="[]"
 APPLIED_EXCEPTIONS="[]"
 
 if command -v trivy &>/dev/null; then
+    SCANNER_PATH="$(command -v trivy)"
     SCANNER_VERSION="$(trivy --version | head -n 1)"
-    echo "Running Trivy image vulnerability scan (${SCANNER_VERSION})..."
+    SCANNER_PROVENANCE="${SCANNER_PATH} (${SCANNER_VERSION})"
+    echo "Running Trivy image vulnerability scan (${SCANNER_PROVENANCE})..."
+
     
     # Run scan without suppressing tool execution errors; do not ignore unfixed vulnerabilities (WP05-F02)
     TRIVY_RC=0
@@ -161,6 +165,7 @@ cat <<EOF > "${METADATA_OUTPUT}"
   "security_scan": {
     "scanner": "${SCANNER_NAME}",
     "scanner_version": "${SCANNER_VERSION}",
+    "scanner_provenance": "${SCANNER_PROVENANCE}",
     "verdict": "${SCAN_VERDICT}",
     "details": "${SCAN_DETAILS}",
     "critical_count": ${SCAN_CRITICAL_COUNT},

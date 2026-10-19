@@ -106,6 +106,7 @@ def create_valid_evidence_bundle(tmp_path, b_sha="a" * 40, f_sha="b" * 40):
                 "security_scan": {
                     "scanner": "trivy",
                     "scanner_version": "Version: 0.76.0",
+                    "scanner_provenance": "/usr/local/bin/trivy (Version: 0.76.0)",
                     "verdict": "PASS",
                     "details": "0 CRITICAL and 0 HIGH vulnerabilities detected in container image.",
                     "critical_count": 0,
@@ -126,6 +127,7 @@ def create_valid_evidence_bundle(tmp_path, b_sha="a" * 40, f_sha="b" * 40):
                 "security_scan": {
                     "scanner": "trivy",
                     "scanner_version": "Version: 0.76.0",
+                    "scanner_provenance": "/usr/local/bin/trivy (Version: 0.76.0)",
                     "verdict": "PASS",
                     "details": "0 CRITICAL and 0 HIGH vulnerabilities detected in container image.",
                     "critical_count": 0,
@@ -134,6 +136,7 @@ def create_valid_evidence_bundle(tmp_path, b_sha="a" * 40, f_sha="b" * 40):
                     "evidence_file": str(f_trivy),
                     "evidence_sha256": sha(f_trivy)
                 },
+
                 "publication_status": "DISABLED_BY_DEFAULT",
                 "registry_published": False
             }
@@ -417,8 +420,9 @@ def test_exception_package_and_image_scope_mismatch(tmp_path):
     assert not is_val
     assert "image scope" in err and "does not match target image" in err
 
-def test_valid_exception_evaluation(tmp_path):
-    """Valid exception with full schema and future expiry properly resolves finding (WP05-F01)."""
+def test_valid_exception_evaluation(tmp_path, monkeypatch):
+    """Valid exception with full schema and future expiry properly resolves finding when authorized (WP05-F01, WP05-G01)."""
+    monkeypatch.setenv("COLLECTFLOW_EXTERNAL_SECURITY_APPROVAL_TOKEN", "sec_gov_external_auth_token_32chars_long_verified_ok!")
     valid_exp_file = tmp_path / "valid_exceptions.json"
     valid_exp_file.write_text(json.dumps({
         "schema_version": "2.0.0",
@@ -458,6 +462,7 @@ def test_valid_exception_evaluation(tmp_path):
     assert res["high_count"] == 1
     assert res["unapproved_high_count"] == 0
     assert len(res["applied_exceptions"]) == 1
+
 
 def test_container_scan_missing_evidence_rejection(tmp_path):
     """Container scan missing evidence_file or checksum is rejected (WP05-F02)."""
@@ -524,4 +529,191 @@ def test_verify_release_candidate_fails_when_evidence_missing(tmp_path):
     res = subprocess.run(cmd, capture_output=True, text=True)
     assert res.returncode == 1
     assert "Mandatory release candidate quality gate evidence is missing" in res.stderr
+
+def test_self_declared_exceptions_rejected_without_external_token(tmp_path, monkeypatch):
+    """Non-empty exceptions in repository JSON are rejected fail-closed without external security token (WP05-G01)."""
+    monkeypatch.delenv("COLLECTFLOW_EXTERNAL_SECURITY_APPROVAL_TOKEN", raising=False)
+    exp_file = tmp_path / "exceptions.json"
+    exp_file.write_text(json.dumps({
+        "schema_version": "2.0.0",
+        "exceptions": [
+            {
+                "cve_id": "CVE-2026-1111",
+                "package_name": "curl",
+                "affected_image": "collectflow-backend",
+                "rationale": "Mitigated in container network policy",
+                "approver": "SecTeam",
+                "approval_reference": "SEC-789",
+                "expires_at": "2030-01-01"
+            }
+        ]
+    }), encoding="utf-8")
+    valid_exps, errors = load_and_validate_exceptions(exp_file, "collectflow-backend")
+    assert len(valid_exps) == 0
+    assert any("Self-declared vulnerability exceptions found" in e for e in errors)
+
+def test_wildcard_image_scope_rejected():
+    """Wildcard affected_image ('*') is strictly rejected (WP05-G01)."""
+    rec = {
+        "cve_id": "CVE-2026-1111",
+        "package_name": "curl",
+        "affected_image": "*",
+        "rationale": "Wildcard bypass attempt",
+        "approver": "SecTeam",
+        "approval_reference": "SEC-789",
+        "expires_at": "2030-01-01"
+    }
+    is_val, err, _ = validate_exception_record(rec, "collectflow-backend")
+    assert not is_val
+    assert "Wildcard or mismatched image scope" in err
+
+def test_fabricated_approval_token_rejected(tmp_path, monkeypatch):
+    """Short or dummy/mock external approval token is strictly rejected (WP05-G01)."""
+    for bad_token in ["dummy", "mock_token_12345", "test_token_self_approved", "short_token"]:
+        monkeypatch.setenv("COLLECTFLOW_EXTERNAL_SECURITY_APPROVAL_TOKEN", bad_token)
+        exp_file = tmp_path / "exceptions.json"
+        exp_file.write_text(json.dumps({
+            "schema_version": "2.0.0",
+            "exceptions": [
+                {
+                    "cve_id": "CVE-2026-1111",
+                    "package_name": "curl",
+                    "affected_image": "collectflow-backend",
+                    "rationale": "Mitigated",
+                    "approver": "SecTeam",
+                    "approval_reference": "SEC-789",
+                    "expires_at": "2030-01-01"
+                }
+            ]
+        }), encoding="utf-8")
+        valid_exps, errors = load_and_validate_exceptions(exp_file, "collectflow-backend")
+        assert len(valid_exps) == 0
+        assert any("external security approval token" in e.lower() for e in errors)
+
+def test_formal_rc_mode_rejects_diagnostic_bypasses(tmp_path):
+    """formal_rc_mode strictly rejects verify_docker_images=False or verify_git_shas=False (WP05-G03)."""
+    manifest = create_valid_evidence_bundle(tmp_path)
+    errs = validate_manifest(manifest, verify_git_shas=False, verify_docker_images=False, formal_rc_mode=True)
+    assert any("FORMAL RELEASE CANDIDATE REJECTED" in e and "Docker image verification" in e for e in errs)
+
+def test_missing_scanner_provenance_rejected(tmp_path):
+    """Manifest missing scanner_provenance in container security_scan fails validation (WP05-G03)."""
+    manifest = create_valid_evidence_bundle(tmp_path)
+    del manifest["container_artifacts"]["backend"]["security_scan"]["scanner_provenance"]
+    errs = validate_manifest(manifest, verify_git_shas=False, verify_docker_images=False)
+    assert any("missing required field 'scanner_provenance'" in e for e in errs)
+
+def test_diagnostic_skip_flags_never_produce_rc_passed(tmp_path):
+    """verify_release_candidate.py exits code 3 (RC_SKIPPED_VERIFICATION) and never RC_PASSED when diagnostic skips are present (WP05-G03)."""
+    import shutil
+    b_repo = tmp_path / "backend_repo"
+    f_repo = tmp_path / "frontend_repo"
+    b_repo.mkdir()
+    f_repo.mkdir()
+
+    subprocess.run(["git", "init"], cwd=str(b_repo), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(b_repo), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(b_repo), check=True, capture_output=True)
+    shutil.copytree(PROJECT_ROOT / "scripts", b_repo / "scripts")
+    (b_repo / "README.md").write_text("backend")
+    subprocess.run(["git", "add", "."], cwd=str(b_repo), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init backend"], cwd=str(b_repo), check=True, capture_output=True)
+    b_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(b_repo), capture_output=True, text=True, check=True).stdout.strip()
+
+    subprocess.run(["git", "init"], cwd=str(f_repo), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(f_repo), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.com"], cwd=str(f_repo), check=True, capture_output=True)
+    (f_repo / "README.md").write_text("frontend")
+    subprocess.run(["git", "add", "."], cwd=str(f_repo), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init frontend"], cwd=str(f_repo), check=True, capture_output=True)
+    f_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(f_repo), capture_output=True, text=True, check=True).stdout.strip()
+
+    backend_test = tmp_path / "backend_test.json"
+    backend_test.write_text(json.dumps({"passed": 267, "failed": 0, "verdict": "PASS"}))
+    frontend_test = tmp_path / "frontend_test.json"
+    frontend_test.write_text(json.dumps({"passed": 620, "failed": 0, "verdict": "PASS"}))
+    backend_audit = tmp_path / "backend_audit.json"
+    backend_audit.write_text(json.dumps({"dependencies": []}))
+    frontend_audit = tmp_path / "frontend_audit.json"
+    frontend_audit.write_text(json.dumps({"metadata": {"vulnerabilities": {"high": 0, "critical": 0}}}))
+    secret_scan = tmp_path / "secret_scan.json"
+    secret_scan.write_text(json.dumps({"findings_count": 0, "findings": []}))
+    sast_lint = tmp_path / "sast_lint.json"
+    sast_lint.write_text(json.dumps({"lint_errors": 0}))
+
+    b_trivy = tmp_path / "b_trivy.json"
+    f_trivy = tmp_path / "f_trivy.json"
+    trivy_clean = {"SchemaVersion": 2, "Results": [{"Target": "app", "Class": "os-pkgs", "Type": "alpine", "Vulnerabilities": []}]}
+    b_trivy.write_text(json.dumps(trivy_clean))
+    f_trivy.write_text(json.dumps(trivy_clean))
+
+    backend_meta = tmp_path / "backend_meta.json"
+    backend_meta.write_text(json.dumps({
+        "image_name": "collectflow-backend",
+        "image_tag": f"collectflow-backend:{b_sha}",
+        "image_id": "sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff",
+        "oci_revision": b_sha,
+        "scan_verdict": "PASS",
+        "security_scan": {
+            "scanner": "trivy",
+            "scanner_version": "Version: 0.76.0",
+            "scanner_provenance": "/usr/local/bin/trivy (Version: 0.76.0)",
+            "verdict": "PASS",
+            "details": "0 CRITICAL and 0 HIGH vulnerabilities detected in container image.",
+            "critical_count": 0,
+            "high_count": 0,
+            "blocking_findings": [],
+            "evidence_file": str(b_trivy),
+            "evidence_sha256": hashlib.sha256(b_trivy.read_bytes()).hexdigest()
+        },
+        "publication_status": "DISABLED_BY_DEFAULT",
+        "registry_published": False
+    }))
+    frontend_meta = tmp_path / "frontend_meta.json"
+    frontend_meta.write_text(json.dumps({
+        "image_name": "collectflow-frontend",
+        "image_tag": f"collectflow-frontend:{f_sha}",
+        "image_id": "sha256:222233334444555566667777888899990000aaaabbbbccccddddeeeeffff1111",
+        "oci_revision": f_sha,
+        "scan_verdict": "PASS",
+        "security_scan": {
+            "scanner": "trivy",
+            "scanner_version": "Version: 0.76.0",
+            "scanner_provenance": "/usr/local/bin/trivy (Version: 0.76.0)",
+            "verdict": "PASS",
+            "details": "0 CRITICAL and 0 HIGH vulnerabilities detected in container image.",
+            "critical_count": 0,
+            "high_count": 0,
+            "blocking_findings": [],
+            "evidence_file": str(f_trivy),
+            "evidence_sha256": hashlib.sha256(f_trivy.read_bytes()).hexdigest()
+        },
+        "publication_status": "DISABLED_BY_DEFAULT",
+        "registry_published": False
+    }))
+
+    rc_script = b_repo / "scripts/ci/verify_release_candidate.py"
+    cmd = [
+        sys.executable,
+        str(rc_script),
+        "--rc-id", "RC-TEST-DIAGNOSTIC",
+        "--backend-dir", str(b_repo),
+        "--frontend-dir", str(f_repo),
+        "--backend-test-report", str(backend_test),
+        "--frontend-test-report", str(frontend_test),
+        "--backend-audit-report", str(backend_audit),
+        "--frontend-audit-report", str(frontend_audit),
+        "--secret-scan-report", str(secret_scan),
+        "--sast-lint-report", str(sast_lint),
+        "--backend-meta", str(backend_meta),
+        "--frontend-meta", str(frontend_meta),
+        "--output-manifest", str(tmp_path / "manifest.json"),
+        "--skip-docker-verify",
+        "--skip-git-verify"
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    assert res.returncode == 3
+    assert "DIAGNOSTIC NON-ACCEPTANCE" in res.stderr
+    assert "FORMAL ACCEPTANCE NOT GRANTED" in res.stderr
+    assert "RC_SKIPPED_VERIFICATION" in res.stderr
 

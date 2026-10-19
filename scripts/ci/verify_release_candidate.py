@@ -238,17 +238,34 @@ def main() -> int:
         "--backend-dir", str(backend_dir),
         "--frontend-dir", str(frontend_dir)
     ]
+    diagnostic_skips = []
     if args.skip_docker_verify:
+        diagnostic_skips.append("--skip-docker-verify")
         val_cmd.append("--skip-docker-verify")
     if args.skip_git_verify:
+        diagnostic_skips.append("--skip-git-verify")
         val_cmd.append("--skip-git-verify")
     if args.require_approved:
         val_cmd.append("--require-approved")
+
+    if not diagnostic_skips:
+        val_cmd.append("--formal-rc")
 
     val_res = run_command(val_cmd, "Validating Release Candidate Manifest & Anti-Forgery Evidence")
     if val_res.returncode != 0:
         print(f"\n[RC GATE FAILED] Release candidate manifest validation failed with exit code {val_res.returncode}.", file=sys.stderr)
         return 1
+
+    # WP05-G03: Diagnostic skip flags must NEVER produce RC_PASSED
+    if diagnostic_skips:
+        print("\n================================================================", file=sys.stderr)
+        print("   [DIAGNOSTIC NON-ACCEPTANCE] FORMAL ACCEPTANCE NOT GRANTED", file=sys.stderr)
+        print(f"   Diagnostic skip flags active: {', '.join(diagnostic_skips)}", file=sys.stderr)
+        print("   Formal release candidate acceptance (RC_PASSED) is strictly forbidden", file=sys.stderr)
+        print("   when verification checks are bypassed or skipped (WP05-G03).", file=sys.stderr)
+        print("   Verdict: RC_SKIPPED_VERIFICATION", file=sys.stderr)
+        print("================================================================\n", file=sys.stderr)
+        return 3
 
     print("\n================================================================")
     print("   [RC GATE ACCEPTED] RELEASE CANDIDATE FORMALLY VERIFIED")
@@ -259,6 +276,7 @@ def main() -> int:
     print("   Publication:      DISABLED_BY_DEFAULT (Protected Boundary)")
     print("================================================================\n")
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

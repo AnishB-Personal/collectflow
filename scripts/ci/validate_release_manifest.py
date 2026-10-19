@@ -126,9 +126,19 @@ def validate_manifest(
     verify_git_shas: bool = True,
     verify_evidence_integrity: bool = True,
     verify_docker_images: bool = True,
-    require_deployment_approved: bool = False
+    require_deployment_approved: bool = False,
+    formal_rc_mode: bool = False
 ) -> List[str]:
     errors: List[str] = []
+
+    # WP05-G03: Formal release-candidate mode strictly prohibits diagnostic bypasses
+    if formal_rc_mode:
+        if not verify_docker_images:
+            errors.append("Diagnostic bypass violation: FORMAL RELEASE CANDIDATE REJECTED when Docker image verification (verify_docker_images=False) is bypassed (WP05-G03).")
+        if not verify_git_shas:
+            errors.append("Diagnostic bypass violation: FORMAL RELEASE CANDIDATE REJECTED when Git SHA verification (verify_git_shas=False) is bypassed (WP05-G03).")
+        if not verify_evidence_integrity:
+            errors.append("Diagnostic bypass violation: FORMAL RELEASE CANDIDATE REJECTED when evidence integrity verification (verify_evidence_integrity=False) is bypassed (WP05-G03).")
 
     # 1. Structural schema validation
     required_keys = [
@@ -145,6 +155,7 @@ def validate_manifest(
 
     if errors:
         return errors
+
 
     # 2. Source Traceability, Git SHA & Clean Worktree Validation (WP05-01)
     source_trace = manifest_data.get("source_traceability", {})
@@ -232,6 +243,11 @@ def validate_manifest(
                 if not scanner_version or scanner_version == "unavailable":
                     errors.append(f"{component} container scanner version is missing or unavailable")
 
+                scanner_provenance = sec_scan_meta.get("scanner_provenance", "")
+                if not scanner_provenance or scanner_provenance == "unavailable":
+                    errors.append(f"{component} container scanner installation provenance is missing required field 'scanner_provenance' or unavailable (WP05-G03)")
+
+
                 try:
                     rep_data = json.loads(ev_path.read_text(encoding="utf-8"))
                     if "SchemaVersion" not in rep_data or "Results" not in rep_data:
@@ -269,11 +285,18 @@ def validate_manifest(
                                     f"{component} container scan claimed PASS, but report contains {rep_crit} CRITICAL and {rep_high} HIGH vulnerabilities (forgery detected)"
                                 )
                         elif scan_verdict == "PASS_WITH_APPROVED_EXCEPTIONS":
+                            import os
+                            ext_token = os.environ.get("COLLECTFLOW_EXTERNAL_SECURITY_APPROVAL_TOKEN")
+                            if not ext_token or len(ext_token.strip()) < 32 or "self" in ext_token.lower() or "dummy" in ext_token.lower():
+                                errors.append(
+                                    f"{component} vulnerability exceptions rejected: repository cannot self-approve exceptions without independently controlled external approval (WP05-G01)"
+                                )
                             applied = sec_scan_meta.get("applied_exceptions", [])
                             if not isinstance(applied, list):
                                 errors.append(f"{component} container scan applied_exceptions must be a structured list")
                             else:
                                 target_img = c_info.get("image_name", f"collectflow-{component}")
+
                                 for f_cve, f_pkg, f_sev in findings_list:
                                     matched = any(
                                         exp.get("cve_id") == f_cve and exp.get("package_name") == f_pkg
@@ -557,6 +580,7 @@ def main() -> int:
     parser.add_argument("--skip-evidence-verify", action="store_true", help="Skip evidence file content and checksum verification")
     parser.add_argument("--skip-docker-verify", action="store_true", help="Skip Docker daemon image inspection")
     parser.add_argument("--require-approved", action="store_true", help="Enforce deployment_authorized=true")
+    parser.add_argument("--formal-rc", action="store_true", help="Enforce formal release candidate mode (prohibits diagnostic skips)")
     args = parser.parse_args()
 
     manifest_path = Path(args.manifest).resolve()
@@ -581,8 +605,10 @@ def main() -> int:
         verify_git_shas=not args.skip_git_verify,
         verify_evidence_integrity=not args.skip_evidence_verify,
         verify_docker_images=not args.skip_docker_verify,
-        require_deployment_approved=args.require_approved
+        require_deployment_approved=args.require_approved,
+        formal_rc_mode=args.formal_rc
     )
+
 
     if errors:
         print(f"\n[VALIDATION FAILED] {len(errors)} release rejection error(s) detected:")
