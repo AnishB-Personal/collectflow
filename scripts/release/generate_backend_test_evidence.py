@@ -135,6 +135,9 @@ def generate_backend_test_evidence(
         "hostname": xml_hostname or "unknown",
         "duration_seconds": round(xml_time_sec, 3),
         "status": status,
+        "passed": passed,
+        "failed": total_failures,
+        "skipped": total_skipped,
         "summary": {
             "total": total_tests,
             "passed": passed,
