@@ -163,6 +163,16 @@ Both repositories continue on `feature/release-wp06-financial-approval-gates`.
     7. Verifies source revisions remain unchanged across execution.
     8. Enforces fail-closed boundaries (Corporate Finance status: `AWAITING_FINANCE_APPROVAL`).
 
+### WP06-R08: Protect Formal Pipeline Execution & Fail-Closed Gate Enforcement
+- **Files:** `scripts/release/run_financial_acceptance_pipeline.py`, `tests/test_wp06_financial_governance_and_integrity.py`
+- **Implemented Controls:**
+  - Strictly prohibited diagnostic bypass options (`--skip-pytest`, `--skip-clean`, `--allow-dirty`) in formal release acceptance mode; any attempt to invoke bypasses in formal mode fails closed with immediate exit code 1.
+  - Mandated that any invocation specifying `--diagnostic` is explicitly flagged (`is_diagnostic = True`, `formal_acceptance_eligible: false`) and returns exit code 1, incapable of producing an accepted technical PASS or readiness code 2.
+  - Implemented `check_clean_working_tree`: inspects `git status --porcelain` on both backend and frontend repositories before execution; rejects uncommitted and untracked modifications fail-closed.
+  - Preserved exact backend and frontend Git SHA pinning checks before and after pipeline execution to ensure zero revision drift.
+  - Preserved fresh artifact purge in Stage 0, full backend pytest regression in Stage 1, structured test evidence generation with XML SHA-256 in Stage 2, genuine 5-source reconciliation in Stage 3, and formal readiness gate verification in Stage 4.
+  - Added negative tests in `test_30_pipeline_enforcement_negative_tests` proving that skipped pytest, retained old artifacts, dirty working trees, and diagnostic bypasses fail closed and cannot authorize formal financial release acceptance.
+
 ---
 
 ## 3. Independent Multi-Source Financial Reconciliation Matrix

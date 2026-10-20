@@ -27,6 +27,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import json
 import os
 from pathlib import Path
+import subprocess
 from typing import Optional, Dict, List, Any
 import pytest
 from unittest.mock import MagicMock, patch
@@ -1440,5 +1441,104 @@ def test_29_formal_source_and_environment_negative_tests(tmp_path):
     with pytest.raises(ValueError) as exc_info:
         verify_repository_identity(fake_repo, "collectflow")
     assert "Backend repository marker missing" in str(exc_info.value)
+
+
+# ==============================================================================
+# WP06-08 Test 30: Pipeline Enforcement Negative Tests (WP06-R08)
+# ==============================================================================
+def test_30_pipeline_enforcement_negative_tests(tmp_path):
+    """30. Validate pipeline enforcement negative tests (WP06-R08):
+    skipped pytest, retained old artifacts, dirty working trees, and diagnostic bypasses
+    cannot authorize formal financial acceptance."""
+    backend_dir = Path(__file__).resolve().parent.parent
+    frontend_dir = backend_dir.parent / "cash-flow-buddy-101"
+    backend_sha = get_git_commit_sha(backend_dir)
+    frontend_sha = get_git_commit_sha(frontend_dir)
+
+    from scripts.release.run_financial_acceptance_pipeline import (
+        run_pipeline,
+        check_clean_working_tree,
+    )
+
+    isolated_artifacts = tmp_path / "artifacts"
+    isolated_artifacts.mkdir()
+
+    # 1. Skipped pytest in formal mode cannot authorize formal acceptance
+    rc_skip_pytest = run_pipeline(
+        backend_dir=backend_dir,
+        frontend_dir=frontend_dir,
+        artifacts_dir=isolated_artifacts,
+        expected_backend_sha=backend_sha,
+        expected_frontend_sha=frontend_sha,
+        skip_pytest=True,
+        diagnostic=False,
+    )
+    assert rc_skip_pytest == 1
+
+    # 2. Retained old artifacts / skipped clean in formal mode cannot authorize formal acceptance
+    rc_skip_clean = run_pipeline(
+        backend_dir=backend_dir,
+        frontend_dir=frontend_dir,
+        artifacts_dir=isolated_artifacts,
+        expected_backend_sha=backend_sha,
+        expected_frontend_sha=frontend_sha,
+        skip_clean=True,
+        diagnostic=False,
+    )
+    assert rc_skip_clean == 1
+
+    # 3. Dirty working tree detection rejects modified or untracked files
+    mock_git_dir = tmp_path / "mock_dirty_repo"
+    mock_git_dir.mkdir()
+    subprocess.run(["git", "init", str(mock_git_dir)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(mock_git_dir), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(mock_git_dir), "config", "user.email", "test@example.com"], check=True)
+    (mock_git_dir / "file.txt").write_text("initial", encoding="utf-8")
+    subprocess.run(["git", "-C", str(mock_git_dir), "add", "file.txt"], check=True)
+    subprocess.run(["git", "-C", str(mock_git_dir), "commit", "-m", "init"], check=True)
+
+    # Clean initially
+    is_clean, _ = check_clean_working_tree(mock_git_dir)
+    assert is_clean is True
+
+    # Untracked file makes it dirty
+    (mock_git_dir / "untracked.py").write_text("print(1)", encoding="utf-8")
+    is_clean, diff = check_clean_working_tree(mock_git_dir)
+    assert is_clean is False
+    assert "untracked.py" in diff
+
+    # Modified file makes it dirty
+    (mock_git_dir / "untracked.py").unlink()
+    (mock_git_dir / "file.txt").write_text("modified", encoding="utf-8")
+    is_clean, diff = check_clean_working_tree(mock_git_dir)
+    assert is_clean is False
+    assert "file.txt" in diff
+
+    # Pipeline rejects dirty working tree in formal mode
+    rc_dirty = run_pipeline(
+        backend_dir=mock_git_dir,
+        frontend_dir=frontend_dir,
+        artifacts_dir=isolated_artifacts,
+        expected_backend_sha=get_git_commit_sha(mock_git_dir),
+        expected_frontend_sha=frontend_sha,
+        allow_dirty=False,
+        diagnostic=False,
+    )
+    assert rc_dirty == 1
+
+    # 4. Diagnostic mode with bypasses cannot produce accepted status (exit code 2)
+    fake_xml = isolated_artifacts / "backend_pytest_report.xml"
+    fake_xml.write_text("<testsuites></testsuites>", encoding="utf-8")
+    rc_diag = run_pipeline(
+        backend_dir=backend_dir,
+        frontend_dir=frontend_dir,
+        artifacts_dir=isolated_artifacts,
+        expected_backend_sha=backend_sha,
+        expected_frontend_sha=frontend_sha,
+        skip_pytest=True,
+        allow_dirty=True,
+        diagnostic=True,
+    )
+    assert rc_diag == 1
 
 
