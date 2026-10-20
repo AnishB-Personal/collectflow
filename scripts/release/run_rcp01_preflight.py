@@ -488,13 +488,14 @@ def run_preflight(
     artifacts_dir = artifacts_dir.resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    # Purge any stale root-level artifacts in backend repo to prevent cross-run pollution
+    # Purge stale generated test evidence in root artifacts if present (never tracked files)
     root_artifacts = backend_dir / "artifacts"
     if root_artifacts.is_dir() and root_artifacts != artifacts_dir:
-        for f in root_artifacts.glob("*.json"):
-            if f.is_file() and f.parent == root_artifacts:
+        for stale_name in ("backend_test_evidence.json", "reconciliation_summary.json", "backend_pytest_report.xml"):
+            stale_file = root_artifacts / stale_name
+            if stale_file.is_file():
                 try:
-                    f.unlink()
+                    stale_file.unlink()
                 except Exception:
                     pass
 
