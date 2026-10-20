@@ -67,7 +67,7 @@ PROHIBITED_BOOTSTRAP_PASSWORDS = {
     "welcome12345!",
 }
 
-APPROVED_TEST_FIXTURE_ENVS = {"test", "local_test", "integration_test"}
+APPROVED_TEST_FIXTURE_ENVS = {"test", "local_test", "integration_test", "integration"}
 
 ph = PasswordHasher()
 
@@ -344,6 +344,19 @@ def load_reference_config(
         env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
         assert_test_fixture_permitted(env_mode)
 
+    # WP06-01: In production and staging, self-declared finance_approved in JSON cannot authorize production reference-data insertion.
+    # Corporate Finance governance is currently AWAITING_FINANCE_APPROVAL.
+    env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
+    is_prod_or_staging = any(token in env_mode for token in ("prod", "stag")) or (
+        env_mode not in APPROVED_TEST_FIXTURE_ENVS
+    )
+    if is_prod_or_staging and not is_synthetic:
+        raise RuntimeError(
+            "CRITICAL GOVERNANCE ABORT: Statutory reference configuration activation in production/staging is BLOCKED "
+            "pending independently authenticated Corporate Finance authorization (BPD-01/BPD-02 status: AWAITING_FINANCE_APPROVAL). "
+            "Self-declared 'approval_status=finance_approved' in JSON configuration files cannot authorize production statutory master data."
+        )
+
     # 2. Validation of approval metadata and provenance (WP03-F02: require approval_status=finance_approved)
     approval_status = raw_status.lower()
     if not is_synthetic:
@@ -363,9 +376,23 @@ def load_reference_config(
     if not approval_date:
         raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config missing required 'approval_date' metadata.")
     try:
-        date.fromisoformat(approval_date)
-    except Exception:
-        raise ValueError(f"CRITICAL CONFIGURATION ERROR: Invalid approval_date format '{approval_date}', expected ISO YYYY-MM-DD.")
+        app_d = date.fromisoformat(approval_date)
+        if app_d > date.today():
+            raise ValueError(f"Approval date '{approval_date}' cannot be in the future.")
+    except Exception as exc:
+        raise ValueError(f"CRITICAL CONFIGURATION ERROR: Invalid approval_date: {exc}")
+
+    # Check expiration if present
+    expiry_date_str = str(data.get("expiry_date") or data.get("expires_at") or "").strip()
+    if expiry_date_str:
+        try:
+            exp_d = date.fromisoformat(expiry_date_str)
+            if exp_d < date.today():
+                raise ValueError("CRITICAL CONFIGURATION ERROR: Statutory reference approval has expired.")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"CRITICAL CONFIGURATION ERROR: Invalid expiry date: {exc}")
 
     controlled_source = str(data.get("controlled_source", "")).strip()
     if not controlled_source:
@@ -396,7 +423,117 @@ def load_reference_config(
     if "tds_sections" not in data or not isinstance(data["tds_sections"], list):
         raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config missing 'tds_sections' list.")
 
+    # WP06-01: Financial year boundary, Indian FY convention, and overlapping interval validation
+    validate_financial_year_records(data["financial_years"])
+
+    # WP06-01: GST rate consistency and rate validation
+    seen_gst = set()
+    for g in data["gst_rates"]:
+        g_name = str(g.get("name", "")).strip()
+        if not g_name:
+            raise ValueError("CRITICAL CONFIGURATION ERROR: GST rate missing required 'name'.")
+        if g_name in seen_gst:
+            raise ValueError(f"CRITICAL CONFIGURATION ERROR: Duplicate GST rate name '{g_name}'.")
+        seen_gst.add(g_name)
+        try:
+            r = Decimal(str(g.get("rate")))
+            if r < Decimal("0.0000") or r > Decimal("1.0000"):
+                raise ValueError("Rate out of bounds.")
+        except Exception:
+            raise ValueError(f"CRITICAL CONFIGURATION ERROR: Invalid rate for GST '{g_name}'.")
+        # Check split consistency
+        cgst = Decimal(str(g.get("cgst_rate", "0")))
+        sgst = Decimal(str(g.get("sgst_rate", "0")))
+        igst = Decimal(str(g.get("igst_rate", "0")))
+        if abs((cgst + sgst) - r) > Decimal("0.0001") or abs(igst - r) > Decimal("0.0001"):
+            raise ValueError(f"CRITICAL CONFIGURATION ERROR: Inconsistent GST split for '{g_name}' (CGST {cgst} + SGST {sgst} != {r}).")
+
+    # WP06-01: TDS section code validation
+    seen_tds = set()
+    for t in data["tds_sections"]:
+        sec = str(t.get("section_code", "")).strip()
+        if not sec:
+            raise ValueError("CRITICAL CONFIGURATION ERROR: TDS section missing 'section_code'.")
+        if sec in seen_tds:
+            raise ValueError(f"CRITICAL CONFIGURATION ERROR: Duplicate TDS section code '{sec}'.")
+        seen_tds.add(sec)
+        try:
+            r = Decimal(str(t.get("default_rate")))
+            if r < Decimal("0.0000") or r > Decimal("1.0000"):
+                raise ValueError("Rate out of bounds.")
+        except Exception:
+            raise ValueError(f"CRITICAL CONFIGURATION ERROR: Invalid default_rate for TDS section '{sec}'.")
+
     return data
+
+
+def validate_financial_year_records(
+    financial_years: list,
+    db_existing_fys: list | None = None,
+) -> None:
+    """
+    Rigorously validates financial year boundaries and overlapping configurations (WP06-01).
+    Enforces:
+    1. Valid ISO start and end dates.
+    2. start_date < end_date.
+    3. Indian statutory financial year convention (starts April 1, ends March 31 of the following year).
+    4. No duplicate FY codes.
+    5. No overlapping financial year intervals within the configuration.
+    6. No overlapping financial year intervals with pre-existing database records.
+    """
+    seen_codes = set()
+    parsed_intervals = []
+
+    for item in financial_years:
+        if not isinstance(item, dict):
+            raise ValueError("CRITICAL CONFIGURATION ERROR: Financial year record must be a JSON object.")
+        code = str(item.get("code", "")).strip()
+        if not code:
+            raise ValueError("CRITICAL CONFIGURATION ERROR: Financial year missing required 'code' field.")
+        if code in seen_codes:
+            raise ValueError(f"CRITICAL CONFIGURATION ERROR: Duplicate financial year code '{code}' in configuration.")
+        seen_codes.add(code)
+
+        s_str = str(item.get("start_date", "")).strip()
+        e_str = str(item.get("end_date", "")).strip()
+        if not s_str or not e_str:
+            raise ValueError(f"CRITICAL CONFIGURATION ERROR: Financial year '{code}' missing start_date or end_date.")
+
+        try:
+            sd = date.fromisoformat(s_str)
+            ed = date.fromisoformat(e_str)
+        except Exception as exc:
+            raise ValueError(f"CRITICAL CONFIGURATION ERROR: Invalid date format in FY '{code}': {exc}") from None
+
+        if sd >= ed:
+            raise ValueError(
+                f"CRITICAL CONFIGURATION ERROR: Financial year '{code}' start_date ({sd}) must be before end_date ({ed})."
+            )
+
+        # Indian statutory FY boundary check (starts April 1, ends March 31 of next year)
+        if not (sd.month == 4 and sd.day == 1 and ed.month == 3 and ed.day == 31 and ed.year == sd.year + 1):
+            raise ValueError(
+                f"CRITICAL CONFIGURATION ERROR: Financial year '{code}' ({sd} to {ed}) violates Indian statutory "
+                "financial year convention (April 1 to March 31)."
+            )
+
+        for other_code, other_sd, other_ed in parsed_intervals:
+            if sd <= other_ed and ed >= other_sd:
+                raise ValueError(
+                    f"CRITICAL CONFIGURATION ERROR: Overlapping financial year boundaries detected between "
+                    f"'{code}' ({sd} to {ed}) and '{other_code}' ({other_sd} to {other_ed})."
+                )
+        parsed_intervals.append((code, sd, ed))
+
+    if db_existing_fys:
+        for code, sd, ed in parsed_intervals:
+            for existing in db_existing_fys:
+                if existing.code != code and existing.is_active:
+                    if sd <= existing.end_date and ed >= existing.start_date:
+                        raise ValueError(
+                            f"CRITICAL INITIALIZATION ERROR: Financial year '{code}' ({sd} to {ed}) overlaps with "
+                            f"existing database financial year '{existing.code}' ({existing.start_date} to {existing.end_date})."
+                        )
 
 
 def init_reference_data(db, ref_config: dict | None = None, verify_only: bool = False) -> dict:
@@ -420,6 +557,10 @@ def init_reference_data(db, ref_config: dict | None = None, verify_only: bool = 
         }
 
     results = {"financial_years": 0, "gst_rates": 0, "tds_sections": 0}
+
+    # Query existing database financial years for overlapping detection
+    existing_db_fys = db.scalars(select(FinancialYear)).all()
+    validate_financial_year_records(ref_config["financial_years"], db_existing_fys=existing_db_fys)
 
     # 1. Financial Years
     for fy_data in ref_config["financial_years"]:

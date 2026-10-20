@@ -41,6 +41,7 @@ def test_sandbox_database_path_isolation():
     from app.database import get_db_path
 
     # In integration mode without COLLECTFLOW_DB_PATH, startup must abort
+    old_env = os.environ.get("COLLECTFLOW_ENV", "test")
     os.environ["COLLECTFLOW_ENV"] = "integration"
     old_path = os.environ.pop("COLLECTFLOW_DB_PATH", None)
     try:
@@ -75,6 +76,6 @@ def test_sandbox_database_path_isolation():
             with pytest.raises(RuntimeError, match="CRITICAL ISOLATION ERROR"):
                 get_db_path()
     finally:
-        os.environ.pop("COLLECTFLOW_ENV", None)
+        os.environ["COLLECTFLOW_ENV"] = old_env
         if old_path:
             os.environ["COLLECTFLOW_DB_PATH"] = old_path

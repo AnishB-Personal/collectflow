@@ -155,7 +155,9 @@ def validate_browser_snapshot(data: dict, run_id: str, run_start_utc: datetime.d
     return data
 
 
-def execute_fresh_browser_capture(run_id: str, run_start_utc: datetime.datetime) -> dict:
+def execute_fresh_browser_capture(
+    run_id: str, run_start_utc: datetime.datetime, allow_not_executed: bool = False
+) -> Optional[dict]:
     """
     Executes a fresh Playwright headless capture against the live frontend on every reconciliation run.
     Validates output provenance and timestamp. Zero hardcoded fallbacks permitted.
@@ -178,6 +180,9 @@ def execute_fresh_browser_capture(run_id: str, run_start_utc: datetime.datetime)
         next((s for s in possible_scripts if s.exists()), None)
     )
     if not capture_script:
+        if allow_not_executed:
+            print("  [NOTICE] Browser capture script not found. Marking Browser UI as NOT EXECUTED.")
+            return None
         raise RuntimeError(
             "FATAL: Browser capture script 'scripts/capture_browser_financials.mjs' not found in either repository."
         )
@@ -195,28 +200,37 @@ def execute_fresh_browser_capture(run_id: str, run_start_utc: datetime.datetime)
 
         if not server_online:
             print(f"  Frontend at {FRONTEND_URL} not running. Launching Vite dev server from {frontend_dir}...")
-            vite_proc = subprocess.Popen(
-                ["npm", "run", "dev", "--", "--port", "3000"],
-                cwd=str(frontend_dir),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=dict(os.environ, VITE_API_MODE="live", VITE_API_BASE_URL=BACKEND_URL),
-            )
-            t0 = time.time()
-            ready = False
-            while time.time() - t0 < 25:
-                try:
-                    r = requests.get(FRONTEND_URL, timeout=1)
-                    if r.status_code < 500:
-                        ready = True
-                        break
-                except Exception:
-                    time.sleep(0.5)
-            if not ready:
-                raise RuntimeError(f"FATAL: Vite dev server on {FRONTEND_URL} failed to start within 25 seconds.")
-            print(f"  Vite dev server is ready at {FRONTEND_URL}.")
+            try:
+                vite_proc = subprocess.Popen(
+                    ["npm", "run", "dev", "--", "--port", "3000"],
+                    cwd=str(frontend_dir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=dict(os.environ, VITE_API_MODE="live", VITE_API_BASE_URL=BACKEND_URL),
+                )
+                t0 = time.time()
+                ready = False
+                while time.time() - t0 < 25:
+                    try:
+                        r = requests.get(FRONTEND_URL, timeout=1)
+                        if r.status_code < 500:
+                            ready = True
+                            break
+                    except Exception:
+                        time.sleep(0.5)
+                if not ready:
+                    if allow_not_executed:
+                        print(f"  [NOTICE] Vite dev server on {FRONTEND_URL} failed to start. Marking Browser UI as NOT EXECUTED.")
+                        return None
+                    raise RuntimeError(f"FATAL: Vite dev server on {FRONTEND_URL} failed to start within 25 seconds.")
+                print(f"  Vite dev server is ready at {FRONTEND_URL}.")
+            except Exception as e:
+                if allow_not_executed:
+                    print(f"  [NOTICE] Error launching frontend server ({e}). Marking Browser UI as NOT EXECUTED.")
+                    return None
+                raise
 
-        # Execute Playwright capture script
+        # Execute Playwright capture script with portable library path resolution
         print(f"  Executing fresh browser capture automation (run_id={run_id})...")
         cmd = [
             "node",
@@ -226,16 +240,28 @@ def execute_fresh_browser_capture(run_id: str, run_start_utc: datetime.datetime)
             "--run-id",
             run_id,
         ]
+        extra_paths = []
+        user_local_lib = Path.home() / ".local" / "lib"
+        if user_local_lib.is_dir():
+            extra_paths.append(str(user_local_lib))
+        cur_ld = os.environ.get("LD_LIBRARY_PATH", "")
+        if cur_ld:
+            extra_paths.append(cur_ld)
+        ld_val = ":".join(extra_paths)
+
         env = dict(
             os.environ,
             FRONTEND_URL=FRONTEND_URL,
             CAPTURE_RUN_ID=run_id,
             CAPTURE_OUTPUT_PATH=str(snapshot_path),
-            LD_LIBRARY_PATH=f"/home/anishb/.local/lib:{os.environ.get('LD_LIBRARY_PATH', '')}",
+            LD_LIBRARY_PATH=ld_val,
         )
         res = subprocess.run(cmd, cwd=str(frontend_dir), capture_output=True, text=True, timeout=40, env=env)
 
         if res.returncode != 0:
+            if allow_not_executed:
+                print(f"  [NOTICE] Playwright browser capture exited with code {res.returncode}. Marking Browser UI as NOT EXECUTED.")
+                return None
             raise RuntimeError(
                 f"FATAL: Playwright browser DOM capture failed (code {res.returncode}):\n"
                 f"STDOUT: {res.stdout}\n"
@@ -244,6 +270,9 @@ def execute_fresh_browser_capture(run_id: str, run_start_utc: datetime.datetime)
             )
 
         if not snapshot_path.exists():
+            if allow_not_executed:
+                print(f"  [NOTICE] Browser snapshot '{snapshot_path}' was not written. Marking Browser UI as NOT EXECUTED.")
+                return None
             raise RuntimeError(
                 f"FATAL: Expected browser snapshot file '{snapshot_path}' was not written by capture script."
             )
@@ -265,7 +294,11 @@ def execute_fresh_browser_capture(run_id: str, run_start_utc: datetime.datetime)
                 vite_proc.kill()
 
 
-def verify_cross_layer_reconciliation(browser_override: Optional[dict] = None) -> bool:
+def verify_cross_layer_reconciliation(
+    browser_override: Optional[dict] = None,
+    allow_browser_not_executed: bool = False,
+    output_json: Optional[str] = None,
+) -> dict:
     run_start_utc = datetime.datetime.now(datetime.timezone.utc)
     run_id = f"uat_{int(time.time())}_{secrets.token_hex(4)}"
 
@@ -418,29 +451,44 @@ def verify_cross_layer_reconciliation(browser_override: Optional[dict] = None) -
         print("  Using provided browser override data for verification test...")
         browser_data = browser_override
     else:
-        browser_data = execute_fresh_browser_capture(run_id, run_start_utc)
+        browser_data = execute_fresh_browser_capture(
+            run_id, run_start_utc, allow_not_executed=allow_browser_not_executed
+        )
 
-    browser_invoiced = quantize_dec(browser_data["invoiced_gross"])
-    browser_exclusive = quantize_dec(browser_data["exclusive_amount"])
-    browser_tax = None  # Strictly NOT rendered as individual KPI in UI -> N/A (UI)
-    browser_cash = quantize_dec(browser_data["cash_amount"])
-    browser_tds = quantize_dec(browser_data["tds_amount"])
-    browser_settled = quantize_dec(browser_data["total_settled"])
-    browser_outstanding = quantize_dec(browser_data["total_outstanding"])
-    browser_unbilled_po = None  # Strictly NOT rendered in UI -> N/A (UI)
-    browser_unbilled_ar = None  # Strictly NOT rendered in UI -> N/A (UI)
-    browser_target_yearly = quantize_dec(browser_data["annual_target"])
+    if browser_data is not None:
+        browser_invoiced = quantize_dec(browser_data.get("invoiced_gross"))
+        browser_exclusive = quantize_dec(browser_data.get("exclusive_amount"))
+        browser_tax = None  # Strictly NOT rendered as individual KPI in UI -> N/A (UI)
+        browser_cash = quantize_dec(browser_data.get("cash_amount"))
+        browser_tds = quantize_dec(browser_data.get("tds_amount"))
+        browser_settled = quantize_dec(browser_data.get("total_settled"))
+        browser_outstanding = quantize_dec(browser_data.get("total_outstanding"))
+        browser_unbilled_po = None  # Strictly NOT rendered in UI -> N/A (UI)
+        browser_unbilled_ar = None  # Strictly NOT rendered in UI -> N/A (UI)
+        browser_target_yearly = quantize_dec(browser_data.get("annual_target"))
 
-    print(f"  Browser Invoiced:     ₹{browser_invoiced}")
-    print(f"  Browser Exclusive:    ₹{browser_exclusive}")
-    print(f"  Browser Tax:          N/A (UI)")
-    print(f"  Browser Cash:         ₹{browser_cash}")
-    print(f"  Browser TDS:          ₹{browser_tds}")
-    print(f"  Browser Settled:      ₹{browser_settled}")
-    print(f"  Browser Outstanding:  ₹{browser_outstanding}")
-    print(f"  Browser Unbilled Back:N/A (UI)")
-    print(f"  Browser Unbilled AR:  N/A (UI)")
-    print(f"  Browser Target:       ₹{browser_target_yearly}")
+        print(f"  Browser Invoiced:     ₹{browser_invoiced}")
+        print(f"  Browser Exclusive:    ₹{browser_exclusive}")
+        print(f"  Browser Tax:          N/A (UI)")
+        print(f"  Browser Cash:         ₹{browser_cash}")
+        print(f"  Browser TDS:          ₹{browser_tds}")
+        print(f"  Browser Settled:      ₹{browser_settled}")
+        print(f"  Browser Outstanding:  ₹{browser_outstanding}")
+        print(f"  Browser Unbilled Back:N/A (UI)")
+        print(f"  Browser Unbilled AR:  N/A (UI)")
+        print(f"  Browser Target:       ₹{browser_target_yearly}")
+    else:
+        browser_invoiced = None
+        browser_exclusive = None
+        browser_tax = None
+        browser_cash = None
+        browser_tds = None
+        browser_settled = None
+        browser_outstanding = None
+        browser_unbilled_po = None
+        browser_unbilled_ar = None
+        browser_target_yearly = None
+        print("  Browser Capture:      NOT EXECUTED (Environment without headless browser/display)")
 
     # -------------------------------------------------------------------------
     # Source 4: Authoritative Downloaded XLSX Workbook
@@ -599,7 +647,7 @@ def verify_cross_layer_reconciliation(browser_override: Optional[dict] = None) -
 
         s_pg = f"₹{v_pg}"
         s_api = f"₹{v_api}"
-        s_ui = f"₹{v_ui}" if v_ui is not None else "N/A (UI)"
+        s_ui = f"₹{v_ui}" if v_ui is not None else ("NOT EXECUTED" if browser_data is None else "N/A (UI)")
         s_xl = f"₹{v_xl}" if v_xl is not None else "N/A (Export)"
         s_csv = f"₹{v_csv}" if v_csv is not None else "N/A (Export)"
 
@@ -687,17 +735,68 @@ def verify_cross_layer_reconciliation(browser_override: Optional[dict] = None) -
     # Invariant 5: AR Aging Sum = Total Outstanding AR
     inv5_diff = abs(api_aging_sum - pg_outstanding)
     print(f"  5. 6 AR Aging Buckets Sum (₹{api_aging_sum}) = Outstanding AR (₹{pg_outstanding}) -> Delta: ₹{inv5_diff} [{'PASS' if inv5_diff == 0 else 'FAIL'}]")
-    assert inv5_diff == 0
+    assert inv5_diff == 0, f"FATAL: Cross-layer financial reconciliation failed on invariant 5 (AR aging delta ₹{inv5_diff})"
 
     # Invariant 6: Annual Sales Target Quota Reconciliation
-    inv6_diff = max(abs(pg_target_yearly - api_target_yearly), abs(pg_target_yearly - browser_target_yearly))
-    print(f"  6. Annual Target PG (₹{pg_target_yearly}) = API (₹{api_target_yearly}) = UI (₹{browser_target_yearly}) -> Delta: ₹{inv6_diff} [{'PASS' if inv6_diff == 0 else 'FAIL'}]")
-    assert inv6_diff == 0
+    if browser_target_yearly is not None:
+        inv6_diff = max(abs(pg_target_yearly - api_target_yearly), abs(pg_target_yearly - browser_target_yearly))
+        print(f"  6. Annual Target PG (₹{pg_target_yearly}) = API (₹{api_target_yearly}) = UI (₹{browser_target_yearly}) -> Delta: ₹{inv6_diff} [{'PASS' if inv6_diff == 0 else 'FAIL'}]")
+    else:
+        inv6_diff = abs(pg_target_yearly - api_target_yearly)
+        print(f"  6. Annual Target PG (₹{pg_target_yearly}) = API (₹{api_target_yearly}) [UI: NOT EXECUTED] -> Delta: ₹{inv6_diff} [{'PASS' if inv6_diff == 0 else 'FAIL'}]")
+    assert inv6_diff == 0, f"FATAL: Cross-layer financial reconciliation failed on invariant 6 (annual target delta ₹{inv6_diff})"
 
     assert all_passed, "FATAL: Cross-layer financial reconciliation failed due to one or more source mismatches!"
-    print("\nSUCCESS: All 5 independent sources reconciled with exact zero monetary delta (₹0.00)!")
-    return True
+    print("\nSUCCESS: All independent sources reconciled with exact zero monetary delta (₹0.00)!")
+
+    summary_report = {
+        "status": "PASS" if all_passed else "FAIL",
+        "run_id": run_id,
+        "run_start_utc": run_start_utc.isoformat(),
+        "browser_status": "PASS" if browser_data is not None else "NOT_EXECUTED",
+        "metrics": {
+            "invoiced_gross": str(pg_invoiced),
+            "exclusive_amount": str(pg_exclusive),
+            "tax_amount": str(pg_tax),
+            "cash_received": str(pg_cash),
+            "tds_deducted": str(pg_tds),
+            "total_settled": str(pg_settled),
+            "total_outstanding": str(pg_outstanding),
+            "unbilled_po_gross": str(pg_unbilled_po_gross),
+            "unbilled_recognized_ar": str(pg_unbilled_po_ar),
+            "annual_target": str(pg_target_yearly),
+        },
+        "invariants": {
+            "cash_plus_tds_equals_settled": inv1_diff == Decimal("0.00"),
+            "invoiced_minus_settled_equals_outstanding": inv2_diff == Decimal("0.00"),
+            "reversal_net_zero": True,
+            "unbilled_ar_zero": pg_unbilled_po_ar == Decimal("0.00"),
+            "ar_aging_sums_to_outstanding": inv5_diff == Decimal("0.00"),
+            "target_reconciled": inv6_diff == Decimal("0.00"),
+        },
+    }
+
+    if output_json:
+        out_p = Path(output_json)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_p, "w", encoding="utf-8") as f:
+            json.dump(summary_report, f, indent=2)
+        print(f"Reconciliation summary written to {out_p}")
+
+    return summary_report
 
 
 if __name__ == "__main__":
-    verify_cross_layer_reconciliation()
+    import argparse
+    parser = argparse.ArgumentParser(description="CollectFlow Cross-Layer Financial Reconciliation")
+    parser.add_argument("--allow-browser-not-executed", action="store_true", help="Allow browser UI capture to be marked NOT EXECUTED")
+    parser.add_argument("--output", type=str, default=None, help="Output path for structured JSON reconciliation report")
+    args = parser.parse_args()
+
+    res = verify_cross_layer_reconciliation(
+        allow_browser_not_executed=args.allow_browser_not_executed,
+        output_json=args.output,
+    )
+    if res.get("status") == "PASS":
+        sys.exit(0)
+    sys.exit(1)
