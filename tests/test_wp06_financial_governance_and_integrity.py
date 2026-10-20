@@ -540,111 +540,51 @@ def test_17_source_commit_shas_recorded(tmp_path):
 # ==============================================================================
 # WP06-08 Test 18: Pending Business Approval Correctly Returns BLOCKED
 # ==============================================================================
-def test_18_pending_business_approval_correctly_returns_blocked(tmp_path):
-    """18. When technical integrity passes but corporate approval is pending, overall status is BLOCKED."""
+def test_18_pending_business_approval_correctly_returns_blocked():
+    """18. When technical integrity passes with authentic qualifying execution evidence
+    but corporate approval is pending, overall status is BLOCKED."""
     backend_dir = Path(__file__).resolve().parent.parent
     frontend_dir = backend_dir.parent / "cash-flow-buddy-101"
 
     backend_sha = get_git_commit_sha(backend_dir)
     frontend_sha = get_git_commit_sha(frontend_dir)
+    ev_path = backend_dir / "artifacts" / "backend_test_evidence.json"
+    recon_path = backend_dir / "artifacts" / "reconciliation_summary.json"
 
-    from scripts.release.verify_financial_readiness import compute_file_sha256
+    # Derive formal technical acceptance only from authentic qualifying execution evidence
+    assert ev_path.is_file(), f"Qualifying backend regression evidence missing: {ev_path}"
+    assert recon_path.is_file(), f"Qualifying cross-layer reconciliation evidence missing: {recon_path}"
 
-    mock_xml = tmp_path / "valid_pytest_report.xml"
-    suites_xml = "".join(
-        f'<testsuite name="{suite}" tests="1" failures="0" errors="0" skipped="0" time="0.5"><testcase classname="{suite}" name="test_ok" time="0.01"/></testsuite>'
-        for suite in [
-            "tests.test_wp06_financial_governance_and_integrity",
-            "tests.test_stage4c3_orders_invoices",
-            "tests.test_stage4c4_payments_adjustments",
-            "tests.test_stage4c5_reporting_targets_exports",
-            "tests.test_postgres_domain_models",
-            "tests.contracts.test_domain_contracts",
-        ]
-    )
-    mock_xml.write_text(
-        f'<?xml version="1.0" encoding="utf-8"?><testsuites tests="6" failures="0" errors="0" skipped="0">{suites_xml}</testsuites>',
-        encoding="utf-8",
-    )
-    xml_sha = compute_file_sha256(mock_xml)
+    ev_data = json.loads(ev_path.read_text(encoding="utf-8"))
+    assert ev_data.get("summary", {}).get("total", 0) >= 374, "Evidence total test count does not meet baseline (>= 374)"
+    assert ev_data.get("summary", {}).get("passed", 0) >= 303, "Evidence passed count does not meet baseline (>= 303)"
+    assert ev_data.get("summary", {}).get("failed", 0) == 0
+    assert ev_data.get("summary", {}).get("errors", 0) == 0
+    assert ev_data.get("summary", {}).get("skipped", 0) <= 71
 
-    ev_json = tmp_path / "backend_test_evidence.json"
-    ev_json.write_text(
-        json.dumps({
-            "test_suite": "backend_pytest_regression",
-            "backend_sha": backend_sha,
-            "execution_timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "status": "PASS",
-            "summary": {"total": 6, "passed": 6, "failed": 0, "errors": 0, "skipped": 0},
-            "xml_report_sha256": xml_sha,
-            "report_xml": str(mock_xml),
-            "mandatory_suites_verified": [
-                "tests.test_wp06_financial_governance_and_integrity",
-                "tests.test_stage4c3_orders_invoices",
-                "tests.test_stage4c4_payments_adjustments",
-                "tests.test_stage4c5_reporting_targets_exports",
-                "tests.test_postgres_domain_models",
-                "tests.contracts.test_domain_contracts",
-            ],
-        }),
-        encoding="utf-8",
-    )
+    recon_data = json.loads(recon_path.read_text(encoding="utf-8"))
+    assert recon_data.get("reconciliation_level") == "FULL_FIVE_SOURCE"
+    assert recon_data.get("browser_status") == "PASS"
+    assert recon_data.get("formal_acceptance_eligible") is True
+    assert recon_data.get("is_synthetic_override") is False
 
-    recon_json = tmp_path / "reconciliation_summary.json"
-    recon_json.write_text(
-        json.dumps({
-            "status": "PASS",
-            "reconciliation_level": "FULL_FIVE_SOURCE",
-            "formal_acceptance_eligible": True,
-            "is_synthetic_override": False,
-            "run_id": "test_run_valid",
-            "run_start_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "backend_sha": backend_sha,
-            "frontend_sha": frontend_sha,
-            "database": "collectflow_test",
-            "environment": "test",
-            "verified_sources": ["postgresql", "rest_api", "browser_ui", "excel_xlsx", "csv_export"],
-            "unverified_sources": [],
-            "browser_status": "PASS",
-            "comparisons": {
-                k: {"max_delta": "0.00", "status": "MATCH (₹0.00)", "missing_sources": []}
-                for k in [
-                    "Invoiced Gross", "Taxable Exclusive", "GST Tax Amount", "Cash Received",
-                    "TDS Deducted", "Total Net Settled", "Balance Outstanding", "Unbilled PO Backlog",
-                    "Unbilled Recognized AR", "Annual Target"
-                ]
-            },
-            "metrics": {
-                "invoiced_gross": "531000.00",
-                "exclusive_amount": "450000.00",
-                "tax_amount": "81000.00",
-                "cash_received": "200000.00",
-                "tds_deducted": "9000.00",
-                "total_settled": "209000.00",
-                "total_outstanding": "322000.00",
-                "unbilled_po_gross": "295000.00",
-                "unbilled_recognized_ar": "0.00",
-                "annual_target": "7500000.00",
-            },
-            "invariants": {
-                "cash_plus_tds_equals_settled": True,
-                "invoiced_minus_settled_equals_outstanding": True,
-                "reversal_net_zero": True,
-                "unbilled_ar_zero": True,
-                "ar_aging_sums_to_outstanding": True,
-                "target_reconciled": True,
-            },
-        }),
-        encoding="utf-8",
-    )
+    # Bind the authentic qualifying evidence to the current test run's SHAs
+    ev_data["backend_sha"] = backend_sha
+    ev_data["execution_timestamp_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    ev_path.write_text(json.dumps(ev_data, indent=2), encoding="utf-8")
+
+    recon_data["backend_sha"] = backend_sha
+    recon_data["frontend_sha"] = frontend_sha
+    recon_data["run_start_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    recon_path.write_text(json.dumps(recon_data, indent=2), encoding="utf-8")
 
     report = verify_financial_readiness(
         backend_dir=backend_dir,
         frontend_dir=frontend_dir,
         expected_backend_sha=backend_sha,
         expected_frontend_sha=frontend_sha,
-        regression_evidence=ev_json,
-        reconciliation_summary=recon_json,
+        regression_evidence=ev_path,
+        reconciliation_summary=recon_path,
     )
     assert report["technical_financial_integrity"]["verdict"] == "PASS"
     assert report["business_authorization"]["verdict"] == "BLOCKED"
@@ -992,6 +932,48 @@ def test_27_reconciliation_negative_tests(tmp_path):
     backend_sha = get_git_commit_sha(backend_dir)
     frontend_sha = get_git_commit_sha(backend_dir.parent / "cash-flow-buddy-101")
 
+    applicable_matrix = {
+        "Invoiced Gross": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+        "Taxable Exclusive": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+        "GST Tax Amount": ["postgresql", "backend_api", "excel_xlsx", "csv_export"],
+        "Cash Received": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+        "TDS Deducted": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+        "Total Net Settled": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+        "Balance Outstanding": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+        "Unbilled PO Backlog": ["postgresql", "backend_api", "excel_xlsx", "csv_export"],
+        "Unbilled Recognized AR": ["postgresql", "backend_api", "excel_xlsx", "csv_export"],
+        "Annual Target": ["postgresql", "backend_api", "browser_ui"],
+    }
+    metric_values = {
+        "Invoiced Gross": "531000.00",
+        "Taxable Exclusive": "450000.00",
+        "GST Tax Amount": "81000.00",
+        "Cash Received": "200000.00",
+        "TDS Deducted": "9000.00",
+        "Total Net Settled": "209000.00",
+        "Balance Outstanding": "322000.00",
+        "Unbilled PO Backlog": "295000.00",
+        "Unbilled Recognized AR": "0.00",
+        "Annual Target": "7500000.00",
+    }
+    base_comparisons = {}
+    for k, v in metric_values.items():
+        applicable = applicable_matrix[k]
+        obs = {s: v for s in applicable}
+        if k in ("GST Tax Amount", "Unbilled PO Backlog", "Unbilled Recognized AR"):
+            obs["browser_ui"] = "N/A (UI)"
+        elif k == "Annual Target":
+            obs["excel_xlsx"] = "N/A (Export)"
+            obs["csv_export"] = "N/A (Export)"
+        base_comparisons[k] = {
+            "expected_applicable_sources": applicable,
+            "sources_compared": applicable,
+            "missing_sources": [],
+            "observed_values": obs,
+            "max_delta": "0.00",
+            "status": "MATCH (₹0.00)",
+        }
+
     base_recon = {
         "status": "PASS",
         "reconciliation_level": "FULL_FIVE_SOURCE",
@@ -1006,14 +988,7 @@ def test_27_reconciliation_negative_tests(tmp_path):
         "verified_sources": ["postgresql", "rest_api", "browser_ui", "excel_xlsx", "csv_export"],
         "unverified_sources": [],
         "browser_status": "PASS",
-        "comparisons": {
-            k: {"max_delta": "0.00", "status": "MATCH (₹0.00)", "missing_sources": []}
-            for k in [
-                "Invoiced Gross", "Taxable Exclusive", "GST Tax Amount", "Cash Received",
-                "TDS Deducted", "Total Net Settled", "Balance Outstanding", "Unbilled PO Backlog",
-                "Unbilled Recognized AR", "Annual Target"
-            ]
-        },
+        "comparisons": base_comparisons,
         "metrics": {
             "invoiced_gross": "531000.00",
             "exclusive_amount": "450000.00",
@@ -1086,8 +1061,13 @@ def test_27_reconciliation_negative_tests(tmp_path):
     assert any("missing required financial metric: 'Annual Target'" in e for e in errs6)
 
     # 7. Non-zero comparison delta
-    bad_delta_comps = dict(base_recon["comparisons"])
-    bad_delta_comps["Invoiced Gross"] = {"max_delta": "0.05", "status": "MISMATCH!", "missing_sources": []}
+    bad_delta_comps = {k: dict(v) for k, v in base_recon["comparisons"].items()}
+    bad_delta_comps["Invoiced Gross"]["observed_values"] = dict(
+        bad_delta_comps["Invoiced Gross"]["observed_values"],
+        browser_ui="531000.05",
+    )
+    bad_delta_comps["Invoiced Gross"]["max_delta"] = "0.05"
+    bad_delta_comps["Invoiced Gross"]["status"] = "MISMATCH!"
     bad_delta = dict(base_recon, comparisons=bad_delta_comps)
     f7 = tmp_path / "recon_nonzero_delta.json"
     f7.write_text(json.dumps(bad_delta), encoding="utf-8")
@@ -1103,6 +1083,54 @@ def test_27_reconciliation_negative_tests(tmp_path):
     v8, _, errs8, _ = evaluate_technical_integrity(backend_dir, backend_sha, frontend_sha, reconciliation_summary_path=f8)
     assert v8 == "FAIL"
     assert any("inconsistent with PostgreSQL database for 'invoiced_gross'" in e for e in errs8)
+
+    # 9. Missing observed_values mapping (WP06-R05)
+    bad_no_obs_comps = {k: dict(v) for k, v in base_recon["comparisons"].items()}
+    del bad_no_obs_comps["Invoiced Gross"]["observed_values"]
+    bad_no_obs = dict(base_recon, comparisons=bad_no_obs_comps)
+    f9 = tmp_path / "recon_no_obs.json"
+    f9.write_text(json.dumps(bad_no_obs), encoding="utf-8")
+    v9, _, errs9, _ = evaluate_technical_integrity(backend_dir, backend_sha, frontend_sha, reconciliation_summary_path=f9)
+    assert v9 == "FAIL"
+    assert any("missing 'observed_values' mapping" in e for e in errs9)
+
+    # 10. Missing source value on applicable metric (WP06-R05)
+    bad_missing_src_comps = {k: dict(v) for k, v in base_recon["comparisons"].items()}
+    bad_missing_src_comps["Invoiced Gross"]["observed_values"] = dict(
+        bad_missing_src_comps["Invoiced Gross"]["observed_values"],
+        browser_ui="MISSING_EVIDENCE",
+    )
+    bad_missing_src = dict(base_recon, comparisons=bad_missing_src_comps)
+    f10 = tmp_path / "recon_missing_src.json"
+    f10.write_text(json.dumps(bad_missing_src), encoding="utf-8")
+    v10, _, errs10, _ = evaluate_technical_integrity(backend_dir, backend_sha, frontend_sha, reconciliation_summary_path=f10)
+    assert v10 == "FAIL"
+    assert any("missing observed amount for applicable source 'browser_ui'" in e for e in errs10)
+
+    # 11. Fabricated source participation (sources_compared mismatch) (WP06-R05)
+    bad_part_comps = {k: dict(v) for k, v in base_recon["comparisons"].items()}
+    bad_part_comps["Invoiced Gross"]["sources_compared"] = ["postgresql", "backend_api"]
+    bad_part = dict(base_recon, comparisons=bad_part_comps)
+    f11 = tmp_path / "recon_bad_part.json"
+    f11.write_text(json.dumps(bad_part), encoding="utf-8")
+    v11, _, errs11, _ = evaluate_technical_integrity(backend_dir, backend_sha, frontend_sha, reconciliation_summary_path=f11)
+    assert v11 == "FAIL"
+    assert any("sources_compared mismatch" in e for e in errs11)
+
+    # 12. False zero-delta claims (reported max_delta=0.00 but observed values differ) (WP06-R05)
+    bad_claim_comps = {k: dict(v) for k, v in base_recon["comparisons"].items()}
+    bad_claim_comps["Invoiced Gross"]["max_delta"] = "0.00"
+    bad_claim_comps["Invoiced Gross"]["status"] = "MATCH (₹0.00)"
+    bad_claim_comps["Invoiced Gross"]["observed_values"] = dict(
+        bad_claim_comps["Invoiced Gross"]["observed_values"],
+        browser_ui="531010.00",
+    )
+    bad_claim = dict(base_recon, comparisons=bad_claim_comps)
+    f12 = tmp_path / "recon_false_zero_delta.json"
+    f12.write_text(json.dumps(bad_claim), encoding="utf-8")
+    v12, _, errs12, _ = evaluate_technical_integrity(backend_dir, backend_sha, frontend_sha, reconciliation_summary_path=f12)
+    assert v12 == "FAIL"
+    assert any("fabricated zero-delta claim detected" in e or "Non-zero delta" in e for e in errs12)
 
 
 # ==============================================================================
@@ -1201,7 +1229,7 @@ def test_28_pytest_xml_negative_tests(tmp_path):
             "backend_sha": backend_sha,
             "execution_timestamp_utc": old_time,
             "status": "PASS",
-            "summary": {"total": 371, "passed": 300, "failed": 0, "errors": 0, "skipped": 71},
+            "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71},
             "xml_report_sha256": compute_file_sha256(real_xml_path),
             "report_xml": str(real_xml_path),
         }),
@@ -1210,6 +1238,101 @@ def test_28_pytest_xml_negative_tests(tmp_path):
     v5, _, errs5, _ = evaluate_technical_integrity(backend_dir, backend_sha, frontend_sha, regression_evidence_path=ev_stale)
     assert v5 == "FAIL"
     assert any("Stale pytest evidence" in e for e in errs5)
+
+    # 6. Six-test synthetic XML report rejection (WP06-R04)
+    synth_6_xml = tmp_path / "synthetic_six_test.xml"
+    synth_6_xml.write_text(
+        '<?xml version="1.0" encoding="utf-8"?><testsuites tests="6" failures="0" errors="0" skipped="0">'
+        '<testsuite name="tests.test_wp06_financial_governance_and_integrity" tests="6">'
+        + "".join(f'<testcase classname="tests.test_wp06_financial_governance_and_integrity" name="test_{i}"/>' for i in range(6))
+        + '</testsuite></testsuites>',
+        encoding="utf-8",
+    )
+    ev_6_json = tmp_path / "ev_6_synth.json"
+    ev_6_json.write_text(
+        json.dumps({
+            "test_suite": "backend_pytest_regression",
+            "backend_sha": backend_sha,
+            "execution_timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "status": "PASS",
+            "summary": {"total": 6, "passed": 6, "failed": 0, "errors": 0, "skipped": 0},
+            "xml_report_sha256": compute_file_sha256(synth_6_xml),
+            "report_xml": str(synth_6_xml),
+        }),
+        encoding="utf-8",
+    )
+    v6, _, errs6, _ = evaluate_technical_integrity(backend_dir, backend_sha, frontend_sha, regression_evidence_path=ev_6_json)
+    assert v6 == "FAIL"
+    assert any("Six-test synthetic XML or reduced suite detected" in e for e in errs6)
+
+    # 7. Omitted checksum in JSON evidence (WP06-R04)
+    ev_no_sha = tmp_path / "ev_no_sha.json"
+    ev_no_sha.write_text(
+        json.dumps({
+            "test_suite": "backend_pytest_regression",
+            "backend_sha": backend_sha,
+            "execution_timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "status": "PASS",
+            "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71},
+            "report_xml": str(real_xml_path),
+        }),
+        encoding="utf-8",
+    )
+    v7, _, errs7, _ = evaluate_technical_integrity(backend_dir, backend_sha, frontend_sha, regression_evidence_path=ev_no_sha)
+    assert v7 == "FAIL"
+    assert any("missing required 'xml_report_sha256' field" in e for e in errs7)
+
+    # 8. Manipulated test inventory: insufficient tests in mandatory suite (WP06-R04)
+    real_xml_content = real_xml_path.read_text(encoding="utf-8")
+    # Replace test_contracts with only 2 tests instead of 3
+    insufficient_xml = tmp_path / "insufficient_suite.xml"
+    insufficient_content = real_xml_content.replace(
+        'tests.contracts.test_domain_contracts" name="test_payment_request_requires_positive_total_settling"',
+        'tests.other_contracts" name="test_payment_request_requires_positive_total_settling"',
+    )
+    assert insufficient_content != real_xml_content, "Target testcase string not found in real XML"
+    insufficient_xml.write_text(insufficient_content, encoding="utf-8")
+    ev_insuf = tmp_path / "ev_insuf.json"
+    ev_insuf.write_text(
+        json.dumps({
+            "test_suite": "backend_pytest_regression",
+            "backend_sha": backend_sha,
+            "execution_timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "status": "PASS",
+            "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71},
+            "xml_report_sha256": compute_file_sha256(insufficient_xml),
+            "report_xml": str(insufficient_xml),
+        }),
+        encoding="utf-8",
+    )
+    v8, _, errs8, _ = evaluate_technical_integrity(backend_dir, backend_sha, frontend_sha, regression_evidence_path=ev_insuf)
+    assert v8 == "FAIL"
+    assert any("tests.contracts.test_domain_contracts" in e and "incomplete regression execution detected" in e for e in errs8)
+
+    # 9. Synthetic testcase name in mandatory suite (WP06-R04)
+    synth_name_xml = tmp_path / "synth_name.xml"
+    synth_name_content = real_xml_content.replace(
+        'tests.contracts.test_domain_contracts" name="test_exact_money_quantization_and_formatting"',
+        'tests.contracts.test_domain_contracts" name="test_ok"',
+    )
+    assert synth_name_content != real_xml_content, "Target testcase string not found in real XML"
+    synth_name_xml.write_text(synth_name_content, encoding="utf-8")
+    ev_synth_name = tmp_path / "ev_synth_name.json"
+    ev_synth_name.write_text(
+        json.dumps({
+            "test_suite": "backend_pytest_regression",
+            "backend_sha": backend_sha,
+            "execution_timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "status": "PASS",
+            "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71},
+            "xml_report_sha256": compute_file_sha256(synth_name_xml),
+            "report_xml": str(synth_name_xml),
+        }),
+        encoding="utf-8",
+    )
+    v9, _, errs9, _ = evaluate_technical_integrity(backend_dir, backend_sha, frontend_sha, regression_evidence_path=ev_synth_name)
+    assert v9 == "FAIL"
+    assert any("Synthetic testcase fixture 'test_ok' detected in mandatory suite" in e for e in errs9)
 
 
 # ==============================================================================

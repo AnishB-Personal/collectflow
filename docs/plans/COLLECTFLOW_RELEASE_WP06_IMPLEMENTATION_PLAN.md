@@ -97,6 +97,20 @@ The objective of WP-06 is to establish trustworthy financial and business releas
 - Verifies repository directory markers and remote origin URLs for both repositories.
 - Rejects production/staging databases and unauthorized review flags (`CRITICAL GOVERNANCE ABORT`).
 
+### WP06-R04: Incomplete Regression Execution Rejection
+- **Script:** `scripts/release/verify_financial_readiness.py`, `scripts/release/generate_backend_test_evidence.py`.
+- Rejects synthetic or reduced test reports (e.g. six-test XML fixtures).
+- Enforces baseline inventory: total >= 374, passed >= 303, skipped <= 71, failed == 0, errors == 0.
+- Enforces mandatory suite executed test case minimums and authentic testcase names.
+- Requires and recomputes `xml_report_sha256`.
+
+### WP06-R05: Five-Source Observed Metric Verification
+- **Script:** `scripts/verify_cross_layer_reconciliation.py`, `scripts/release/verify_financial_readiness.py`.
+- Records actual source-specific observed amounts for all 10 financial metrics across all applicable sources.
+- Validates applicable source matrix and distinguishes legitimate architectural N/A from missing evidence.
+- Independently recalculates monetary deltas directly from observed numbers using Decimal arithmetic.
+- Rejects fabricated zero-delta claims and cross-checks PostgreSQL totals against live database queries.
+
 ### WP06-05: Finance & Business Sign-off Governance Package
 - Documents created under `docs/finance/`:
   - `COLLECTFLOW_BPD01_REFERENCE_MASTERS_REVIEW.md`

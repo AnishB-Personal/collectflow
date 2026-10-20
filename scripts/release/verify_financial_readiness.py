@@ -47,6 +47,8 @@ if os.environ.get("COLLECTFLOW_ENV") == "test" and "COLLECTFLOW_DATABASE_URL" no
 EXPECTED_ALEMBIC_REVISION = "77e73a1cb221"
 APPROVED_TEST_ENVS = {"test", "ci", "isolated_test"}
 APPROVED_TEST_DATABASES = {"collectflow_test", "collectflow_ci"}
+BASELINE_MIN_TOTAL_TESTS = 374
+BASELINE_MIN_PASSED_TESTS = 303
 BASELINE_MAX_SKIPS = 71
 
 MANDATORY_FINANCIAL_SUITES = [
@@ -57,6 +59,15 @@ MANDATORY_FINANCIAL_SUITES = [
     "tests.test_postgres_domain_models",
     "tests.contracts.test_domain_contracts",
 ]
+
+MANDATORY_FINANCIAL_SUITE_MINIMUMS = {
+    "tests.test_wp06_financial_governance_and_integrity": 29,
+    "tests.test_stage4c3_orders_invoices": 11,
+    "tests.test_stage4c4_payments_adjustments": 23,
+    "tests.test_stage4c5_reporting_targets_exports": 18,
+    "tests.test_postgres_domain_models": 6,
+    "tests.contracts.test_domain_contracts": 3,
+}
 
 EXPECTED_RECONCILIATION_SOURCES = [
     "postgresql",
@@ -78,6 +89,26 @@ EXPECTED_RECONCILIATION_COMPARISONS = [
     "Unbilled Recognized AR",
     "Annual Target",
 ]
+
+EXPECTED_METRIC_APPLICABLE_SOURCES = {
+    "Invoiced Gross": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+    "Taxable Exclusive": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+    "GST Tax Amount": ["postgresql", "backend_api", "excel_xlsx", "csv_export"],
+    "Cash Received": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+    "TDS Deducted": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+    "Total Net Settled": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+    "Balance Outstanding": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+    "Unbilled PO Backlog": ["postgresql", "backend_api", "excel_xlsx", "csv_export"],
+    "Unbilled Recognized AR": ["postgresql", "backend_api", "excel_xlsx", "csv_export"],
+    "Annual Target": ["postgresql", "backend_api", "browser_ui"],
+}
+
+LEGITIMATE_ARCHITECTURAL_NA = {
+    "GST Tax Amount": {"browser_ui": "N/A (UI)"},
+    "Unbilled PO Backlog": {"browser_ui": "N/A (UI)"},
+    "Unbilled Recognized AR": {"browser_ui": "N/A (UI)"},
+    "Annual Target": {"excel_xlsx": "N/A (Export)", "csv_export": "N/A (Export)"},
+}
 
 EXPECTED_RECONCILIATION_INVARIANTS = [
     "cash_plus_tds_equals_settled",
@@ -521,6 +552,10 @@ def evaluate_technical_integrity(
                 ev_errs.append(f"Regression evidence source SHA mismatch: evidence has '{ev_sha}', current backend is '{backend_sha}'")
 
             # 4.2 Verify referenced pytest XML exists and recompute SHA-256
+            if not ev_xml_sha:
+                ev_ok = False
+                ev_errs.append("Regression evidence JSON missing required 'xml_report_sha256' field")
+
             if not ev_xml_path_str:
                 xml_path = backend_dir / "artifacts" / "backend_pytest_report.xml"
             else:
@@ -540,7 +575,7 @@ def evaluate_technical_integrity(
                         f"recalculated XML checksum is '{actual_xml_sha}' (altered XML detected)"
                     )
 
-                # 4.3 Reparse XML and independently recalculate test counts
+                # 4.3 Reparse XML and independently recalculate test counts and inventory
                 try:
                     tree = ET.parse(xml_path)
                     root = tree.getroot()
@@ -552,11 +587,14 @@ def evaluate_technical_integrity(
                     xml_passed = xml_total - xml_failures - xml_errors - xml_skipped
 
                     discovered_classes = set()
+                    suite_testcases: Dict[str, List[str]] = {}
                     for s in suites:
                         for tc in s.findall("testcase"):
                             cn = tc.attrib.get("classname")
+                            name = tc.attrib.get("name")
                             if cn:
                                 discovered_classes.add(cn)
+                                suite_testcases.setdefault(cn, []).append(name or "")
 
                     # Compare XML vs JSON counts
                     if (
@@ -574,9 +612,18 @@ def evaluate_technical_integrity(
                             f"(forged JSON evidence detected)"
                         )
 
-                    if xml_passed <= 0 or xml_total <= 0:
+                    # Baseline test inventory checks (WP06-R04)
+                    if xml_total < BASELINE_MIN_TOTAL_TESTS:
                         ev_ok = False
-                        ev_errs.append(f"Pytest report reported zero passed tests ({xml_passed} / {xml_total})")
+                        ev_errs.append(
+                            f"Incomplete backend regression: collected {xml_total} tests, expected at least {BASELINE_MIN_TOTAL_TESTS} tests. "
+                            f"Six-test synthetic XML or reduced suite detected."
+                        )
+                    if xml_passed < BASELINE_MIN_PASSED_TESTS:
+                        ev_ok = False
+                        ev_errs.append(
+                            f"Incomplete backend regression: passed {xml_passed} tests, expected at least {BASELINE_MIN_PASSED_TESTS} tests."
+                        )
                     if xml_failures > 0 or xml_errors > 0:
                         ev_ok = False
                         ev_errs.append(f"Pytest report contains failed tests ({xml_failures}) or errors ({xml_errors})")
@@ -584,10 +631,27 @@ def evaluate_technical_integrity(
                         ev_ok = False
                         ev_errs.append(f"Unapproved additional skipped tests: {xml_skipped} exceeds baseline threshold of {BASELINE_MAX_SKIPS}")
 
-                    missing_mandatory_suites = [s for s in MANDATORY_FINANCIAL_SUITES if s not in discovered_classes]
+                    missing_mandatory_suites = [s for s in MANDATORY_FINANCIAL_SUITE_MINIMUMS if s not in discovered_classes]
                     if missing_mandatory_suites:
                         ev_ok = False
                         ev_errs.append(f"Pytest report missing mandatory financial test suite(s): {missing_mandatory_suites}")
+
+                    for suite_name, min_tests in MANDATORY_FINANCIAL_SUITE_MINIMUMS.items():
+                        if suite_name in suite_testcases:
+                            actual_count = len(suite_testcases[suite_name])
+                            if actual_count < min_tests:
+                                ev_ok = False
+                                ev_errs.append(
+                                    f"Mandatory test suite '{suite_name}' executed only {actual_count} tests, "
+                                    f"expected at least {min_tests} (incomplete regression execution detected)"
+                                )
+                            for t_name in suite_testcases[suite_name]:
+                                if t_name in ("test_ok", "test_dummy", "test_placeholder", "test_fake"):
+                                    ev_ok = False
+                                    ev_errs.append(
+                                        f"Synthetic testcase fixture '{t_name}' detected in mandatory suite '{suite_name}' "
+                                        f"(synthetic unit test fixtures cannot qualify as formal execution evidence)"
+                                    )
 
                 except Exception as xml_exc:
                     ev_ok = False
@@ -727,7 +791,7 @@ def evaluate_technical_integrity(
                     f"got {sorted(verified_srcs)} (unverified: {unverified_srcs})"
                 )
 
-            # 5.4 Comparisons and zero delta verification (WP06-R01.5, WP06-R01.7)
+            # 5.4 Comparisons, observed source values and recomputed delta verification (WP06-R05)
             if not isinstance(recon_comparisons, dict) or not recon_comparisons:
                 recon_ok = False
                 recon_errs.append("Reconciliation comparisons dictionary is empty or missing")
@@ -738,15 +802,83 @@ def evaluate_technical_integrity(
                         recon_errs.append(f"Reconciliation comparisons missing required financial metric: '{comp_metric}'")
                     else:
                         c_data = recon_comparisons[comp_metric]
-                        raw_delta = str(c_data.get("max_delta", ""))
-                        try:
-                            delta_dec = Decimal(raw_delta)
-                            if delta_dec != Decimal("0.00"):
-                                recon_ok = False
-                                recon_errs.append(f"Non-zero delta for comparison '{comp_metric}': ₹{delta_dec}")
-                        except Exception:
+                        if not isinstance(c_data, dict):
                             recon_ok = False
-                            recon_errs.append(f"Invalid max_delta for comparison '{comp_metric}': '{raw_delta}'")
+                            recon_errs.append(f"Reconciliation comparison for '{comp_metric}' is not a valid dictionary")
+                            continue
+
+                        expected_sources = EXPECTED_METRIC_APPLICABLE_SOURCES[comp_metric]
+                        actual_sources = c_data.get("sources_compared", [])
+
+                        # 1. Require sources_compared to match expected applicable sources (WP06-R05.4, WP06-R05.5)
+                        if set(actual_sources) != set(expected_sources):
+                            recon_ok = False
+                            recon_errs.append(
+                                f"Metric '{comp_metric}' sources_compared mismatch: expected {sorted(expected_sources)}, "
+                                f"got {sorted(actual_sources)} (unexpected or missing source participation)"
+                            )
+
+                        # 2. Validate observed_values mapping (WP06-R05.1, WP06-R05.3)
+                        observed_values = c_data.get("observed_values")
+                        if not isinstance(observed_values, dict):
+                            recon_ok = False
+                            recon_errs.append(f"Metric '{comp_metric}' missing 'observed_values' mapping")
+                        else:
+                            observed_decimals: List[Decimal] = []
+                            for src in expected_sources:
+                                raw_val = observed_values.get(src)
+                                if raw_val is None or raw_val in ("N/A", "MISSING_EVIDENCE", "NOT_EXECUTED", ""):
+                                    recon_ok = False
+                                    recon_errs.append(
+                                        f"Metric '{comp_metric}' missing observed amount for applicable source '{src}' "
+                                        f"(got '{raw_val}')"
+                                    )
+                                else:
+                                    try:
+                                        observed_decimals.append(Decimal(str(raw_val)))
+                                    except Exception:
+                                        recon_ok = False
+                                        recon_errs.append(
+                                            f"Metric '{comp_metric}' source '{src}' observed value is invalid Decimal: '{raw_val}'"
+                                        )
+
+                            # Validate legitimate N/A sources (WP06-R05.3)
+                            for na_src, na_expected in LEGITIMATE_ARCHITECTURAL_NA.get(comp_metric, {}).items():
+                                na_val = str(observed_values.get(na_src, ""))
+                                if not na_val.startswith("N/A"):
+                                    recon_ok = False
+                                    recon_errs.append(
+                                        f"Metric '{comp_metric}' source '{na_src}' expected legitimate N/A marker, got '{na_val}'"
+                                    )
+
+                            # 3. Independently recompute every reported monetary delta from observed values (WP06-R05.6)
+                            if observed_decimals and len(observed_decimals) == len(expected_sources):
+                                computed_max = max(observed_decimals)
+                                computed_min = min(observed_decimals)
+                                recomputed_delta = computed_max - computed_min
+
+                                raw_reported_delta = str(c_data.get("max_delta", ""))
+                                try:
+                                    reported_delta = Decimal(raw_reported_delta)
+                                    if recomputed_delta != reported_delta:
+                                        recon_ok = False
+                                        recon_errs.append(
+                                            f"Metric '{comp_metric}' reported max_delta '{reported_delta}' does not match "
+                                            f"independently recomputed delta '{recomputed_delta}' (fabricated zero-delta claim detected)"
+                                        )
+                                except Exception:
+                                    recon_ok = False
+                                    recon_errs.append(f"Metric '{comp_metric}' invalid reported max_delta: '{raw_reported_delta}'")
+
+                                if recomputed_delta != Decimal("0.00"):
+                                    recon_ok = False
+                                    recon_errs.append(f"Non-zero delta for comparison '{comp_metric}': ₹{recomputed_delta}")
+
+                        # 4. Metric status check
+                        comp_status = c_data.get("status")
+                        if comp_status != "MATCH (₹0.00)":
+                            recon_ok = False
+                            recon_errs.append(f"Metric '{comp_metric}' status is not 'MATCH (₹0.00)' (got '{comp_status}')")
 
             # 5.5 Invariants verification (WP06-R01.5, WP06-R01.6)
             if not isinstance(recon_invariants, dict) or not recon_invariants:

@@ -63,6 +63,39 @@ AUTHORITATIVE_COLUMNS = [
     "Days Overdue",
 ]
 
+EXPECTED_RECONCILIATION_METRICS = [
+    "Invoiced Gross",
+    "Taxable Exclusive",
+    "GST Tax Amount",
+    "Cash Received",
+    "TDS Deducted",
+    "Total Net Settled",
+    "Balance Outstanding",
+    "Unbilled PO Backlog",
+    "Unbilled Recognized AR",
+    "Annual Target",
+]
+
+EXPECTED_METRIC_APPLICABLE_SOURCES = {
+    "Invoiced Gross": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+    "Taxable Exclusive": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+    "GST Tax Amount": ["postgresql", "backend_api", "excel_xlsx", "csv_export"],
+    "Cash Received": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+    "TDS Deducted": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+    "Total Net Settled": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+    "Balance Outstanding": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+    "Unbilled PO Backlog": ["postgresql", "backend_api", "excel_xlsx", "csv_export"],
+    "Unbilled Recognized AR": ["postgresql", "backend_api", "excel_xlsx", "csv_export"],
+    "Annual Target": ["postgresql", "backend_api", "browser_ui"],
+}
+
+LEGITIMATE_ARCHITECTURAL_NA = {
+    "GST Tax Amount": {"browser_ui": "N/A (UI)"},
+    "Unbilled PO Backlog": {"browser_ui": "N/A (UI)"},
+    "Unbilled Recognized AR": {"browser_ui": "N/A (UI)"},
+    "Annual Target": {"excel_xlsx": "N/A (Export)", "csv_export": "N/A (Export)"},
+}
+
 # Ensure import paths for app
 project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
@@ -639,23 +672,39 @@ def verify_cross_layer_reconciliation(
 
     all_passed = True
     comparisons = {}
-    source_names = ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"]
     for name, v_pg, v_api, v_ui, v_xl, v_csv in checks:
-        vals = [v_pg, v_api, v_ui, v_xl, v_csv]
-        sources_compared = [s for s, v in zip(source_names, vals) if v is not None]
-        missing_sources = []
-        if name in ("Invoiced Gross", "Taxable Exclusive", "Cash Received", "TDS Deducted", "Total Net Settled", "Balance Outstanding", "Annual Target"):
-            if v_ui is None and browser_status == "NOT_EXECUTED":
-                missing_sources.append("browser_ui")
+        source_map = {
+            "postgresql": v_pg,
+            "backend_api": v_api,
+            "browser_ui": v_ui,
+            "excel_xlsx": v_xl,
+            "csv_export": v_csv,
+        }
+        expected_sources = EXPECTED_METRIC_APPLICABLE_SOURCES[name]
+        sources_compared = [s for s in expected_sources if source_map[s] is not None]
+        missing_sources = [s for s in expected_sources if source_map[s] is None]
 
-        applicable_vals = [v for v in vals if v is not None]
+        observed_values = {}
+        for s_name, val in source_map.items():
+            if val is not None:
+                observed_values[s_name] = str(val)
+            else:
+                na_reason = LEGITIMATE_ARCHITECTURAL_NA.get(name, {}).get(s_name)
+                if na_reason:
+                    observed_values[s_name] = na_reason
+                elif s_name == "browser_ui" and browser_status == "NOT_EXECUTED":
+                    observed_values[s_name] = "NOT_EXECUTED"
+                else:
+                    observed_values[s_name] = "MISSING_EVIDENCE"
+
+        applicable_vals = [source_map[s] for s in sources_compared]
         assert len(applicable_vals) >= 2, f"Insufficient sources for comparison: {name}"
 
         # Differences against PostgreSQL anchor
         diffs = [abs(v - v_pg) for v in applicable_vals]
         max_diff = max(diffs)
-        metric_status = "MATCH (₹0.00)" if max_diff == Decimal("0.00") else "MISMATCH!"
-        if max_diff != Decimal("0.00"):
+        metric_status = "MATCH (₹0.00)" if max_diff == Decimal("0.00") and not missing_sources else "MISMATCH!"
+        if max_diff != Decimal("0.00") or missing_sources:
             all_passed = False
 
         s_pg = f"₹{v_pg}"
@@ -667,8 +716,10 @@ def verify_cross_layer_reconciliation(
         print(f"{name:<24} | {s_pg:<12} | {s_api:<12} | {s_ui:<14} | {s_xl:<12} | {s_csv:<12} | ₹{max_diff:<7} | {metric_status}")
 
         comparisons[name] = {
+            "expected_applicable_sources": expected_sources,
             "sources_compared": sources_compared,
             "missing_sources": missing_sources,
+            "observed_values": observed_values,
             "max_delta": str(max_diff),
             "status": metric_status,
         }

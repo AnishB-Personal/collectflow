@@ -22,6 +22,10 @@ def compute_file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+BASELINE_MIN_TOTAL_TESTS = 374
+BASELINE_MIN_PASSED_TESTS = 303
+BASELINE_MAX_SKIPS = 71
+
 MANDATORY_FINANCIAL_SUITES = [
     "tests.test_wp06_financial_governance_and_integrity",
     "tests.test_stage4c3_orders_invoices",
@@ -30,6 +34,15 @@ MANDATORY_FINANCIAL_SUITES = [
     "tests.test_postgres_domain_models",
     "tests.contracts.test_domain_contracts",
 ]
+
+MANDATORY_FINANCIAL_SUITE_MINIMUMS = {
+    "tests.test_wp06_financial_governance_and_integrity": 29,
+    "tests.test_stage4c3_orders_invoices": 11,
+    "tests.test_stage4c4_payments_adjustments": 23,
+    "tests.test_stage4c5_reporting_targets_exports": 18,
+    "tests.test_postgres_domain_models": 6,
+    "tests.contracts.test_domain_contracts": 3,
+}
 
 
 def generate_backend_test_evidence(
@@ -59,6 +72,7 @@ def generate_backend_test_evidence(
     xml_hostname = None
     xml_time_sec = 0.0
     discovered_classes = set()
+    suite_testcases = {}
 
     for suite in suites:
         total_tests += int(suite.attrib.get("tests", 0))
@@ -77,8 +91,10 @@ def generate_backend_test_evidence(
 
         for tc in suite.findall("testcase"):
             cn = tc.attrib.get("classname")
+            name = tc.attrib.get("name")
             if cn:
                 discovered_classes.add(cn)
+                suite_testcases.setdefault(cn, []).append(name)
 
     passed = total_tests - total_failures - total_errors - total_skipped
     if passed < 0:
@@ -93,12 +109,23 @@ def generate_backend_test_evidence(
     )
     backend_sha = res.stdout.strip()
 
-    missing_suites = [s for s in MANDATORY_FINANCIAL_SUITES if s not in discovered_classes]
-    status = (
-        "PASS"
-        if total_failures == 0 and total_errors == 0 and passed > 0 and not missing_suites
-        else "FAIL"
+    missing_suites = [s for s in MANDATORY_FINANCIAL_SUITE_MINIMUMS if s not in discovered_classes]
+    insufficient_suites = [
+        f"{s} (has {len(suite_testcases.get(s, []))}, expected at least {min_c})"
+        for s, min_c in MANDATORY_FINANCIAL_SUITE_MINIMUMS.items()
+        if len(suite_testcases.get(s, [])) < min_c
+    ]
+
+    is_qualifying = (
+        total_failures == 0
+        and total_errors == 0
+        and total_tests >= BASELINE_MIN_TOTAL_TESTS
+        and passed >= BASELINE_MIN_PASSED_TESTS
+        and total_skipped <= BASELINE_MAX_SKIPS
+        and not missing_suites
+        and not insufficient_suites
     )
+    status = "PASS" if is_qualifying else "FAIL"
     xml_sha256 = compute_file_sha256(xml_path)
 
     evidence = {
@@ -115,8 +142,10 @@ def generate_backend_test_evidence(
             "errors": total_errors,
             "skipped": total_skipped,
         },
-        "mandatory_suites_present": not missing_suites,
+        "mandatory_suites_present": not missing_suites and not insufficient_suites,
         "missing_mandatory_suites": missing_suites,
+        "insufficient_mandatory_suites": insufficient_suites,
+        "test_inventory_summary": {s: len(suite_testcases.get(s, [])) for s in MANDATORY_FINANCIAL_SUITE_MINIMUMS},
         "xml_report_sha256": xml_sha256,
         "report_xml": str(xml_path.resolve()),
     }

@@ -108,6 +108,37 @@ Both repositories continue on `feature/release-wp06-financial-approval-gates`.
   - Strictly rejects `--allow-production-review` or production/staging target databases (`CRITICAL GOVERNANCE ABORT`) during formal financial release verification.
   - Added negative tests for unpinned revisions, mismatched repositories, and unauthorized production-review switches.
 
+### WP06-R04: Reject Incomplete Regression Execution
+- **Files:** `scripts/release/verify_financial_readiness.py`, `scripts/release/generate_backend_test_evidence.py`, `tests/test_wp06_financial_governance_and_integrity.py`
+- **Implemented Controls:**
+  - Mandated that synthetic XML fixtures (e.g. six-test reports) cannot qualify as complete backend regression execution.
+  - Established expected collected-test inventory baseline: `BASELINE_MIN_TOTAL_TESTS = 374`, `BASELINE_MIN_PASSED_TESTS = 303`, `BASELINE_MAX_SKIPS = 71`.
+  - Enforced test case minimums per mandatory financial suite:
+    - `tests.test_wp06_financial_governance_and_integrity`: min 29 test cases
+    - `tests.test_stage4c3_orders_invoices`: min 11 test cases
+    - `tests.test_stage4c4_payments_adjustments`: min 23 test cases
+    - `tests.test_stage4c5_reporting_targets_exports`: min 18 test cases
+    - `tests.test_postgres_domain_models`: min 6 test cases
+    - `tests.contracts.test_domain_contracts`: min 3 test cases
+  - Reparses XML test cases and detects placeholder test fixtures (`test_ok`, `test_dummy`, `test_placeholder`), rejecting them fail-closed.
+  - Requires presence and integrity of `xml_report_sha256` in JSON evidence; absence triggers immediate FAIL.
+  - Validates full XML vs JSON count consistency (total, passed, failed, errors, skipped) and freshness (<= 24 hours).
+  - Corrected `test_18` to derive technical PASS only from authentic qualifying execution evidence.
+  - Added negative tests for six-test synthetic reports, omitted checksums, manipulated test inventories, and synthetic testcase names.
+
+### WP06-R05: Verify Actual Five-Source Metric Comparisons
+- **Files:** `scripts/verify_cross_layer_reconciliation.py`, `scripts/release/verify_financial_readiness.py`, `tests/test_wp06_financial_governance_and_integrity.py`
+- **Implemented Controls:**
+  - Recorded actual observed amounts by source for every one of the ten financial metrics in `scripts/verify_cross_layer_reconciliation.py`.
+  - Defined explicit applicable-source matrix (`EXPECTED_METRIC_APPLICABLE_SOURCES`) and legitimate architectural N/A mapping (`LEGITIMATE_ARCHITECTURAL_NA`) for all 10 metrics.
+  - Distinguished legitimate architectural N/A values (`"N/A (UI)"`, `"N/A (Export)"`) from missing execution evidence (`"MISSING_EVIDENCE"`, `"NOT_EXECUTED"`).
+  - Enforced that `sources_compared` matches expected applicable sources exactly; rejected unexpected or missing source participation.
+  - Independently recomputed monetary delta (`max(observed) - min(observed)`) across all applicable sources for each metric using Decimal arithmetic.
+  - Verified that reported `max_delta` matches independently recomputed delta, rejecting fabricated zero-delta claims.
+  - Required recomputed monetary delta to equal exactly ₹0.00 across all 10 metrics.
+  - Cross-checked PostgreSQL observed values directly against independent database queries.
+  - Added negative tests for missing observed values mapping, missing source amounts, sources_compared mismatches, and false zero-delta claims.
+
 ---
 
 ## 3. Independent Multi-Source Financial Reconciliation Matrix
