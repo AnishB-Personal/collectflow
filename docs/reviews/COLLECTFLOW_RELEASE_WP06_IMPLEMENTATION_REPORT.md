@@ -139,6 +139,30 @@ Both repositories continue on `feature/release-wp06-financial-approval-gates`.
   - Cross-checked PostgreSQL observed values directly against independent database queries.
   - Added negative tests for missing observed values mapping, missing source amounts, sources_compared mismatches, and false zero-delta claims.
 
+### WP06-R06: Stop Mutating Acceptance Evidence During Tests
+- **Files:** `tests/test_wp06_financial_governance_and_integrity.py`, `scripts/release/verify_financial_readiness.py`
+- **Implemented Controls:**
+  - Removed all writes to real `backend_test_evidence.json` and `reconciliation_summary.json` from pytest tests.
+  - Eliminated test-driven restamping of existing evidence with new source revisions or timestamps; acceptance evidence remains strictly immutable once generated.
+  - Tested Finance BLOCKED behavior in `test_18` using a controlled mock (`monkeypatch`), decoupling business governance assertions from live evidence mutation.
+  - Verified underlying pytest XML report timestamp freshness (<= 24 hours) and timestamp consistency between JSON evidence metadata and XML attributes.
+  - Added negative test proving that stale test evidence cannot become valid by modifying or restamping its JSON execution metadata.
+
+### WP06-R07: Remove Circular Test/Evidence Dependencies & Orchestration Pipeline
+- **Files:** `tests/test_wp06_financial_governance_and_integrity.py`, `scripts/release/run_financial_acceptance_pipeline.py`
+- **Implemented Controls:**
+  - Full backend pytest now runs hermetically in an isolated clean checkout without pre-existing files in `artifacts/`.
+  - Refactored `test_28` to generate isolated temporary test XML fixtures dynamically in `tmp_path`, removing all runtime dependencies on pre-existing `artifacts/backend_pytest_report.xml`.
+  - Created deterministic noninteractive orchestration pipeline script `scripts/release/run_financial_acceptance_pipeline.py`:
+    1. Captures and pins expected source revisions (backend & frontend Git SHAs).
+    2. Purges stale generated acceptance artifacts (`artifacts/*.xml`, `artifacts/*.json`).
+    3. Executes full backend pytest regression and generates JUnit XML report.
+    4. Generates validated structured test evidence JSON with XML SHA-256 checksum.
+    5. Executes genuine five-source cross-layer reconciliation (PostgreSQL, REST API, Playwright DOM, XLSX, CSV).
+    6. Executes formal financial release readiness gate with exact SHA pinning.
+    7. Verifies source revisions remain unchanged across execution.
+    8. Enforces fail-closed boundaries (Corporate Finance status: `AWAITING_FINANCE_APPROVAL`).
+
 ---
 
 ## 3. Independent Multi-Source Financial Reconciliation Matrix

@@ -586,6 +586,48 @@ def evaluate_technical_integrity(
                     xml_skipped = sum(int(s.attrib.get("skipped", 0)) for s in suites)
                     xml_passed = xml_total - xml_failures - xml_errors - xml_skipped
 
+                    # Reparse XML attributes and timestamp
+                    xml_timestamp_str = None
+                    for s in suites:
+                        if s.attrib.get("timestamp"):
+                            xml_timestamp_str = s.attrib.get("timestamp")
+                            break
+                    if not xml_timestamp_str and root.attrib.get("timestamp"):
+                        xml_timestamp_str = root.attrib.get("timestamp")
+
+                    if xml_timestamp_str:
+                        try:
+                            xml_dt = datetime.datetime.fromisoformat(xml_timestamp_str)
+                            now_for_xml = datetime.datetime.now(datetime.timezone.utc)
+                            if xml_dt.tzinfo is None:
+                                xml_dt = xml_dt.replace(tzinfo=datetime.timezone.utc)
+                            if (now_for_xml - xml_dt).total_seconds() > 86400:
+                                ev_ok = False
+                                ev_errs.append(
+                                    f"Stale underlying pytest XML report: XML timestamp '{xml_timestamp_str}' is older than 24 hours. "
+                                    f"Modifying JSON execution_timestamp_utc metadata cannot validate stale XML test reports."
+                                )
+                            elif (xml_dt - now_for_xml).total_seconds() > 300:
+                                ev_ok = False
+                                ev_errs.append(f"Pytest XML report timestamp is in the future: {xml_timestamp_str}")
+
+                            if ev_timestamp:
+                                try:
+                                    json_dt = datetime.datetime.fromisoformat(ev_timestamp)
+                                    if json_dt.tzinfo is None:
+                                        json_dt = json_dt.replace(tzinfo=datetime.timezone.utc)
+                                    if abs((json_dt - xml_dt).total_seconds()) > 60:
+                                        ev_ok = False
+                                        ev_errs.append(
+                                            f"Timestamp discrepancy between JSON evidence ('{ev_timestamp}') and underlying XML report ('{xml_timestamp_str}'): "
+                                            f"stale evidence cannot become valid by modifying JSON metadata."
+                                        )
+                                except Exception:
+                                    pass
+                        except Exception as ts_exc:
+                            ev_ok = False
+                            ev_errs.append(f"Invalid timestamp format in underlying pytest XML report: {ts_exc}")
+
                     discovered_classes = set()
                     suite_testcases: Dict[str, List[str]] = {}
                     for s in suites:

@@ -27,6 +27,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import json
 import os
 from pathlib import Path
+from typing import Optional, Dict, List, Any
 import pytest
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
@@ -540,56 +541,52 @@ def test_17_source_commit_shas_recorded(tmp_path):
 # ==============================================================================
 # WP06-08 Test 18: Pending Business Approval Correctly Returns BLOCKED
 # ==============================================================================
-def test_18_pending_business_approval_correctly_returns_blocked():
-    """18. When technical integrity passes with authentic qualifying execution evidence
-    but corporate approval is pending, overall status is BLOCKED."""
+def test_18_pending_business_approval_correctly_returns_blocked(monkeypatch):
+    """18. When technical integrity passes (verified via controlled isolation) but corporate
+    approval is pending, overall status is BLOCKED."""
     backend_dir = Path(__file__).resolve().parent.parent
     frontend_dir = backend_dir.parent / "cash-flow-buddy-101"
 
     backend_sha = get_git_commit_sha(backend_dir)
     frontend_sha = get_git_commit_sha(frontend_dir)
-    ev_path = backend_dir / "artifacts" / "backend_test_evidence.json"
-    recon_path = backend_dir / "artifacts" / "reconciliation_summary.json"
 
-    # Derive formal technical acceptance only from authentic qualifying execution evidence
-    assert ev_path.is_file(), f"Qualifying backend regression evidence missing: {ev_path}"
-    assert recon_path.is_file(), f"Qualifying cross-layer reconciliation evidence missing: {recon_path}"
+    from scripts.release import verify_financial_readiness as vfr_module
 
-    ev_data = json.loads(ev_path.read_text(encoding="utf-8"))
-    assert ev_data.get("summary", {}).get("total", 0) >= 374, "Evidence total test count does not meet baseline (>= 374)"
-    assert ev_data.get("summary", {}).get("passed", 0) >= 303, "Evidence passed count does not meet baseline (>= 303)"
-    assert ev_data.get("summary", {}).get("failed", 0) == 0
-    assert ev_data.get("summary", {}).get("errors", 0) == 0
-    assert ev_data.get("summary", {}).get("skipped", 0) <= 71
+    # Controlled mock for technical integrity gate to test Finance BLOCKED governance in isolation (WP06-R06)
+    mock_checks = {
+        "expected_sha_pinning": {"status": "PASS", "pinned": True},
+        "backend_sha_checkpoint": {"status": "PASS", "sha": backend_sha},
+        "frontend_sha_checkpoint": {"status": "PASS", "sha": frontend_sha},
+        "schema_revision": {"status": "PASS", "revision": "77e73a1cb221"},
+        "dataset_environment": {"status": "PASS", "database": "collectflow_test"},
+        "dataset_population": {"status": "PASS", "counts": {"invoices": 1, "payments": 2, "reversals": 1, "unbilled_pos": 1}},
+        "invoice_balance_invariants": {"status": "PASS"},
+        "accounting_totals_invariants": {"status": "PASS"},
+        "payment_settlement_invariants": {"status": "PASS"},
+        "reversal_integrity": {"status": "PASS"},
+        "unbilled_po_zero_ar": {"status": "PASS"},
+        "regression_test_evidence": {"status": "PASS", "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71}},
+        "cross_layer_reconciliation_evidence": {"status": "PASS", "reconciliation_level": "FULL_FIVE_SOURCE", "formal_acceptance_eligible": True},
+        "repository_identity": {"status": "PASS"},
+    }
 
-    recon_data = json.loads(recon_path.read_text(encoding="utf-8"))
-    assert recon_data.get("reconciliation_level") == "FULL_FIVE_SOURCE"
-    assert recon_data.get("browser_status") == "PASS"
-    assert recon_data.get("formal_acceptance_eligible") is True
-    assert recon_data.get("is_synthetic_override") is False
-
-    # Bind the authentic qualifying evidence to the current test run's SHAs
-    ev_data["backend_sha"] = backend_sha
-    ev_data["execution_timestamp_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    ev_path.write_text(json.dumps(ev_data, indent=2), encoding="utf-8")
-
-    recon_data["backend_sha"] = backend_sha
-    recon_data["frontend_sha"] = frontend_sha
-    recon_data["run_start_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    recon_path.write_text(json.dumps(recon_data, indent=2), encoding="utf-8")
+    monkeypatch.setattr(
+        vfr_module,
+        "evaluate_technical_integrity",
+        lambda *args, **kwargs: ("PASS", mock_checks, [], []),
+    )
 
     report = verify_financial_readiness(
         backend_dir=backend_dir,
         frontend_dir=frontend_dir,
         expected_backend_sha=backend_sha,
         expected_frontend_sha=frontend_sha,
-        regression_evidence=ev_path,
-        reconciliation_summary=recon_path,
     )
     assert report["technical_financial_integrity"]["verdict"] == "PASS"
     assert report["business_authorization"]["verdict"] == "BLOCKED"
     assert report["overall_release_readiness"] == "BLOCKED"
     assert report["recommendation"] == "READY FOR INDEPENDENT RE-REVIEW"
+    assert report["business_authorization"]["governance_status"] == "AWAITING_FINANCE_APPROVAL"
 
 
 # ==============================================================================
@@ -1133,18 +1130,62 @@ def test_27_reconciliation_negative_tests(tmp_path):
     assert any("fabricated zero-delta claim detected" in e or "Non-zero delta" in e for e in errs12)
 
 
+def _create_valid_baseline_pytest_xml(dest_path: Path, timestamp: Optional[str] = None) -> str:
+    """Creates a temporary valid baseline JUnit XML fixture in dest_path with full test inventory
+    (>= 374 total, >= 303 passed, <= 71 skipped, 0 failures, 0 errors) and all mandatory suites."""
+    from scripts.release.verify_financial_readiness import compute_file_sha256
+    ts_val = timestamp or datetime.datetime.now(datetime.timezone.utc).isoformat()
+    suites_def = {
+        "tests.test_wp06_financial_governance_and_integrity": [f"test_{i:02d}_valid_case" for i in range(1, 30)],  # 29 tests
+        "tests.test_stage4c3_orders_invoices": [f"test_invoice_{i}" for i in range(1, 12)],  # 11 tests
+        "tests.test_stage4c4_payments_adjustments": [f"test_payment_{i}" for i in range(1, 24)],  # 23 tests
+        "tests.test_stage4c5_reporting_targets_exports": [f"test_reporting_{i}" for i in range(1, 19)],  # 18 tests
+        "tests.test_postgres_domain_models": [f"test_domain_model_{i}" for i in range(1, 7)],  # 6 tests
+        "tests.contracts.test_domain_contracts": [
+            "test_exact_money_quantization_and_formatting",
+            "test_payment_request_requires_positive_total_settling",
+            "test_approved_baseline_fixtures_contract_conformance",
+        ],  # 3 tests
+        "tests.ci.test_wp05_ci_release_gates": [f"test_ci_{i}" for i in range(1, 36)],  # 35 tests
+        "tests.test_audit_remediation_regressions": [f"test_audit_{i}" for i in range(1, 41)],  # 40 tests
+        "tests.test_additional_regressions": [f"test_reg_{i}" for i in range(1, 139)],  # 138 tests
+    }
+    # 29 + 11 + 23 + 18 + 6 + 3 + 35 + 40 + 138 = 303 passed
+    xml_parts = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<testsuites name="pytest tests">',
+        f'<testsuite name="pytest" errors="0" failures="0" skipped="71" tests="374" time="44.0" timestamp="{ts_val}" hostname="test_host">',
+    ]
+    for s_name, tcs in suites_def.items():
+        for tc_name in tcs:
+            xml_parts.append(f'<testcase classname="{s_name}" name="{tc_name}" time="0.01" />')
+
+    for i in range(1, 72):
+        xml_parts.append(
+            f'<testcase classname="tests.test_xss_protection" name="test_legacy_quarantine_{i}" time="0.000">'
+            f'<skipped type="pytest.skip" message="Quarantined legacy SQLite test" />'
+            f'</testcase>'
+        )
+    xml_parts.append('</testsuite></testsuites>')
+    dest_path.write_text("\n".join(xml_parts), encoding="utf-8")
+    return compute_file_sha256(dest_path)
+
+
 # ==============================================================================
 # WP06-08 Test 28: Pytest XML Evidence Validation Negative Tests (WP06-R02)
 # ==============================================================================
 def test_28_pytest_xml_negative_tests(tmp_path):
-    """28. Validate pytest XML evidence negative tests (WP06-R02): altered XML, forged JSON counts,
-    missing XML, mismatched SHA, stale evidence, additional unapproved skips."""
+    """28. Validate pytest XML evidence negative tests (WP06-R02, WP06-R04, WP06-R06): altered XML,
+    forged JSON counts, missing XML, mismatched SHA, stale evidence, additional unapproved skips,
+    manipulated inventories, and preventing restamped stale evidence."""
     backend_dir = Path(__file__).resolve().parent.parent
     backend_sha = get_git_commit_sha(backend_dir)
     frontend_sha = get_git_commit_sha(backend_dir.parent / "cash-flow-buddy-101")
-    real_xml_path = backend_dir / "artifacts" / "backend_pytest_report.xml"
 
     from scripts.release.verify_financial_readiness import compute_file_sha256
+
+    baseline_xml = tmp_path / "baseline_pytest_report.xml"
+    baseline_sha = _create_valid_baseline_pytest_xml(baseline_xml)
 
     # 1. Missing XML file
     ev_missing_xml = tmp_path / "ev_missing_xml.json"
@@ -1154,7 +1195,7 @@ def test_28_pytest_xml_negative_tests(tmp_path):
             "backend_sha": backend_sha,
             "execution_timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "status": "PASS",
-            "summary": {"total": 371, "passed": 300, "failed": 0, "errors": 0, "skipped": 71},
+            "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71},
             "xml_report_sha256": "fake_sha",
             "report_xml": str(tmp_path / "non_existent_report.xml"),
         }),
@@ -1166,7 +1207,7 @@ def test_28_pytest_xml_negative_tests(tmp_path):
 
     # 2. Altered XML (checksum mismatch)
     copy_xml = tmp_path / "copy_report.xml"
-    copy_xml.write_text(real_xml_path.read_text(encoding="utf-8") + "<!-- altered -->", encoding="utf-8")
+    copy_xml.write_text(baseline_xml.read_text(encoding="utf-8") + "<!-- altered -->", encoding="utf-8")
     ev_altered_xml = tmp_path / "ev_altered_xml.json"
     ev_altered_xml.write_text(
         json.dumps({
@@ -1174,7 +1215,7 @@ def test_28_pytest_xml_negative_tests(tmp_path):
             "backend_sha": backend_sha,
             "execution_timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "status": "PASS",
-            "summary": {"total": 371, "passed": 300, "failed": 0, "errors": 0, "skipped": 71},
+            "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71},
             "xml_report_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
             "report_xml": str(copy_xml),
         }),
@@ -1193,8 +1234,8 @@ def test_28_pytest_xml_negative_tests(tmp_path):
             "execution_timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "status": "PASS",
             "summary": {"total": 500, "passed": 500, "failed": 0, "errors": 0, "skipped": 0},
-            "xml_report_sha256": compute_file_sha256(real_xml_path),
-            "report_xml": str(real_xml_path),
+            "xml_report_sha256": baseline_sha,
+            "report_xml": str(baseline_xml),
         }),
         encoding="utf-8",
     )
@@ -1210,9 +1251,9 @@ def test_28_pytest_xml_negative_tests(tmp_path):
             "backend_sha": "0000000000000000000000000000000000000000",
             "execution_timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "status": "PASS",
-            "summary": {"total": 371, "passed": 300, "failed": 0, "errors": 0, "skipped": 71},
-            "xml_report_sha256": compute_file_sha256(real_xml_path),
-            "report_xml": str(real_xml_path),
+            "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71},
+            "xml_report_sha256": baseline_sha,
+            "report_xml": str(baseline_xml),
         }),
         encoding="utf-8",
     )
@@ -1220,8 +1261,10 @@ def test_28_pytest_xml_negative_tests(tmp_path):
     assert v4 == "FAIL"
     assert any("Regression evidence source SHA mismatch" in e for e in errs4)
 
-    # 5. Stale evidence (older than 24 hours)
+    # 5. Stale evidence (older than 24 hours in XML and JSON)
     old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)).isoformat()
+    stale_xml = tmp_path / "stale_report.xml"
+    stale_sha = _create_valid_baseline_pytest_xml(stale_xml, timestamp=old_time)
     ev_stale = tmp_path / "ev_stale.json"
     ev_stale.write_text(
         json.dumps({
@@ -1230,14 +1273,14 @@ def test_28_pytest_xml_negative_tests(tmp_path):
             "execution_timestamp_utc": old_time,
             "status": "PASS",
             "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71},
-            "xml_report_sha256": compute_file_sha256(real_xml_path),
-            "report_xml": str(real_xml_path),
+            "xml_report_sha256": stale_sha,
+            "report_xml": str(stale_xml),
         }),
         encoding="utf-8",
     )
     v5, _, errs5, _ = evaluate_technical_integrity(backend_dir, backend_sha, frontend_sha, regression_evidence_path=ev_stale)
     assert v5 == "FAIL"
-    assert any("Stale pytest evidence" in e for e in errs5)
+    assert any("Stale pytest evidence" in e or "older than 24 hours" in e for e in errs5)
 
     # 6. Six-test synthetic XML report rejection (WP06-R04)
     synth_6_xml = tmp_path / "synthetic_six_test.xml"
@@ -1274,7 +1317,7 @@ def test_28_pytest_xml_negative_tests(tmp_path):
             "execution_timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "status": "PASS",
             "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71},
-            "report_xml": str(real_xml_path),
+            "report_xml": str(baseline_xml),
         }),
         encoding="utf-8",
     )
@@ -1283,14 +1326,14 @@ def test_28_pytest_xml_negative_tests(tmp_path):
     assert any("missing required 'xml_report_sha256' field" in e for e in errs7)
 
     # 8. Manipulated test inventory: insufficient tests in mandatory suite (WP06-R04)
-    real_xml_content = real_xml_path.read_text(encoding="utf-8")
+    real_xml_content = baseline_xml.read_text(encoding="utf-8")
     # Replace test_contracts with only 2 tests instead of 3
     insufficient_xml = tmp_path / "insufficient_suite.xml"
     insufficient_content = real_xml_content.replace(
         'tests.contracts.test_domain_contracts" name="test_payment_request_requires_positive_total_settling"',
         'tests.other_contracts" name="test_payment_request_requires_positive_total_settling"',
     )
-    assert insufficient_content != real_xml_content, "Target testcase string not found in real XML"
+    assert insufficient_content != real_xml_content, "Target testcase string not found in baseline XML"
     insufficient_xml.write_text(insufficient_content, encoding="utf-8")
     ev_insuf = tmp_path / "ev_insuf.json"
     ev_insuf.write_text(
@@ -1315,7 +1358,7 @@ def test_28_pytest_xml_negative_tests(tmp_path):
         'tests.contracts.test_domain_contracts" name="test_exact_money_quantization_and_formatting"',
         'tests.contracts.test_domain_contracts" name="test_ok"',
     )
-    assert synth_name_content != real_xml_content, "Target testcase string not found in real XML"
+    assert synth_name_content != real_xml_content, "Target testcase string not found in baseline XML"
     synth_name_xml.write_text(synth_name_content, encoding="utf-8")
     ev_synth_name = tmp_path / "ev_synth_name.json"
     ev_synth_name.write_text(
@@ -1333,6 +1376,30 @@ def test_28_pytest_xml_negative_tests(tmp_path):
     v9, _, errs9, _ = evaluate_technical_integrity(backend_dir, backend_sha, frontend_sha, regression_evidence_path=ev_synth_name)
     assert v9 == "FAIL"
     assert any("Synthetic testcase fixture 'test_ok' detected in mandatory suite" in e for e in errs9)
+
+    # 10. Stale evidence cannot become valid by modifying JSON metadata (WP06-R06)
+    stale_raw_xml = tmp_path / "stale_raw_report.xml"
+    old_time_raw = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)).isoformat()
+    stale_raw_sha = _create_valid_baseline_pytest_xml(stale_raw_xml, timestamp=old_time_raw)
+
+    # Attempt to validate stale XML by claiming fresh execution in JSON metadata
+    fresh_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    ev_restamped_json = tmp_path / "ev_restamped_json.json"
+    ev_restamped_json.write_text(
+        json.dumps({
+            "test_suite": "backend_pytest_regression",
+            "backend_sha": backend_sha,
+            "execution_timestamp_utc": fresh_time,  # Faked fresh timestamp in JSON!
+            "status": "PASS",
+            "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71},
+            "xml_report_sha256": stale_raw_sha,
+            "report_xml": str(stale_raw_xml),
+        }),
+        encoding="utf-8",
+    )
+    v10, _, errs10, _ = evaluate_technical_integrity(backend_dir, backend_sha, frontend_sha, regression_evidence_path=ev_restamped_json)
+    assert v10 == "FAIL"
+    assert any("Stale underlying pytest XML report" in e or "Timestamp discrepancy" in e for e in errs10)
 
 
 # ==============================================================================
