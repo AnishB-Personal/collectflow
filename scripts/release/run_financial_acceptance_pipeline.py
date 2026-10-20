@@ -212,7 +212,7 @@ def run_pipeline(
         print("FATAL: Source revision mutated during pytest execution!", file=sys.stderr)
         return 1
 
-    # 6. Generate validated backend test evidence JSON
+    # 7. Generate validated backend test evidence JSON
     print("\n[STAGE 2: Test Evidence Generation] Generating validated backend test evidence...")
     gen_cmd = [
         str(venv_python),
@@ -229,7 +229,19 @@ def run_pipeline(
         print("FATAL: Failed to generate backend test evidence JSON", file=sys.stderr)
         return 1
 
-    # 7. Execute genuine five-source cross-layer reconciliation
+    # 8. Reset database to pure baseline fixtures before cross-layer reconciliation
+    print("\n[STAGE 2.5: Fixture Reset] Resetting database to pure baseline fixtures...")
+    seed_cmd = [
+        str(venv_python),
+        str(backend_dir / "scripts" / "seed_postgres_fixtures.py"),
+        "--reset",
+    ]
+    res_seed = run_command(seed_cmd, cwd=backend_dir, env=env)
+    if res_seed.returncode != 0:
+        print("FATAL: Failed to reset database fixtures", file=sys.stderr)
+        return 1
+
+    # 9. Execute genuine five-source cross-layer reconciliation
     print("\n[STAGE 3: Multi-Source Reconciliation] Executing genuine 5-source cross-layer reconciliation...")
     recon_cmd = [
         str(venv_python),
