@@ -540,20 +540,111 @@ def test_17_source_commit_shas_recorded(tmp_path):
 # ==============================================================================
 # WP06-08 Test 18: Pending Business Approval Correctly Returns BLOCKED
 # ==============================================================================
-def test_18_pending_business_approval_correctly_returns_blocked():
+def test_18_pending_business_approval_correctly_returns_blocked(tmp_path):
     """18. When technical integrity passes but corporate approval is pending, overall status is BLOCKED."""
     backend_dir = Path(__file__).resolve().parent.parent
     frontend_dir = backend_dir.parent / "cash-flow-buddy-101"
 
     backend_sha = get_git_commit_sha(backend_dir)
     frontend_sha = get_git_commit_sha(frontend_dir)
+
+    from scripts.release.verify_financial_readiness import compute_file_sha256
+
+    mock_xml = tmp_path / "valid_pytest_report.xml"
+    suites_xml = "".join(
+        f'<testsuite name="{suite}" tests="1" failures="0" errors="0" skipped="0" time="0.5"><testcase classname="{suite}" name="test_ok" time="0.01"/></testsuite>'
+        for suite in [
+            "tests.test_wp06_financial_governance_and_integrity",
+            "tests.test_stage4c3_orders_invoices",
+            "tests.test_stage4c4_payments_adjustments",
+            "tests.test_stage4c5_reporting_targets_exports",
+            "tests.test_postgres_domain_models",
+            "tests.contracts.test_domain_contracts",
+        ]
+    )
+    mock_xml.write_text(
+        f'<?xml version="1.0" encoding="utf-8"?><testsuites tests="6" failures="0" errors="0" skipped="0">{suites_xml}</testsuites>',
+        encoding="utf-8",
+    )
+    xml_sha = compute_file_sha256(mock_xml)
+
+    ev_json = tmp_path / "backend_test_evidence.json"
+    ev_json.write_text(
+        json.dumps({
+            "test_suite": "backend_pytest_regression",
+            "backend_sha": backend_sha,
+            "execution_timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "status": "PASS",
+            "summary": {"total": 6, "passed": 6, "failed": 0, "errors": 0, "skipped": 0},
+            "xml_report_sha256": xml_sha,
+            "report_xml": str(mock_xml),
+            "mandatory_suites_verified": [
+                "tests.test_wp06_financial_governance_and_integrity",
+                "tests.test_stage4c3_orders_invoices",
+                "tests.test_stage4c4_payments_adjustments",
+                "tests.test_stage4c5_reporting_targets_exports",
+                "tests.test_postgres_domain_models",
+                "tests.contracts.test_domain_contracts",
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    recon_json = tmp_path / "reconciliation_summary.json"
+    recon_json.write_text(
+        json.dumps({
+            "status": "PASS",
+            "reconciliation_level": "FULL_FIVE_SOURCE",
+            "formal_acceptance_eligible": True,
+            "is_synthetic_override": False,
+            "run_id": "test_run_valid",
+            "run_start_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "backend_sha": backend_sha,
+            "frontend_sha": frontend_sha,
+            "database": "collectflow_test",
+            "environment": "test",
+            "verified_sources": ["postgresql", "rest_api", "browser_ui", "excel_xlsx", "csv_export"],
+            "unverified_sources": [],
+            "browser_status": "PASS",
+            "comparisons": {
+                k: {"max_delta": "0.00", "status": "MATCH (₹0.00)", "missing_sources": []}
+                for k in [
+                    "Invoiced Gross", "Taxable Exclusive", "GST Tax Amount", "Cash Received",
+                    "TDS Deducted", "Total Net Settled", "Balance Outstanding", "Unbilled PO Backlog",
+                    "Unbilled Recognized AR", "Annual Target"
+                ]
+            },
+            "metrics": {
+                "invoiced_gross": "531000.00",
+                "exclusive_amount": "450000.00",
+                "tax_amount": "81000.00",
+                "cash_received": "200000.00",
+                "tds_deducted": "9000.00",
+                "total_settled": "209000.00",
+                "total_outstanding": "322000.00",
+                "unbilled_po_gross": "295000.00",
+                "unbilled_recognized_ar": "0.00",
+                "annual_target": "7500000.00",
+            },
+            "invariants": {
+                "cash_plus_tds_equals_settled": True,
+                "invoiced_minus_settled_equals_outstanding": True,
+                "reversal_net_zero": True,
+                "unbilled_ar_zero": True,
+                "ar_aging_sums_to_outstanding": True,
+                "target_reconciled": True,
+            },
+        }),
+        encoding="utf-8",
+    )
+
     report = verify_financial_readiness(
         backend_dir=backend_dir,
         frontend_dir=frontend_dir,
         expected_backend_sha=backend_sha,
         expected_frontend_sha=frontend_sha,
-        regression_evidence=backend_dir / "artifacts" / "backend_test_evidence.json",
-        reconciliation_summary=backend_dir / "artifacts" / "reconciliation_summary.json",
+        regression_evidence=ev_json,
+        reconciliation_summary=recon_json,
     )
     assert report["technical_financial_integrity"]["verdict"] == "PASS"
     assert report["business_authorization"]["verdict"] == "BLOCKED"
