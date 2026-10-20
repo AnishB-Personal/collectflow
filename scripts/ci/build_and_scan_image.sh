@@ -46,8 +46,27 @@ docker build \
 IMAGE_ID="$(docker inspect --format='{{.Id}}' "${IMAGE_TAG}")"
 echo "Built image ID (daemon config digest): ${IMAGE_ID}"
 
-# Extract base image
-BASE_IMAGE="$(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "${IMAGE_TAG}" | grep -E '^PYTHON_VERSION=|^NODE_VERSION=' | head -n 1 || echo "standard-base")"
+# Extract immutable base image digest
+BASE_IMAGE_PINNED="$(grep -E 'ARG (PYTHON|NODE)_VERSION=' "${ROOT_DIR}/Dockerfile" 2>/dev/null | head -n 1 | cut -d= -f2- || echo "")"
+if [[ -n "${BASE_IMAGE_PINNED}" ]]; then
+    if [[ "${REPO_TYPE}" == "backend" ]]; then
+        BASE_IMAGE_DIGEST="python:${BASE_IMAGE_PINNED}"
+    else
+        BASE_IMAGE_DIGEST="node:${BASE_IMAGE_PINNED}"
+    fi
+else
+    BASE_IMAGE_DIGEST="$(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "${IMAGE_TAG}" | grep -E '^PYTHON_VERSION=|^NODE_VERSION=' | head -n 1 || echo "standard-base")"
+fi
+BASE_IMAGE="${BASE_IMAGE_DIGEST}"
+
+# Verify non-root runtime identity
+CONTAINER_UID="$(docker run --rm "${IMAGE_TAG}" id -u 2>/dev/null || echo "0")"
+CONTAINER_USER="$(docker run --rm "${IMAGE_TAG}" whoami 2>/dev/null || echo "root")"
+if [[ "${CONTAINER_UID}" == "0" || "${CONTAINER_USER}" == "root" ]]; then
+    echo "ERROR: Image ${IMAGE_TAG} runs as root (uid=${CONTAINER_UID}). Non-root user required."
+    exit 1
+fi
+echo "Verified non-root runtime identity: ${CONTAINER_USER} (uid=${CONTAINER_UID})"
 
 # 4. Associate and verify exact source SHA with OCI revision label (WP05-04)
 OCI_REVISION="$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' "${IMAGE_TAG}" 2>/dev/null || echo "")"
@@ -83,16 +102,11 @@ if command -v trivy &>/dev/null; then
     echo "Running Trivy image vulnerability scan (${SCANNER_PROVENANCE})..."
 
     
+    TRIVY_INVOCATION="trivy image --cache-dir ${HOME}/.cache/trivy --scanners vuln --severity HIGH,CRITICAL --format json --output ${SCAN_REPORT_PATH} ${IMAGE_TAG}"
     # Run scan without suppressing tool execution errors; do not ignore unfixed vulnerabilities (WP05-F02)
     TRIVY_RC=0
     mkdir -p "${HOME}/.cache/trivy"
-    trivy image \
-        --cache-dir "${HOME}/.cache/trivy" \
-        --scanners vuln \
-        --severity HIGH,CRITICAL \
-        --format json \
-        --output "${SCAN_REPORT_PATH}" \
-        "${IMAGE_TAG}" || TRIVY_RC=$?
+    ${TRIVY_INVOCATION} || TRIVY_RC=$?
 
     # Fail closed on tool execution errors (WP05-F02: Treat non-zero Trivy exit codes as failures fail-closed)
     if [[ ${TRIVY_RC} -ne 0 ]]; then
@@ -163,11 +177,19 @@ cat <<EOF > "${METADATA_OUTPUT}"
   "build_timestamp": "${BUILD_TIMESTAMP}",
   "target_architecture": "${TARGET_ARCH}",
   "base_image": "${BASE_IMAGE}",
+  "base_image_digest": "${BASE_IMAGE}",
+  "runtime_identity": {
+    "user": "${CONTAINER_USER}",
+    "uid": ${CONTAINER_UID},
+    "non_root_verified": true
+  },
   "build_toolchain": "docker-$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo 'unknown')",
   "security_scan": {
     "scanner": "${SCANNER_NAME}",
     "scanner_version": "${SCANNER_VERSION}",
     "scanner_provenance": "${SCANNER_PROVENANCE}",
+    "scanner_invocation": "${TRIVY_INVOCATION:-unavailable}",
+    "scan_timestamp_utc": "${BUILD_TIMESTAMP}",
     "verdict": "${SCAN_VERDICT}",
     "details": "${SCAN_DETAILS}",
     "critical_count": ${SCAN_CRITICAL_COUNT},

@@ -74,11 +74,64 @@ def valid_rcp01_manifest(tmp_path: Path) -> Tuple[Path, dict]:
 
     # Write SAST report
     sast_file = artifacts_dir / "sast_lint_report.json"
-    sast_file.write_text(json.dumps({"scanner_provenance": "bandit_and_ruff", "bandit": {"results": []}, "ruff": {"results": []}}), encoding="utf-8")
+    sast_data = {
+        "scanner_provenance": "bandit 1.8.3 and ruff 0.9.1",
+        "status": "PASS",
+        "bandit": {
+            "high_severity_count": 0,
+            "medium_severity_count": 0,
+            "low_severity_count": 0,
+            "total_findings": 0,
+            "status": "PASS",
+        },
+        "ruff": {
+            "violations_count": 0,
+            "status": "PASS",
+        },
+    }
+    sast_file.write_text(json.dumps(sast_data), encoding="utf-8")
     inventory["sast_lint_report"] = {
         "path": str(sast_file),
         "sha256": compute_file_sha256(sast_file),
         "producing_tool": "bandit_and_ruff_sast",
+        "status": "PASS",
+    }
+
+    # Write raw Bandit and Ruff scanner evidence
+    bandit_raw = artifacts_dir / "bandit_raw.json"
+    bandit_raw.write_text(json.dumps({"results": [], "metrics": {"_totals": {"loc": 1000}}}), encoding="utf-8")
+    inventory["bandit_raw_report"] = {
+        "path": str(bandit_raw),
+        "sha256": compute_file_sha256(bandit_raw),
+        "producing_tool": "bandit 1.8.3",
+        "status": "PASS",
+    }
+
+    ruff_raw = artifacts_dir / "ruff_raw.json"
+    ruff_raw.write_text(json.dumps([]), encoding="utf-8")
+    inventory["ruff_raw_report"] = {
+        "path": str(ruff_raw),
+        "sha256": compute_file_sha256(ruff_raw),
+        "producing_tool": "ruff 0.9.1",
+        "status": "PASS",
+    }
+
+    # Write CycloneDX SBOMs
+    b_sbom = artifacts_dir / "collectflow-backend-sbom.json"
+    b_sbom.write_text(json.dumps({"bomFormat": "CycloneDX", "specVersion": "1.5", "components": [{"name": "fastapi", "version": "0.110.0"}]}), encoding="utf-8")
+    inventory["backend_cyclonedx_sbom"] = {
+        "path": str(b_sbom),
+        "sha256": compute_file_sha256(b_sbom),
+        "producing_tool": "generate_sbom.py",
+        "status": "PASS",
+    }
+
+    f_sbom = artifacts_dir / "collectflow-frontend-sbom.json"
+    f_sbom.write_text(json.dumps({"bomFormat": "CycloneDX", "specVersion": "1.5", "components": [{"name": "react", "version": "19.0.0"}]}), encoding="utf-8")
+    inventory["frontend_cyclonedx_sbom"] = {
+        "path": str(f_sbom),
+        "sha256": compute_file_sha256(f_sbom),
+        "producing_tool": "generate_sbom.py",
         "status": "PASS",
     }
 
@@ -105,8 +158,6 @@ def valid_rcp01_manifest(tmp_path: Path) -> Tuple[Path, dict]:
         ("backend_test_evidence.json", "backend_test_evidence_json"),
         ("frontend_test_summary.json", "frontend_test_summary_json"),
         ("secret_scan_report.json", "secret_scan_report_json"),
-        ("collectflow-backend-sbom.json", "backend_cyclonedx_sbom"),
-        ("collectflow-frontend-sbom.json", "frontend_cyclonedx_sbom"),
         ("backend_image_meta.json", "backend_image_metadata"),
         ("frontend_image_meta.json", "frontend_image_metadata"),
         ("cross_repo_report.json", "cross_repo_pairing_report"),
@@ -174,12 +225,13 @@ def valid_rcp01_manifest(tmp_path: Path) -> Tuple[Path, dict]:
         },
         "consolidated_rc_execution": {
             "cross_repo_pairing": "VERIFIED_PAIR",
-            "release_manifest_validation": "RC_PASSED",
+            "release_manifest_validation": "RC_VALIDATED",
             "publication_disabled": True,
         },
         "security_findings": {
             "secret_scanning": {"findings": 0, "status": "PASS"},
             "dependency_vulnerabilities": {"active_exceptions": 0, "status": "PASS"},
+            "sast_lint": {"status": "PASS"},
             "container_vulnerability_scan": {"status": "PASS"},
         },
         "oci_image_verification": {
@@ -493,3 +545,141 @@ def test_13_missing_terraform_and_security_boundaries_rejects_12_of_12_complianc
     is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
     assert not is_valid
     assert any("cannot be unconditional GO" in err for err in errors)
+
+
+def test_14_release_manifest_validation_failure_blocks_technical_go(valid_rcp01_manifest):
+    """Test 14: Release manifest validation failure blocks technical GO even when container scan passes (RCP01-R02)."""
+    manifest_file, manifest = valid_rcp01_manifest
+
+    # Container scan passes, but release_manifest_validation is failed
+    manifest["security_findings"]["container_vulnerability_scan"]["status"] = "PASS"
+    manifest["consolidated_rc_execution"]["release_manifest_validation"] = "FAILED_SECURITY_GATE"
+    manifest["go_no_go_decision_matrix"]["technical_application_release_candidate"]["recommendation"] = "GO"
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("validation status is not 'RC_VALIDATED'" in err for err in errors)
+    assert any("cannot be GO when consolidated release manifest validation failed" in err for err in errors)
+
+
+def test_15_scanner_failure_or_malformed_evidence_rejected(valid_rcp01_manifest):
+    """Test 15: Scanner failures, missing raw evidence, or malformed reports are rejected (RCP01-R01)."""
+    manifest_file, manifest = valid_rcp01_manifest
+    inv = manifest["artifact_inventory"]
+
+    # 1. Missing required raw scanner artifact in inventory
+    inv_copy = dict(inv)
+    del inv_copy["bandit_raw_report"]
+    manifest["artifact_inventory"] = inv_copy
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Missing required artifact entry in manifest: bandit_raw_report" in err for err in errors)
+
+    # 2. Malformed Trivy report missing Results or SchemaVersion
+    manifest["artifact_inventory"] = inv
+    b_trivy_path = Path(inv["backend_trivy_report"]["path"])
+    b_trivy_path.write_text(json.dumps({"invalid": "schema"}), encoding="utf-8")
+    inv["backend_trivy_report"]["sha256"] = compute_file_sha256(b_trivy_path)
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("missing required 'SchemaVersion' or 'Results'" in err for err in errors)
+
+
+def test_16_discovered_vulnerabilities_or_sast_findings_blocks_technical_go(valid_rcp01_manifest):
+    """Test 16: Discovered vulnerabilities or SAST findings strictly block technical GO (RCP01-R01, RCP01-R02)."""
+    manifest_file, manifest = valid_rcp01_manifest
+    inv = manifest["artifact_inventory"]
+
+    # 1. Bandit high findings block technical GO
+    sast_path = Path(inv["sast_lint_report"]["path"])
+    sast_path.write_text(
+        json.dumps({
+            "scanner_provenance": "bandit and ruff",
+            "status": "FAIL",
+            "bandit": {"high_severity_count": 2, "status": "FAIL"},
+            "ruff": {"violations_count": 0, "status": "PASS"},
+        }),
+        encoding="utf-8",
+    )
+    inv["sast_lint_report"]["sha256"] = compute_file_sha256(sast_path)
+    manifest["go_no_go_decision_matrix"]["technical_application_release_candidate"]["recommendation"] = "GO"
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Technical recommendation cannot be GO when Bandit detected 2 HIGH" in err for err in errors)
+
+    # 2. Ruff syntax violations block technical GO
+    sast_path.write_text(
+        json.dumps({
+            "scanner_provenance": "bandit and ruff",
+            "status": "FAIL",
+            "bandit": {"high_severity_count": 0, "status": "PASS"},
+            "ruff": {"violations_count": 5, "status": "FAIL"},
+        }),
+        encoding="utf-8",
+    )
+    inv["sast_lint_report"]["sha256"] = compute_file_sha256(sast_path)
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Technical recommendation cannot be GO when Ruff detected 5 syntax" in err for err in errors)
+
+    # 3. Container vulnerability scan failure blocks technical GO
+    # Reset SAST
+    sast_path.write_text(
+        json.dumps({
+            "scanner_provenance": "bandit and ruff",
+            "status": "PASS",
+            "bandit": {"high_severity_count": 0, "status": "PASS"},
+            "ruff": {"violations_count": 0, "status": "PASS"},
+        }),
+        encoding="utf-8",
+    )
+    inv["sast_lint_report"]["sha256"] = compute_file_sha256(sast_path)
+    manifest["security_findings"]["container_vulnerability_scan"]["status"] = "FAIL"
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("cannot be GO when container vulnerability scan failed" in err for err in errors)
+
+    # 4. Dependency vulnerabilities block technical GO
+    manifest["security_findings"]["container_vulnerability_scan"]["status"] = "PASS"
+    manifest["security_findings"]["dependency_vulnerabilities"]["status"] = "FAIL"
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("cannot be GO when dependency vulnerabilities are detected" in err for err in errors)
+
+
+def test_17_invalid_sbom_document_rejected(valid_rcp01_manifest):
+    """Test 17: Invalid or empty CycloneDX SBOM documents are rejected (RCP01-R01)."""
+    manifest_file, manifest = valid_rcp01_manifest
+    inv = manifest["artifact_inventory"]
+
+    # 1. Invalid bomFormat
+    b_sbom_path = Path(inv["backend_cyclonedx_sbom"]["path"])
+    b_sbom_path.write_text(json.dumps({"bomFormat": "SPDX", "components": [{"name": "test"}]}), encoding="utf-8")
+    inv["backend_cyclonedx_sbom"]["sha256"] = compute_file_sha256(b_sbom_path)
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Backend SBOM missing or invalid bomFormat" in err for err in errors)
+
+    # 2. Empty components list
+    b_sbom_path.write_text(json.dumps({"bomFormat": "CycloneDX", "components": []}), encoding="utf-8")
+    inv["backend_cyclonedx_sbom"]["sha256"] = compute_file_sha256(b_sbom_path)
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Backend SBOM components list is missing or empty" in err for err in errors)

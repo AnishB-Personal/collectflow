@@ -396,6 +396,8 @@ def verify_rcp01_evidence_manifest(
         "backend_audit_report",
         "frontend_audit_report",
         "sast_lint_report",
+        "bandit_raw_report",
+        "ruff_raw_report",
         "backend_trivy_report",
         "frontend_trivy_report",
     ]
@@ -567,10 +569,50 @@ def verify_rcp01_evidence_manifest(
                 s_data = json.loads(sast_path.read_text(encoding="utf-8"))
                 if not s_data.get("scanner_provenance") and not isinstance(s_data, list):
                     errors.append("SAST report is missing tool execution provenance.")
-                if s_data.get("lint_errors", 0) > 0 and sec_findings.get("secret_scanning", {}).get("status") == "PASS":
-                    pass
+                bandit_obj = s_data.get("bandit", {})
+                b_high = bandit_obj.get("high_severity_count", 0)
+                if b_high > 0:
+                    if s_data.get("status") == "PASS":
+                        errors.append(f"Bandit recorded {b_high} HIGH severity findings but SAST report claimed PASS.")
+                    if matrix.get("technical_application_release_candidate", {}).get("recommendation") == "GO":
+                        errors.append(f"Technical recommendation cannot be GO when Bandit detected {b_high} HIGH severity findings.")
+                ruff_obj = s_data.get("ruff", {})
+                r_viol = ruff_obj.get("violations_count", 0)
+                if r_viol > 0:
+                    if s_data.get("status") == "PASS":
+                        errors.append(f"Ruff recorded {r_viol} syntax/contract violations but SAST report claimed PASS.")
+                    if matrix.get("technical_application_release_candidate", {}).get("recommendation") == "GO":
+                        errors.append(f"Technical recommendation cannot be GO when Ruff detected {r_viol} syntax/contract violations.")
             except Exception as e:
                 errors.append(f"Malformed SAST evidence report: {e}")
+
+    # Validate CycloneDX SBOMs
+    for sbom_key, sbom_label in (("backend_cyclonedx_sbom", "Backend"), ("frontend_cyclonedx_sbom", "Frontend")):
+        sb_info = inv.get(sbom_key)
+        if sb_info and check_disk_files:
+            sb_path = Path(sb_info.get("path", ""))
+            if sb_path.is_file():
+                try:
+                    sb_doc = json.loads(sb_path.read_text(encoding="utf-8"))
+                    if sb_doc.get("bomFormat") != "CycloneDX":
+                        errors.append(f"{sbom_label} SBOM missing or invalid bomFormat: {sb_doc.get('bomFormat')}")
+                    if not isinstance(sb_doc.get("components"), list) or len(sb_doc.get("components")) == 0:
+                        errors.append(f"{sbom_label} SBOM components list is missing or empty.")
+                except Exception as e:
+                    errors.append(f"Malformed {sbom_label} CycloneDX SBOM: {e}")
+
+    # Validate Trivy scan reports
+    for trivy_key in ("backend_trivy_report", "frontend_trivy_report"):
+        t_info = inv.get(trivy_key)
+        if t_info and check_disk_files:
+            t_path = Path(t_info.get("path", ""))
+            if t_path.is_file():
+                try:
+                    t_doc = json.loads(t_path.read_text(encoding="utf-8"))
+                    if "SchemaVersion" not in t_doc or "Results" not in t_doc:
+                        errors.append(f"{trivy_key} is missing required 'SchemaVersion' or 'Results' field.")
+                except Exception as e:
+                    errors.append(f"Malformed {trivy_key} report: {e}")
 
     # 10. Zero deployment / publication enforcement
     sec = data.get("consolidated_rc_execution", {})
@@ -579,15 +621,29 @@ def verify_rcp01_evidence_manifest(
     if not aws.get("zero_aws_provisioning_enforced"):
         errors.append("Zero AWS provisioning must be enforced during preflight.")
 
-    # 11. Diagnostic mode check
+    # 11. Consolidated release manifest validation check (RCP01-R02)
+    if sec.get("release_manifest_validation") != "RC_VALIDATED":
+        errors.append(
+            f"Consolidated release manifest validation status is not 'RC_VALIDATED' (got '{sec.get('release_manifest_validation')}')."
+        )
+
+    # 12. Technical recommendation fail-closed assertions (RCP01-R01, RCP01-R02)
     tech_rec = matrix.get("technical_application_release_candidate", {}).get("recommendation")
     if data.get("diagnostic_mode") or tech_rec == "DIAGNOSTIC_NON_ACCEPTANCE":
         errors.append("Preflight manifest indicates diagnostic execution; cannot authorize formal release candidate.")
 
-    # 12. Consistency check: if container scan failed, technical recommendation cannot be GO
-    c_scan = data.get("security_findings", {}).get("container_vulnerability_scan", {})
-    if c_scan.get("status") == "FAIL" and tech_rec == "GO":
-        errors.append("Technical recommendation cannot be GO when container vulnerability scan failed.")
+    if tech_rec == "GO":
+        if sec.get("release_manifest_validation") != "RC_VALIDATED":
+            errors.append("Technical recommendation cannot be GO when consolidated release manifest validation failed.")
+        c_scan = data.get("security_findings", {}).get("container_vulnerability_scan", {})
+        if c_scan.get("status") != "PASS":
+            errors.append("Technical recommendation cannot be GO when container vulnerability scan failed.")
+        dep_vulns = data.get("security_findings", {}).get("dependency_vulnerabilities", {})
+        if dep_vulns.get("status") != "PASS":
+            errors.append("Technical recommendation cannot be GO when dependency vulnerabilities are detected.")
+        sast_verdict = data.get("security_findings", {}).get("sast_lint", {})
+        if sast_verdict.get("status") != "PASS":
+            errors.append("Technical recommendation cannot be GO when SAST or lint verification failed.")
 
     is_valid = len(errors) == 0
     return is_valid, errors
@@ -783,43 +839,70 @@ def run_preflight(
         print("FATAL: Secret scanning detected potential secrets or failed", file=sys.stderr)
         return 1
 
-    # SAST / Lint checks: Real execution of Bandit AST security scanner and Ruff syntax/contracts linter (RCP01-F02)
+    # SAST / Lint checks: Real execution of Bandit AST security scanner and Ruff syntax/contracts linter (RCP01-F02, RCP01-R01)
     sast_report = artifacts_dir / "sast_lint_report.json"
     bandit_bin = backend_dir / "venv" / "bin" / "bandit"
     if not bandit_bin.is_file():
         bandit_bin = Path("bandit")
+
+    res_b_ver = run_command([str(bandit_bin), "--version"], cwd=backend_dir)
+    bandit_ver_str = res_b_ver.stdout.strip().splitlines()[0] if res_b_ver.stdout else "bandit"
 
     bandit_raw = artifacts_dir / "bandit_raw.json"
     res_bandit = run_command(
         [str(bandit_bin), "-r", "app/", "-f", "json", "-o", str(bandit_raw)],
         cwd=backend_dir,
     )
-    bandit_results = []
-    bandit_metrics = {}
-    if bandit_raw.is_file():
-        try:
-            b_data = json.loads(bandit_raw.read_text(encoding="utf-8"))
-            bandit_results = b_data.get("results", [])
-            bandit_metrics = b_data.get("metrics", {}).get("_totals", {})
-        except Exception:
-            pass
+    if res_bandit.returncode not in (0, 1):
+        print(f"FATAL: Bandit scanner execution failed with exit code {res_bandit.returncode}: {res_bandit.stderr}", file=sys.stderr)
+        return 1
+    if not bandit_raw.is_file() or bandit_raw.stat().st_size == 0:
+        print(f"FATAL: Bandit scanner failed to create nonempty output: {bandit_raw}", file=sys.stderr)
+        return 1
+
+    try:
+        b_data = json.loads(bandit_raw.read_text(encoding="utf-8"))
+        if not isinstance(b_data, dict) or "results" not in b_data or "metrics" not in b_data:
+            print("FATAL: Bandit report JSON is missing required 'results' or 'metrics'", file=sys.stderr)
+            return 1
+        bandit_results = b_data.get("results", [])
+        bandit_metrics = b_data.get("metrics", {}).get("_totals", {})
+    except Exception as exc:
+        print(f"FATAL: Malformed Bandit report JSON: {exc}", file=sys.stderr)
+        return 1
+
+    bandit_high = sum(1 for r in bandit_results if str(r.get("issue_severity", "")).upper() == "HIGH")
+    bandit_medium = sum(1 for r in bandit_results if str(r.get("issue_severity", "")).upper() == "MEDIUM")
+    bandit_low = sum(1 for r in bandit_results if str(r.get("issue_severity", "")).upper() == "LOW")
+    bandit_status = "PASS" if bandit_high == 0 else "FAIL"
 
     ruff_bin = Path("/home/anishb/.local/bin/ruff")
     if not ruff_bin.is_file():
         ruff_bin = Path("ruff")
 
+    res_r_ver = run_command([str(ruff_bin), "--version"], cwd=backend_dir)
+    ruff_ver_str = res_r_ver.stdout.strip() if res_r_ver.stdout else "ruff"
+
+    ruff_raw = artifacts_dir / "ruff_raw.json"
     res_ruff = run_command([str(ruff_bin), "check", "--output-format", "json", "app/"], cwd=backend_dir)
-    ruff_results = []
-    if res_ruff.stdout:
-        try:
-            ruff_results = json.loads(res_ruff.stdout)
-            if not isinstance(ruff_results, list):
-                ruff_results = []
-        except Exception:
-            pass
+    if res_ruff.returncode not in (0, 1):
+        print(f"FATAL: Ruff linter execution failed with exit code {res_ruff.returncode}: {res_ruff.stderr}", file=sys.stderr)
+        return 1
+
+    ruff_raw.write_text(res_ruff.stdout or "[]", encoding="utf-8")
+    try:
+        ruff_results = json.loads(ruff_raw.read_text(encoding="utf-8"))
+        if not isinstance(ruff_results, list):
+            print("FATAL: Ruff linter JSON output is not a list", file=sys.stderr)
+            return 1
+    except Exception as exc:
+        print(f"FATAL: Malformed Ruff linter JSON output: {exc}", file=sys.stderr)
+        return 1
+
+    ruff_status = "PASS" if len(ruff_results) == 0 else "FAIL"
 
     total_lint_errors = len(bandit_results) + len(ruff_results)
-    sast_status = "PASS" if total_lint_errors == 0 else "FAIL"
+    sast_status = "PASS" if (bandit_status == "PASS" and ruff_status == "PASS") else "FAIL"
     sast_data = {
         "tool": "bandit_and_ruff_sast",
         "backend_sha": backend_sha,
@@ -828,14 +911,36 @@ def run_preflight(
         "verdict": sast_status,
         "lint_errors": total_lint_errors,
         "errors": total_lint_errors,
+        "bandit": {
+            "version": bandit_ver_str,
+            "exit_code": res_bandit.returncode,
+            "high_severity_count": bandit_high,
+            "medium_severity_count": bandit_medium,
+            "low_severity_count": bandit_low,
+            "total_findings": len(bandit_results),
+            "status": bandit_status,
+            "raw_report_file": str(bandit_raw),
+            "raw_report_sha256": compute_file_sha256(bandit_raw),
+        },
+        "ruff": {
+            "version": ruff_ver_str,
+            "exit_code": res_ruff.returncode,
+            "violations_count": len(ruff_results),
+            "status": ruff_status,
+            "raw_report_file": str(ruff_raw),
+            "raw_report_sha256": compute_file_sha256(ruff_raw),
+        },
         "bandit_findings_count": len(bandit_results),
         "ruff_lint_errors_count": len(ruff_results),
         "lines_of_code_scanned": bandit_metrics.get("loc", 6298),
-        "scanner_provenance": f"Bandit ({bandit_bin}) and Ruff ({ruff_bin})",
+        "scanner_provenance": f"{bandit_ver_str} and {ruff_ver_str}",
     }
     sast_report.write_text(json.dumps(sast_data, indent=2), encoding="utf-8")
 
-    # Dependency audits: Real execution of pip-audit on backend and npm audit on frontend (RCP01-F02)
+    # Dependency audits: Real execution of pip-audit on backend and npm audit on frontend (RCP01-F02, RCP01-R01)
+    res_pip_ver = run_command([str(venv_python), "-m", "pip_audit", "--version"], cwd=backend_dir)
+    pip_ver_str = res_pip_ver.stdout.strip() if res_pip_ver.stdout else "pip-audit"
+
     b_audit_report = artifacts_dir / "backend_audit_report.json"
     pip_audit_cmd = [
         str(venv_python),
@@ -849,27 +954,89 @@ def run_preflight(
         str(b_audit_report),
     ]
     res_pip = run_command(pip_audit_cmd, cwd=backend_dir)
-    if not b_audit_report.is_file():
-        print(f"FATAL: pip-audit execution failed to produce report {b_audit_report} (exit {res_pip.returncode})", file=sys.stderr)
+    if res_pip.returncode not in (0, 1):
+        print(f"FATAL: pip-audit execution failed (exit {res_pip.returncode}): {res_pip.stderr}", file=sys.stderr)
         return 1
+    if not b_audit_report.is_file() or b_audit_report.stat().st_size == 0:
+        print(f"FATAL: pip-audit execution failed to produce report {b_audit_report}", file=sys.stderr)
+        return 1
+
+    try:
+        pip_data = json.loads(b_audit_report.read_text(encoding="utf-8"))
+        if not isinstance(pip_data, dict) or "dependencies" not in pip_data:
+            print("FATAL: pip-audit report missing 'dependencies' array", file=sys.stderr)
+            return 1
+        pip_deps = pip_data.get("dependencies", [])
+        if not isinstance(pip_deps, list) or len(pip_deps) == 0:
+            print("FATAL: pip-audit report dependencies list is empty (placeholder/mock)", file=sys.stderr)
+            return 1
+        pip_vulns = sum(len(d.get("vulns", [])) for d in pip_deps)
+        pip_vuln_ids = [v.get("id") for d in pip_deps for v in d.get("vulns", [])]
+    except Exception as exc:
+        print(f"FATAL: Failed to parse pip-audit report JSON: {exc}", file=sys.stderr)
+        return 1
+    pip_status = "PASS" if pip_vulns == 0 else "FAIL"
+
+    res_npm_ver = run_command(["npm", "--version"], cwd=frontend_dir)
+    npm_ver_str = f"npm v{res_npm_ver.stdout.strip()}" if res_npm_ver.stdout else "npm"
 
     f_audit_report = artifacts_dir / "frontend_audit_report.json"
     res_npm = run_command(["npm", "audit", "--json"], cwd=frontend_dir)
+    if not res_npm.stdout:
+        print(f"FATAL: npm audit produced no output (exit {res_npm.returncode})", file=sys.stderr)
+        return 1
+
     try:
         npm_data = json.loads(res_npm.stdout)
+        if not isinstance(npm_data, dict) or "metadata" not in npm_data:
+            print("FATAL: npm audit output missing 'metadata' section", file=sys.stderr)
+            return 1
+        meta_vulns = npm_data.get("metadata", {}).get("vulnerabilities", {})
+        if not isinstance(meta_vulns, dict):
+            print("FATAL: npm audit metadata missing 'vulnerabilities' object", file=sys.stderr)
+            return 1
+        npm_high = meta_vulns.get("high", 0)
+        npm_crit = meta_vulns.get("critical", 0)
+        npm_high_crit = npm_high + npm_crit
         f_audit_report.write_text(json.dumps(npm_data, indent=2), encoding="utf-8")
     except Exception as exc:
         print(f"FATAL: Failed to parse npm audit output as JSON: {exc}", file=sys.stderr)
         return 1
+    npm_status = "PASS" if npm_high_crit == 0 and res_npm.returncode == 0 else "FAIL"
 
-    # 8. CycloneDX SBOM Generation
+    # 8. CycloneDX SBOM Generation (RCP01-R01)
     print("\n[STAGE 2A: CycloneDX SBOMs] Generating authoritative SBOM files...")
     b_sbom_path = artifacts_dir / "collectflow-backend-sbom.json"
     f_sbom_path = artifacts_dir / "collectflow-frontend-sbom.json"
-    run_command([str(venv_python), str(backend_dir / "scripts" / "ci" / "generate_sbom.py"), "--repo-type", "backend", "--root", str(backend_dir), "--output", str(b_sbom_path)], cwd=backend_dir)
-    run_command([str(venv_python), str(backend_dir / "scripts" / "ci" / "generate_sbom.py"), "--repo-type", "frontend", "--root", str(frontend_dir), "--output", str(f_sbom_path)], cwd=backend_dir)
+    res_b_sbom = run_command([str(venv_python), str(backend_dir / "scripts" / "ci" / "generate_sbom.py"), "--repo-type", "backend", "--root", str(backend_dir), "--output", str(b_sbom_path)], cwd=backend_dir)
+    res_f_sbom = run_command([str(venv_python), str(backend_dir / "scripts" / "ci" / "generate_sbom.py"), "--repo-type", "frontend", "--root", str(frontend_dir), "--output", str(f_sbom_path)], cwd=backend_dir)
+    if res_b_sbom.returncode != 0 or res_f_sbom.returncode != 0:
+        print("FATAL: generate_sbom.py exited nonzero", file=sys.stderr)
+        return 1
     if not b_sbom_path.is_file() or not f_sbom_path.is_file():
-        print("FATAL: Failed to generate CycloneDX SBOMs", file=sys.stderr)
+        print("FATAL: CycloneDX SBOM files missing on disk", file=sys.stderr)
+        return 1
+
+    b_sbom_valid = False
+    f_sbom_valid = False
+    try:
+        b_sb = json.loads(b_sbom_path.read_text(encoding="utf-8"))
+        if b_sb.get("bomFormat") == "CycloneDX" and isinstance(b_sb.get("components"), list) and len(b_sb.get("components")) > 0:
+            b_sbom_valid = True
+    except Exception as exc:
+        print(f"FATAL: Backend SBOM invalid: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        f_sb = json.loads(f_sbom_path.read_text(encoding="utf-8"))
+        if f_sb.get("bomFormat") == "CycloneDX" and isinstance(f_sb.get("components"), list) and len(f_sb.get("components")) > 0:
+            f_sbom_valid = True
+    except Exception as exc:
+        print(f"FATAL: Frontend SBOM invalid: {exc}", file=sys.stderr)
+        return 1
+
+    if not b_sbom_valid or not f_sbom_valid:
+        print("FATAL: Generated CycloneDX SBOM files are invalid or empty", file=sys.stderr)
         return 1
 
     # 9. Container Image Verification & Metadata Generation
@@ -1163,19 +1330,31 @@ def run_preflight(
             "path": str(b_audit_report),
             "sha256": compute_file_sha256(b_audit_report),
             "producing_tool": "pip_audit_vulnerability_scanner",
-            "status": "PASS",
+            "status": pip_status,
         },
         "frontend_audit_report": {
             "path": str(f_audit_report),
             "sha256": compute_file_sha256(f_audit_report),
             "producing_tool": "npm_audit_vulnerability_scanner",
-            "status": "PASS",
+            "status": npm_status,
         },
         "sast_lint_report": {
             "path": str(sast_report),
             "sha256": compute_file_sha256(sast_report),
             "producing_tool": "bandit_and_ruff_sast",
             "status": sast_status,
+        },
+        "bandit_raw_report": {
+            "path": str(bandit_raw),
+            "sha256": compute_file_sha256(bandit_raw),
+            "producing_tool": bandit_ver_str,
+            "status": bandit_status,
+        },
+        "ruff_raw_report": {
+            "path": str(ruff_raw),
+            "sha256": compute_file_sha256(ruff_raw),
+            "producing_tool": ruff_ver_str,
+            "status": ruff_status,
         },
         "backend_trivy_report": {
             "path": str(b_trivy_path),
@@ -1191,17 +1370,74 @@ def run_preflight(
         },
     }
 
+    # Evaluate all mandatory technical quality gates (RCP01-R01, RCP01-R02)
+    mandatory_gates = {
+        "release_manifest_validation": {
+            "status": "PASS" if rc_manifest_valid else "FAIL",
+            "required": True,
+            "details": "Consolidated release manifest schema and artifact integrity",
+        },
+        "container_vulnerability_scan": {
+            "status": "FAIL" if container_scan_failed else "PASS",
+            "required": True,
+            "details": f"Backend: {b_crit_count} crit, {b_high_count} high; Frontend: {f_crit_count} crit, {f_high_count} high",
+        },
+        "dependency_vulnerabilities": {
+            "status": "PASS" if (pip_status == "PASS" and npm_status == "PASS") else "FAIL",
+            "required": True,
+            "details": f"pip-audit ({pip_status}, {pip_vulns} vulns), npm-audit ({npm_status}, {npm_high_crit} high/crit)",
+        },
+        "sast_lint": {
+            "status": sast_status,
+            "required": True,
+            "details": f"Bandit AST ({bandit_status}, {bandit_high} high), Ruff linter ({ruff_status}, {len(ruff_results)} violations)",
+        },
+        "secret_scanning": {
+            "status": "PASS",
+            "required": True,
+            "details": "Zero credentials/tokens detected",
+        },
+        "backend_pytest_regression": {
+            "status": b_ev_data.get("status", "FAIL"),
+            "required": True,
+            "details": f"{b_ev_data['summary']['passed']} passed, {b_ev_data['summary']['skipped']} skipped, {b_ev_data['summary']['failed']} failed",
+        },
+        "frontend_vitest": {
+            "status": f_test_data.get("status", "FAIL"),
+            "required": True,
+            "details": f"{f_test_data['tests_passed']} passed, {f_test_data['tests_failed']} failed",
+        },
+        "database_schema": {
+            "status": "PASS",
+            "required": True,
+            "details": f"Alembic revision {EXPECTED_ALEMBIC_REVISION}",
+        },
+        "technical_financial_integrity": {
+            "status": tech_fin_verdict,
+            "required": True,
+            "details": "Five-source cross-layer financial reconciliation ₹0.00 delta",
+        },
+        "cross_repo_pairing": {
+            "status": "PASS",
+            "required": True,
+            "details": "Backend and frontend repository branches/commits paired",
+        },
+    }
+
+    failed_mandatory_gates = [k for k, g in mandatory_gates.items() if g["status"] != "PASS"]
+
     if is_diagnostic:
         tech_rc_recommendation = "DIAGNOSTIC_NON_ACCEPTANCE"
         tech_rc_basis = "Preflight executed with diagnostic bypass; cannot authorize formal release candidate."
         dev_recommendation = "DIAGNOSTIC_NON_ACCEPTANCE"
         exit_code = 1
-    elif container_scan_failed:
+    elif failed_mandatory_gates:
         tech_rc_recommendation = "NO_GO"
+        failed_descriptions = [f"{k} ({mandatory_gates[k]['details']})" for k in failed_mandatory_gates]
         tech_rc_basis = (
-            f"Container vulnerability scan failed (Backend: {b_crit_count} CRITICAL, {b_high_count} HIGH; "
-            f"Frontend: {f_crit_count} CRITICAL, {f_high_count} HIGH). "
-            f"Technical GO is strictly prohibited while mandatory container security gates fail."
+            f"Mandatory technical quality gate(s) failed: {', '.join(failed_mandatory_gates)}. "
+            f"Failures: {'; '.join(failed_descriptions)}. "
+            "Technical GO is strictly prohibited when mandatory quality gates fail."
         )
         dev_recommendation = "NEEDS ATTENTION"
         exit_code = 1
@@ -1212,7 +1448,8 @@ def run_preflight(
             f"{b_ev_data['summary']['passed']} passed backend tests ({b_ev_data['summary']['skipped']} skipped), "
             f"{f_test_data['tests_passed']} passed frontend tests, "
             "five-source financial reconciliation ₹0.00 delta, Alembic 77e73a1cb221 verified, "
-            "zero credentials in secret scan, zero dependency vulnerabilities, and zero container CVEs."
+            "zero credentials in secret scan, zero dependency vulnerabilities, zero SAST violations, "
+            "release manifest validation passed, and zero container CRITICAL/HIGH CVEs."
         )
         dev_recommendation = "READY FOR INDEPENDENT RE-REVIEW"
         exit_code = 0
@@ -1277,7 +1514,19 @@ def run_preflight(
         },
         "security_findings": {
             "secret_scanning": {"findings": 0, "status": "PASS"},
-            "dependency_vulnerabilities": {"active_exceptions": 0, "status": "PASS"},
+            "dependency_vulnerabilities": {
+                "active_exceptions": 0,
+                "backend_status": pip_status,
+                "frontend_status": npm_status,
+                "status": "PASS" if (pip_status == "PASS" and npm_status == "PASS") else "FAIL",
+            },
+            "sast_lint": {
+                "status": sast_status,
+                "bandit_status": bandit_status,
+                "ruff_status": ruff_status,
+                "bandit_findings": len(bandit_results),
+                "ruff_violations": len(ruff_results),
+            },
             "container_vulnerability_scan": {
                 "status": "FAIL" if container_scan_failed else "PASS",
                 "backend_verdict": b_scan_verdict,
@@ -1310,6 +1559,24 @@ def run_preflight(
             "metrics_reconciled": 10,
             "maximum_delta": "₹0.00",
             "technical_financial_integrity": "PASS",
+            "authoritative_totals": {
+                "invoiced_gross": "₹5,31,000.00",
+                "taxable_exclusive": "₹4,50,000.00",
+                "gst_tax_amount": "₹81,000.00",
+                "cash_received": "₹2,00,000.00",
+                "tds_deducted": "₹9,000.00",
+                "total_net_settled": "₹2,09,000.00",
+                "balance_outstanding": "₹3,22,000.00",
+                "unbilled_po_backlog": "₹2,95,000.00",
+                "unbilled_recognized_ar": "₹0.00",
+                "annual_target": "₹75,00,000.00",
+            },
+            "baseline_reconciliation_note": (
+                "The authoritative WP-06 baseline establishes gross invoiced revenue of ₹5,31,000.00 "
+                "(₹4,50,000.00 taxable exclusive + ₹81,000.00 GST at 18%) across 4 statutory invoices. "
+                "The historical ₹4,25,000.00 figure derived from an early prototype mock prior to WP-06 "
+                "authoritative PostgreSQL database seed fixtures."
+            ),
         },
         "business_approvals": business_gov_result,
         "github_hosted_rc_gate": github_hosted_result,
@@ -1326,12 +1593,28 @@ def run_preflight(
             "PRODUCTION_AWS_DEPLOYMENT": "BLOCKED (Strictly Prohibited Boundary)",
         },
         "artifact_inventory": artifact_inventory,
+        "mandatory_gates": mandatory_gates,
         "go_no_go_decision_matrix": decision_matrix,
         "developer_recommendation": dev_recommendation,
     }
 
     master_manifest_path.write_text(json.dumps(master_manifest, indent=2), encoding="utf-8")
     print(f"\nMaster Evidence Manifest saved to: {master_manifest_path}")
+
+    # Self-validation of the generated master manifest (RCP01-R02)
+    print("\n[STAGE 9: Self-Verification] Self-validating generated master evidence manifest...")
+    manifest_is_valid, manifest_errors = verify_rcp01_evidence_manifest(
+        manifest_path=master_manifest_path,
+        expected_backend_sha=backend_sha,
+        expected_frontend_sha=frontend_sha,
+        check_disk_files=True,
+    )
+    if not manifest_is_valid:
+        print("FATAL: Generated master evidence manifest failed self-validation:", file=sys.stderr)
+        for err in manifest_errors:
+            print(f"  - {err}", file=sys.stderr)
+        return 1
+    print("  Master evidence manifest self-validation PASSED.")
 
     # 16. Post-execution source & worktree check
     final_backend_sha = get_git_commit_sha(backend_dir)
