@@ -419,10 +419,11 @@ def verify_rcp01_evidence_manifest(
         if fin_path.is_file():
             try:
                 fin_doc = json.loads(fin_path.read_text(encoding="utf-8"))
-                fin_revs = fin_doc.get("source_revisions", {})
-                if fin_revs.get("backend_sha") != b_sha or fin_revs.get("frontend_sha") != f_sha:
+                fin_b_sha = fin_doc.get("backend_sha") or fin_doc.get("source_revisions", {}).get("backend_sha")
+                fin_f_sha = fin_doc.get("frontend_sha") or fin_doc.get("source_revisions", {}).get("frontend_sha")
+                if fin_b_sha != b_sha or fin_f_sha != f_sha:
                     errors.append(
-                        f"Financial readiness evidence source revisions ({fin_revs.get('backend_sha')}, {fin_revs.get('frontend_sha')}) "
+                        f"Financial readiness evidence source revisions ({fin_b_sha}, {fin_f_sha}) "
                         f"do not match release candidate ({b_sha}, {f_sha}) - stale or mismatched financial evidence"
                     )
             except Exception as e:
