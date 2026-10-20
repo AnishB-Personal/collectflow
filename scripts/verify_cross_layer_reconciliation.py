@@ -542,6 +542,8 @@ def verify_cross_layer_reconciliation(
 
     excel_file_res = requests.get(
         f"{BACKEND_URL}/api/export/excel?ticket={ticket_excel}&fy=FY 2026-27&scope=all",
+        headers=headers,
+        cookies=login_res.cookies,
         timeout=10,
     )
     assert excel_file_res.status_code == 200
@@ -602,6 +604,8 @@ def verify_cross_layer_reconciliation(
 
     csv_file_res = requests.get(
         f"{BACKEND_URL}/api/export/csv?ticket={ticket_csv}&fy=FY 2026-27&scope=all",
+        headers=headers,
+        cookies=login_res.cookies,
         timeout=10,
     )
     assert csv_file_res.status_code == 200
