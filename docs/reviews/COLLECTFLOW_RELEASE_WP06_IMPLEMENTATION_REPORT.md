@@ -18,14 +18,14 @@ Both repositories continue on `feature/release-wp06-financial-approval-gates`.
 ### Backend Repository: `AnishB-Personal/collectflow`
 - **Accepted WP-05 Baseline Commit:** `8e92be265d2e2117c6d5a7c07231e1e771c80612`
 - **Active Branch:** `feature/release-wp06-financial-approval-gates`
-- **Verified Review Head:** `411a6244c954d7e61ef72842817824d5be172008`
+- **Verified Review Head:** `5acd8ec14180c7a4f86539f64c500474014312e5`
 - **Database Target:** PostgreSQL 16 on `127.0.0.1:5432/collectflow_test`
 - **Schema Revision:** Alembic revision `77e73a1cb221`
 
 ### Frontend Repository: `AnishB-Personal/cash-flow-buddy-101`
 - **Accepted WP-05 Baseline Commit:** `8289c9ca8eec03b0482b3401faffc83c1d36b0aa`
 - **Active Branch:** `feature/release-wp06-financial-approval-gates`
-- **Verified Review Head:** `71eed81e67f9f9b23dd404e6465a1ed597dfa20b`
+- **Verified Review Head:** `f0b413c7f93ccd50cbbcf56583db16fc59efba59`
 
 ---
 
