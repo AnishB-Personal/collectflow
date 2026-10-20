@@ -92,6 +92,7 @@ def run_pipeline(
     frontend_dir = frontend_dir.resolve()
     if artifacts_dir is None:
         artifacts_dir = backend_dir / "artifacts"
+    artifacts_dir = artifacts_dir.resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     is_diagnostic = diagnostic or skip_pytest or skip_clean or allow_dirty
@@ -199,12 +200,12 @@ def run_pipeline(
         if res_pytest.returncode != 0:
             print(f"FATAL: Full backend pytest failed with exit code {res_pytest.returncode}", file=sys.stderr)
             return 1
-        if not xml_path.is_file():
-            print(f"FATAL: Pytest XML report not generated at {xml_path}", file=sys.stderr)
+        if not xml_path.is_file() or xml_path.stat().st_size == 0:
+            print(f"FATAL: Pytest XML report not generated or empty at {xml_path}", file=sys.stderr)
             return 1
     else:
-        if not xml_path.is_file():
-            print(f"FATAL: Cannot run diagnostic pipeline with skip_pytest without existing XML at {xml_path}", file=sys.stderr)
+        if not xml_path.is_file() or xml_path.stat().st_size == 0:
+            print(f"FATAL: Cannot run diagnostic pipeline with skip_pytest without existing valid XML at {xml_path}", file=sys.stderr)
             return 1
 
     # Verify backend revision didn't mutate during tests
@@ -225,8 +226,25 @@ def run_pipeline(
         str(backend_dir),
     ]
     res_gen = run_command(gen_cmd, cwd=backend_dir, env=env)
-    if res_gen.returncode != 0 or not ev_path.is_file():
-        print("FATAL: Failed to generate backend test evidence JSON", file=sys.stderr)
+    if res_gen.returncode != 0 or not ev_path.is_file() or ev_path.stat().st_size == 0:
+        print(f"FATAL: Failed to generate valid backend test evidence JSON at {ev_path}", file=sys.stderr)
+        return 1
+
+    try:
+        ev_data = json.loads(ev_path.read_text(encoding="utf-8"))
+        ev_report_xml = ev_data.get("report_xml")
+        if not ev_report_xml or Path(ev_report_xml).resolve() != xml_path.resolve():
+            print(f"FATAL: Evidence JSON XML path mismatch: '{ev_report_xml}' != '{xml_path.resolve()}'", file=sys.stderr)
+            return 1
+        expected_xml_sha = compute_file_sha256(xml_path)
+        if ev_data.get("xml_report_sha256") != expected_xml_sha:
+            print(f"FATAL: Evidence XML checksum mismatch: '{ev_data.get('xml_report_sha256')}' != '{expected_xml_sha}'", file=sys.stderr)
+            return 1
+        if ev_data.get("backend_sha") != initial_backend_sha:
+            print(f"FATAL: Evidence backend SHA mismatch: '{ev_data.get('backend_sha')}' != '{initial_backend_sha}'", file=sys.stderr)
+            return 1
+    except Exception as exc:
+        print(f"FATAL: Failed to validate generated backend test evidence: {exc}", file=sys.stderr)
         return 1
 
     # 8. Reset database to pure baseline fixtures before cross-layer reconciliation
@@ -250,19 +268,39 @@ def run_pipeline(
         str(recon_path),
     ]
     res_recon = run_command(recon_cmd, cwd=backend_dir, env=env)
-    if res_recon.returncode != 0 or not recon_path.is_file():
-        print("FATAL: Multi-source reconciliation failed", file=sys.stderr)
+    if res_recon.returncode != 0 or not recon_path.is_file() or recon_path.stat().st_size == 0:
+        print(f"FATAL: Multi-source reconciliation failed or generated empty report at {recon_path}", file=sys.stderr)
         return 1
 
-    # 8. Execute formal financial release readiness gate
+    try:
+        recon_data = json.loads(recon_path.read_text(encoding="utf-8"))
+        if recon_data.get("backend_sha") != initial_backend_sha:
+            print(f"FATAL: Reconciliation backend SHA mismatch: '{recon_data.get('backend_sha')}' != '{initial_backend_sha}'", file=sys.stderr)
+            return 1
+        if recon_data.get("frontend_sha") != initial_frontend_sha:
+            print(f"FATAL: Reconciliation frontend SHA mismatch: '{recon_data.get('frontend_sha')}' != '{initial_frontend_sha}'", file=sys.stderr)
+            return 1
+    except Exception as exc:
+        print(f"FATAL: Failed to validate generated reconciliation summary: {exc}", file=sys.stderr)
+        return 1
+
+    # 8. Execute formal financial release readiness gate (WP06-R09: explicit evidence path binding)
     print("\n[STAGE 4: Financial Release Readiness Gate] Running formal readiness verification...")
     gate_cmd = [
         str(venv_python),
         str(backend_dir / "scripts" / "release" / "verify_financial_readiness.py"),
+        "--backend-dir",
+        str(backend_dir),
+        "--frontend-dir",
+        str(frontend_dir),
         "--expected-backend-sha",
         initial_backend_sha,
         "--expected-frontend-sha",
         initial_frontend_sha,
+        "--regression-evidence",
+        str(ev_path),
+        "--reconciliation-summary",
+        str(recon_path),
         "--output",
         str(manifest_path),
     ]
@@ -271,8 +309,8 @@ def run_pipeline(
         print(f"FATAL: Financial readiness verification returned unexpected code: {res_gate.returncode}", file=sys.stderr)
         return 1
 
-    if not manifest_path.is_file():
-        print(f"FATAL: Financial readiness manifest not generated at {manifest_path}", file=sys.stderr)
+    if not manifest_path.is_file() or manifest_path.stat().st_size == 0:
+        print(f"FATAL: Financial readiness manifest not generated or empty at {manifest_path}", file=sys.stderr)
         return 1
 
     manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -281,12 +319,72 @@ def run_pipeline(
     overall_verdict = manifest_data.get("overall_release_readiness")
     recommendation = manifest_data.get("recommendation")
 
+    # Validate that manifest was strictly bound to current-run evidence (WP06-R09)
+    tech_checks = manifest_data.get("technical_financial_integrity", {}).get("checks", {})
+    reg_check = tech_checks.get("regression_test_evidence", {})
+    recon_check = tech_checks.get("cross_layer_reconciliation_evidence", {})
+
+    actual_ev_sha = compute_file_sha256(ev_path)
+    actual_recon_sha = compute_file_sha256(recon_path)
+
+    if reg_check.get("checksum_sha256") != actual_ev_sha:
+        print(
+            f"FATAL: Manifest regression evidence checksum mismatch: manifest has '{reg_check.get('checksum_sha256')}', "
+            f"current evidence SHA-256 is '{actual_ev_sha}'",
+            file=sys.stderr,
+        )
+        return 1
+
+    if recon_check.get("checksum_sha256") != actual_recon_sha:
+        print(
+            f"FATAL: Manifest reconciliation summary checksum mismatch: manifest has '{recon_check.get('checksum_sha256')}', "
+            f"current reconciliation summary SHA-256 is '{actual_recon_sha}'",
+            file=sys.stderr,
+        )
+        return 1
+
+    if reg_check.get("file") and Path(reg_check["file"]).resolve() != ev_path.resolve():
+        print(
+            f"FATAL: Manifest regression evidence path mismatch: manifest consumed '{reg_check.get('file')}', "
+            f"expected '{ev_path.resolve()}'",
+            file=sys.stderr,
+        )
+        return 1
+
+    if recon_check.get("file") and Path(recon_check["file"]).resolve() != recon_path.resolve():
+        print(
+            f"FATAL: Manifest reconciliation summary path mismatch: manifest consumed '{recon_check.get('file')}', "
+            f"expected '{recon_path.resolve()}'",
+            file=sys.stderr,
+        )
+        return 1
+
     # 9. Verify source revisions remained unchanged across entire pipeline
     final_backend_sha = get_git_commit_sha(backend_dir)
     final_frontend_sha = get_git_commit_sha(frontend_dir)
     if final_backend_sha != initial_backend_sha or final_frontend_sha != initial_frontend_sha:
         print("FATAL: Source revision drift detected across pipeline execution!", file=sys.stderr)
         return 1
+
+    # 10. Recheck clean working trees on both repositories after execution (WP06-R09)
+    if not allow_dirty:
+        b_clean_post, b_diff_post = check_clean_working_tree(backend_dir)
+        if not b_clean_post:
+            print(
+                f"FATAL: Backend repository '{backend_dir.name}' working tree became dirty after pipeline execution (uncommitted/untracked changes detected):",
+                file=sys.stderr,
+            )
+            print(b_diff_post, file=sys.stderr)
+            return 1
+
+        f_clean_post, f_diff_post = check_clean_working_tree(frontend_dir)
+        if not f_clean_post:
+            print(
+                f"FATAL: Frontend repository '{frontend_dir.name}' working tree became dirty after pipeline execution (uncommitted/untracked changes detected):",
+                file=sys.stderr,
+            )
+            print(f_diff_post, file=sys.stderr)
+            return 1
 
     # 10. Checksums and provenance summary
     xml_sha = compute_file_sha256(xml_path)

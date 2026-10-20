@@ -18,14 +18,14 @@ Both repositories continue on `feature/release-wp06-financial-approval-gates`.
 ### Backend Repository: `AnishB-Personal/collectflow`
 - **Accepted WP-05 Baseline Commit:** `8e92be265d2e2117c6d5a7c07231e1e771c80612`
 - **Active Branch:** `feature/release-wp06-financial-approval-gates`
-- **Verified Review Head:** `5acd8ec14180c7a4f86539f64c500474014312e5`
+- **Verified Review Head:** `3fd09605ff05c519a1b7b34209ccd9d85d5dfc0b` (pre-R09 checkpoint; pending final R09 commit)
 - **Database Target:** PostgreSQL 16 on `127.0.0.1:5432/collectflow_test`
 - **Schema Revision:** Alembic revision `77e73a1cb221`
 
 ### Frontend Repository: `AnishB-Personal/cash-flow-buddy-101`
 - **Accepted WP-05 Baseline Commit:** `8289c9ca8eec03b0482b3401faffc83c1d36b0aa`
 - **Active Branch:** `feature/release-wp06-financial-approval-gates`
-- **Verified Review Head:** `f0b413c7f93ccd50cbbcf56583db16fc59efba59`
+- **Verified Review Head:** `c6fc51a75135b0343d9c7ad90a80ba5fb5b61260`
 
 ---
 
@@ -173,6 +173,19 @@ Both repositories continue on `feature/release-wp06-financial-approval-gates`.
   - Preserved fresh artifact purge in Stage 0, full backend pytest regression in Stage 1, structured test evidence generation with XML SHA-256 in Stage 2, genuine 5-source reconciliation in Stage 3, and formal readiness gate verification in Stage 4.
   - Added negative tests in `test_30_pipeline_enforcement_negative_tests` proving that skipped pytest, retained old artifacts, dirty working trees, and diagnostic bypasses fail closed and cannot authorize formal financial release acceptance.
 
+### WP06-R09: Bind Formal Verification to Freshly Generated Evidence
+- **Files:** `scripts/release/run_financial_acceptance_pipeline.py`, `scripts/release/verify_financial_readiness.py`, `tests/test_wp06_financial_governance_and_integrity.py`
+- **Implemented Controls:**
+  - Passed actual generated evidence paths explicitly to the readiness verifier using `--regression-evidence <ev_path>` and `--reconciliation-summary <recon_path>`.
+  - Passed explicit `--backend-dir` and `--frontend-dir` arguments.
+  - Guaranteed that the final manifest is strictly generated from and bound to the exact XML report, structured test evidence, and reconciliation summary of the current pipeline execution.
+  - Resolved any omitted or relative XML report paths in `verify_financial_readiness.py` relative to `regression_evidence_path.parent` rather than the default directory.
+  - Stamped the verified evidence file path (`"file": str(...)`) into `checks["regression_test_evidence"]` and `checks["cross_layer_reconciliation_evidence"]`.
+  - Strictly validated in `run_financial_acceptance_pipeline.py` that the generated manifest's recorded checksums (`checksum_sha256`) and file paths match the current-run artifact files.
+  - Enforced that missing or mismatched artifact paths reject fail-closed without falling back to default locations.
+  - Rechecked both backend and frontend working trees for uncommitted/untracked changes post-execution as well as pre-execution.
+  - Added focused negative test `test_31_evidence_path_binding_and_isolation`: proved that placing valid-looking stale evidence in the default directory while running verification with a separate artifact directory causes formal verification to use only current-run evidence, while omission of explicit paths falls back to default and fails on stale evidence.
+
 ---
 
 ## 3. Independent Multi-Source Financial Reconciliation Matrix
@@ -217,10 +230,10 @@ Annual Target            | ₹7500000.00  | ₹7500000.00  | ₹7500000.00    | 
 
 ### Backend:
 - **Full Suite Command:** `pytest tests/ --junitxml=artifacts/backend_pytest_report.xml`
-- **Result:** **303 passed, 71 skipped (quarantined legacy SQLite Phase 1-3 tests), 0 failed** (Total: 374)
+- **Result:** **305 passed, 71 skipped (quarantined legacy SQLite Phase 1-3 tests), 0 failed** (Total: 376)
 - **WP-06 Test Suite:** `pytest tests/test_wp06_financial_governance_and_integrity.py`
-  - **Result:** **29 passed, 0 failed**
-  - Includes negative tests for empty datasets, orphan reversals, altered settlement totals, missing evidence files, partial reconciliation reports, test overrides, direct initialization in production, invalid GST rate splits, mismatched Git commit SHAs, altered XML reports, forged test counts, missing XML evidence, unpinned revisions, repository identity mismatches, unauthorized production-review switches, empty invariants, missing browser status, fabricated FULL_FIVE_SOURCE PASS, and reconciliation totals inconsistent with PostgreSQL.
+  - **Result:** **31 passed, 0 failed**
+  - Includes negative tests for empty datasets, orphan reversals, altered settlement totals, missing evidence files, partial reconciliation reports, test overrides, direct initialization in production, invalid GST rate splits, mismatched Git commit SHAs, altered XML reports, forged test counts, missing XML evidence, unpinned revisions, repository identity mismatches, unauthorized production-review switches, empty invariants, missing browser status, fabricated FULL_FIVE_SOURCE PASS, reconciliation totals inconsistent with PostgreSQL, skipped pytest regression bypasses, retained old artifacts bypasses, dirty working trees, diagnostic execution bypasses, and stale evidence in default directory with separate artifact directory isolation.
 
 ### Frontend:
 - **Command:** `npm test -- --run`
@@ -230,8 +243,13 @@ Annual Target            | ₹7500000.00  | ₹7500000.00  | ₹7500000.00    | 
 
 ## 5. Machine-Readable Release Gate Verification
 
-- **Command:** `python3 scripts/release/verify_financial_readiness.py --output artifacts/financial_readiness_manifest.json`
-- **Output:**
+### 5.1 Historical Manifest Example (Iteration 1 Initial Review Baseline)
+
+> [!NOTE]
+> The following manifest block represents a historical review example captured during the initial WP-06 review iteration (`411a6244` / `71eed81e`). It is labeled and retained here for audit trail provenance, illustrating the initial gate schema before evidence-binding and pipeline enforcement controls were introduced.
+
+- **Historical Command:** `python3 scripts/release/verify_financial_readiness.py --output artifacts/financial_readiness_manifest.json`
+- **Historical Output:**
   ```json
   {
     "report_type": "COLLECTFLOW_FINANCIAL_RELEASE_READINESS",
@@ -268,6 +286,21 @@ Annual Target            | ₹7500000.00  | ₹7500000.00  | ₹7500000.00    | 
   }
   ```
 - **Exit Code:** `2` (BLOCKED)
+
+### 5.2 Current Verified Release Gate Execution (WP06-R09 Final Verification)
+
+- **Orchestration Command:**
+  ```bash
+  COLLECTFLOW_ENV=test COLLECTFLOW_DATABASE_URL="postgresql+psycopg://collectflow_user:collectflow_secret@127.0.0.1:5432/collectflow_test" \
+  python3 scripts/release/run_financial_acceptance_pipeline.py
+  ```
+- **Verified Review Head Commits:**
+  - Backend: pending final commit on `feature/release-wp06-financial-approval-gates`
+  - Frontend: pending final commit on `feature/release-wp06-financial-approval-gates`
+- **Technical Financial Integrity Verdict:** **PASS** (14/14 technical checks satisfied)
+- **Corporate Business Gate Verdict:** **BLOCKED** (`AWAITING_FINANCE_APPROVAL`)
+- **Overall Release Readiness:** **BLOCKED**
+- **Exit Code:** `2` (Technical PASS; release blocked pending external Finance sign-off)
 
 ---
 

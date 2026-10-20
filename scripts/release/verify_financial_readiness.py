@@ -557,11 +557,11 @@ def evaluate_technical_integrity(
                 ev_errs.append("Regression evidence JSON missing required 'xml_report_sha256' field")
 
             if not ev_xml_path_str:
-                xml_path = backend_dir / "artifacts" / "backend_pytest_report.xml"
+                xml_path = (regression_evidence_path.parent / "backend_pytest_report.xml") if regression_evidence_path else (backend_dir / "artifacts" / "backend_pytest_report.xml")
             else:
                 xml_path = Path(ev_xml_path_str)
                 if not xml_path.is_absolute():
-                    xml_path = backend_dir / xml_path
+                    xml_path = (regression_evidence_path.parent / xml_path) if regression_evidence_path else (backend_dir / xml_path)
 
             if not xml_path.is_file():
                 ev_ok = False
@@ -726,6 +726,7 @@ def evaluate_technical_integrity(
             if ev_ok:
                 checks["regression_test_evidence"] = {
                     "status": "PASS",
+                    "file": str(regression_evidence_path.resolve()) if regression_evidence_path else None,
                     "checksum_sha256": ev_sha256,
                     "backend_sha": ev_sha,
                     "summary": ev_summary,
@@ -999,6 +1000,7 @@ def evaluate_technical_integrity(
             if recon_ok:
                 checks["cross_layer_reconciliation_evidence"] = {
                     "status": "PASS",
+                    "file": str(reconciliation_summary_path.resolve()) if reconciliation_summary_path else None,
                     "checksum_sha256": recon_sha256,
                     "reconciliation_level": recon_level,
                     "formal_acceptance_eligible": True,
@@ -1091,6 +1093,17 @@ def verify_financial_readiness(
     allow_production_review: bool = False,
     output_json: Optional[Path] = None,
 ) -> Dict[str, Any]:
+    backend_dir = Path(backend_dir).resolve()
+    frontend_dir = Path(frontend_dir).resolve()
+    if regression_evidence is None:
+        regression_evidence = backend_dir / "artifacts" / "backend_test_evidence.json"
+    else:
+        regression_evidence = Path(regression_evidence).resolve()
+    if reconciliation_summary is None:
+        reconciliation_summary = backend_dir / "artifacts" / "reconciliation_summary.json"
+    else:
+        reconciliation_summary = Path(reconciliation_summary).resolve()
+
     timestamp_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
     expected_b_sha = expected_backend_sha or os.environ.get("COLLECTFLOW_EXPECTED_BACKEND_SHA")
     expected_f_sha = expected_frontend_sha or os.environ.get("COLLECTFLOW_EXPECTED_FRONTEND_SHA")
@@ -1256,14 +1269,14 @@ def main():
     parser.add_argument(
         "--regression-evidence",
         type=Path,
-        default=Path(__file__).resolve().parent.parent.parent / "artifacts" / "backend_test_evidence.json",
-        help="Path to backend regression test evidence JSON",
+        default=None,
+        help="Path to backend regression test evidence JSON (default: backend_dir/artifacts/backend_test_evidence.json)",
     )
     parser.add_argument(
         "--reconciliation-summary",
         type=Path,
-        default=Path(__file__).resolve().parent.parent.parent / "artifacts" / "reconciliation_summary.json",
-        help="Path to cross-layer reconciliation summary JSON",
+        default=None,
+        help="Path to cross-layer reconciliation summary JSON (default: backend_dir/artifacts/reconciliation_summary.json)",
     )
     parser.add_argument(
         "--allow-production-review",

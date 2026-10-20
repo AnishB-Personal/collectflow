@@ -60,6 +60,7 @@ from scripts.verify_cross_layer_reconciliation import (
     verify_cross_layer_reconciliation,
 )
 from scripts.release.verify_financial_readiness import (
+    compute_file_sha256,
     evaluate_business_authorization,
     evaluate_technical_integrity,
     get_git_commit_sha,
@@ -1540,5 +1541,278 @@ def test_30_pipeline_enforcement_negative_tests(tmp_path):
         diagnostic=True,
     )
     assert rc_diag == 1
+
+
+# ==============================================================================
+# WP06-08 Test 31: Evidence Path Binding and Artifact Isolation (WP06-R09)
+# ==============================================================================
+def test_31_evidence_path_binding_and_isolation(tmp_path):
+    """31. Validate evidence path binding and artifact isolation (WP06-R09):
+    Placing valid-looking stale evidence in the default directory while running
+    formal verification with a separate artifact directory proves verification
+    uses ONLY current-run evidence and fails/blocks if default or mismatched paths are consumed."""
+    backend_dir = Path(__file__).resolve().parent.parent
+    frontend_dir = backend_dir.parent / "cash-flow-buddy-101"
+    backend_sha = get_git_commit_sha(backend_dir)
+    frontend_sha = get_git_commit_sha(frontend_dir)
+
+    from scripts.release.run_financial_acceptance_pipeline import check_clean_working_tree
+
+    # 1. Setup mock backend repository with default artifacts directory containing STALE evidence
+    mock_backend = tmp_path / "mock_backend"
+    mock_backend.mkdir()
+    subprocess.run(["git", "init", str(mock_backend)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(mock_backend), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(mock_backend), "config", "user.email", "test@example.com"], check=True)
+    (mock_backend / "dummy.txt").write_text("initial", encoding="utf-8")
+    subprocess.run(["git", "-C", str(mock_backend), "add", "dummy.txt"], check=True)
+    subprocess.run(["git", "-C", str(mock_backend), "commit", "-m", "init"], check=True)
+    # Repository identity markers
+    (mock_backend / "pyproject.toml").write_text("[project]\nname='collectflow'\n", encoding="utf-8")
+    (mock_backend / "app").mkdir()
+
+    # Default artifacts directory for mock_backend
+    default_artifacts = mock_backend / "artifacts"
+    default_artifacts.mkdir()
+
+    # Place STALE evidence in default artifacts directory
+    old_timestamp = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)).isoformat()
+    stale_xml = default_artifacts / "backend_pytest_report.xml"
+    stale_xml_sha = _create_valid_baseline_pytest_xml(stale_xml, timestamp=old_timestamp)
+
+    stale_ev = default_artifacts / "backend_test_evidence.json"
+    stale_ev.write_text(
+        json.dumps({
+            "test_suite": "backend_pytest_regression",
+            "backend_sha": "stale_backend_sha_000000000000000000000000",
+            "execution_timestamp_utc": old_timestamp,
+            "status": "PASS",
+            "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71},
+            "xml_report_sha256": stale_xml_sha,
+            "report_xml": str(stale_xml.resolve()),
+        }),
+        encoding="utf-8",
+    )
+    stale_ev_sha_initial = compute_file_sha256(stale_ev)
+
+    stale_recon = default_artifacts / "reconciliation_summary.json"
+    stale_recon.write_text(
+        json.dumps({
+            "status": "FAIL",
+            "reconciliation_level": "PARTIAL_FOUR_SOURCE",
+            "formal_acceptance_eligible": False,
+            "backend_sha": "stale_backend_sha_000000000000000000000000",
+            "frontend_sha": "stale_frontend_sha_000000000000000000000000",
+            "database": "collectflow_test",
+        }),
+        encoding="utf-8",
+    )
+    stale_recon_sha_initial = compute_file_sha256(stale_recon)
+
+    # 2. Setup SEPARATE artifact directory with FRESH, qualifying current-run evidence
+    separate_artifacts = tmp_path / "separate_artifacts"
+    separate_artifacts.mkdir()
+
+    fresh_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    fresh_xml = separate_artifacts / "backend_pytest_report.xml"
+    fresh_xml_sha = _create_valid_baseline_pytest_xml(fresh_xml, timestamp=fresh_time)
+
+    fresh_ev = separate_artifacts / "backend_test_evidence.json"
+    fresh_ev.write_text(
+        json.dumps({
+            "test_suite": "backend_pytest_regression",
+            "backend_sha": backend_sha,
+            "execution_timestamp_utc": fresh_time,
+            "status": "PASS",
+            "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71},
+            "xml_report_sha256": fresh_xml_sha,
+            "report_xml": str(fresh_xml.resolve()),
+        }),
+        encoding="utf-8",
+    )
+    fresh_ev_sha = compute_file_sha256(fresh_ev)
+
+    # Build genuine 5-source baseline reconciliation for fresh evidence
+    applicable_matrix = {
+        "Invoiced Gross": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+        "Taxable Exclusive": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+        "GST Tax Amount": ["postgresql", "backend_api", "excel_xlsx", "csv_export"],
+        "Cash Received": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+        "TDS Deducted": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+        "Total Net Settled": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+        "Balance Outstanding": ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"],
+        "Unbilled PO Backlog": ["postgresql", "backend_api", "excel_xlsx", "csv_export"],
+        "Unbilled Recognized AR": ["postgresql", "backend_api", "excel_xlsx", "csv_export"],
+        "Annual Target": ["postgresql", "backend_api", "browser_ui"],
+    }
+    metric_values = {
+        "Invoiced Gross": "531000.00",
+        "Taxable Exclusive": "450000.00",
+        "GST Tax Amount": "81000.00",
+        "Cash Received": "200000.00",
+        "TDS Deducted": "9000.00",
+        "Total Net Settled": "209000.00",
+        "Balance Outstanding": "322000.00",
+        "Unbilled PO Backlog": "295000.00",
+        "Unbilled Recognized AR": "0.00",
+        "Annual Target": "7500000.00",
+    }
+    comps = {}
+    for k, v in metric_values.items():
+        applicable = applicable_matrix[k]
+        obs = {s: v for s in applicable}
+        if k in ("GST Tax Amount", "Unbilled PO Backlog", "Unbilled Recognized AR"):
+            obs["browser_ui"] = "N/A (UI)"
+        elif k == "Annual Target":
+            obs["excel_xlsx"] = "N/A (Export)"
+            obs["csv_export"] = "N/A (Export)"
+        comps[k] = {
+            "expected_applicable_sources": applicable,
+            "sources_compared": applicable,
+            "missing_sources": [],
+            "observed_values": obs,
+            "max_delta": "0.00",
+            "status": "MATCH (₹0.00)",
+        }
+
+    fresh_recon = separate_artifacts / "reconciliation_summary.json"
+    fresh_recon.write_text(
+        json.dumps({
+            "status": "PASS",
+            "reconciliation_level": "FULL_FIVE_SOURCE",
+            "formal_acceptance_eligible": True,
+            "is_synthetic_override": False,
+            "run_id": "test_run_bound",
+            "run_start_utc": fresh_time,
+            "backend_sha": backend_sha,
+            "frontend_sha": frontend_sha,
+            "database": "collectflow_test",
+            "environment": "test",
+            "verified_sources": ["postgresql", "rest_api", "browser_ui", "excel_xlsx", "csv_export"],
+            "unverified_sources": [],
+            "browser_status": "PASS",
+            "comparisons": comps,
+            "metrics": {
+                "invoiced_gross": "531000.00",
+                "exclusive_amount": "450000.00",
+                "tax_amount": "81000.00",
+                "cash_received": "200000.00",
+                "tds_deducted": "9000.00",
+                "total_settled": "209000.00",
+                "total_outstanding": "322000.00",
+                "unbilled_po_gross": "295000.00",
+                "unbilled_recognized_ar": "0.00",
+                "annual_target": "7500000.00",
+            },
+            "invariants": {
+                "cash_plus_tds_equals_settled": True,
+                "invoiced_minus_settled_equals_outstanding": True,
+                "reversal_net_zero": True,
+                "unbilled_ar_zero": True,
+                "ar_aging_sums_to_outstanding": True,
+                "target_reconciled": True,
+            },
+        }),
+        encoding="utf-8",
+    )
+    fresh_recon_sha = compute_file_sha256(fresh_recon)
+
+    # 3. Test: Omitting explicit evidence paths causes fallback to default directory, consuming stale evidence
+    report_default = verify_financial_readiness(
+        backend_dir=mock_backend,
+        frontend_dir=frontend_dir,
+        expected_backend_sha=get_git_commit_sha(mock_backend),
+        expected_frontend_sha=frontend_sha,
+    )
+    assert report_default["technical_financial_integrity"]["verdict"] == "FAIL"
+    # Fails because default directory contains stale evidence with mismatched SHA and old timestamp
+    assert any("Regression evidence source SHA mismatch" in e or "Stale" in e for e in report_default["technical_financial_integrity"]["errors"])
+
+    # 4. Test: Explicit evidence paths strictly bind verifier to separate artifact directory, ignoring default
+    manifest_out = separate_artifacts / "financial_readiness_manifest.json"
+    report_bound = verify_financial_readiness(
+        backend_dir=backend_dir,
+        frontend_dir=frontend_dir,
+        expected_backend_sha=backend_sha,
+        expected_frontend_sha=frontend_sha,
+        regression_evidence=fresh_ev,
+        reconciliation_summary=fresh_recon,
+        output_json=manifest_out,
+    )
+    assert report_bound["technical_financial_integrity"]["verdict"] == "PASS"
+
+    reg_check = report_bound["technical_financial_integrity"]["checks"]["regression_test_evidence"]
+    recon_check = report_bound["technical_financial_integrity"]["checks"]["cross_layer_reconciliation_evidence"]
+
+    # Verify that the manifest was bound to the separate artifact directory and exact checksums
+    assert reg_check["file"] == str(fresh_ev.resolve())
+    assert reg_check["checksum_sha256"] == fresh_ev_sha
+    assert recon_check["file"] == str(fresh_recon.resolve())
+    assert recon_check["checksum_sha256"] == fresh_recon_sha
+
+    # Verify that the stale evidence in default directory was neither consumed nor mutated
+    assert compute_file_sha256(stale_ev) == stale_ev_sha_initial
+    assert compute_file_sha256(stale_recon) == stale_recon_sha_initial
+
+    # 5. Test: Missing evidence in separate directory rejects fail-closed without falling back to default
+    missing_ev_path = separate_artifacts / "nonexistent_evidence.json"
+    report_missing = verify_financial_readiness(
+        backend_dir=backend_dir,
+        frontend_dir=frontend_dir,
+        expected_backend_sha=backend_sha,
+        expected_frontend_sha=frontend_sha,
+        regression_evidence=missing_ev_path,
+        reconciliation_summary=fresh_recon,
+    )
+    assert report_missing["technical_financial_integrity"]["verdict"] == "BLOCKED"
+    assert report_missing["technical_financial_integrity"]["checks"]["regression_test_evidence"]["status"] == "BLOCKED"
+
+    # 6. Test: Mismatched XML path in regression evidence rejects fail-closed
+    mismatched_ev = separate_artifacts / "mismatched_xml_evidence.json"
+    mismatched_ev.write_text(
+        json.dumps({
+            "test_suite": "backend_pytest_regression",
+            "backend_sha": backend_sha,
+            "execution_timestamp_utc": fresh_time,
+            "status": "PASS",
+            "summary": {"total": 374, "passed": 303, "failed": 0, "errors": 0, "skipped": 71},
+            "xml_report_sha256": fresh_xml_sha,
+            "report_xml": str(separate_artifacts / "nonexistent_pytest.xml"),
+        }),
+        encoding="utf-8",
+    )
+    report_mismatched = verify_financial_readiness(
+        backend_dir=backend_dir,
+        frontend_dir=frontend_dir,
+        expected_backend_sha=backend_sha,
+        expected_frontend_sha=frontend_sha,
+        regression_evidence=mismatched_ev,
+        reconciliation_summary=fresh_recon,
+    )
+    assert report_mismatched["technical_financial_integrity"]["verdict"] == "FAIL"
+    assert any("underlying pytest xml report not found" in e.lower() for e in report_mismatched["technical_financial_integrity"]["errors"])
+
+    # 7. Test: Pipeline dirty working tree detection rejects repos becoming dirty post-execution
+    dirty_repo = tmp_path / "post_dirty_repo"
+    dirty_repo.mkdir()
+    subprocess.run(["git", "init", str(dirty_repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(dirty_repo), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(dirty_repo), "config", "user.email", "test@example.com"], check=True)
+    (dirty_repo / "f.txt").write_text("ok", encoding="utf-8")
+    subprocess.run(["git", "-C", str(dirty_repo), "add", "f.txt"], check=True)
+    subprocess.run(["git", "-C", str(dirty_repo), "commit", "-m", "init"], check=True)
+    clean_before, _ = check_clean_working_tree(dirty_repo)
+    assert clean_before is True
+    # Simulate an untracked mutation created during pipeline execution
+    (dirty_repo / "leak.tmp").write_text("untracked leak", encoding="utf-8")
+    clean_after, diff_after = check_clean_working_tree(dirty_repo)
+    assert clean_after is False
+    assert "leak.tmp" in diff_after
+
+    # 8. Test: Manifest checksum and file binding strictly verified against actual artifact files
+    assert report_bound["technical_financial_integrity"]["checks"]["regression_test_evidence"]["checksum_sha256"] == compute_file_sha256(fresh_ev)
+    assert report_bound["technical_financial_integrity"]["checks"]["cross_layer_reconciliation_evidence"]["checksum_sha256"] == compute_file_sha256(fresh_recon)
+    assert Path(report_bound["technical_financial_integrity"]["checks"]["regression_test_evidence"]["file"]).resolve() == fresh_ev.resolve()
+    assert Path(report_bound["technical_financial_integrity"]["checks"]["cross_layer_reconciliation_evidence"]["file"]).resolve() == fresh_recon.resolve()
 
 
