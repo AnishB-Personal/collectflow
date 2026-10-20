@@ -93,7 +93,9 @@ def verify_git_ancestry(repo_dir: Path, base_sha: str) -> bool:
 
 def run_command(cmd: List[str], cwd: Path, env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
     print(f"\n[EXEC] {' '.join(cmd)}")
-    res = subprocess.run(cmd, cwd=str(cwd), env=env, capture_output=True, text=True)
+    cmd_env = (env if env is not None else os.environ).copy()
+    cmd_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    res = subprocess.run(cmd, cwd=str(cwd), env=cmd_env, capture_output=True, text=True)
     if res.stdout:
         print(res.stdout)
     if res.stderr:
