@@ -3,129 +3,87 @@
 **Financial Integrity, Statutory Configuration Governance & Business Release Acceptance**
 
 - **Date:** 2026-10-20
+- **Status:** **READY FOR INDEPENDENT RE-REVIEW**
 - **Overall Business Release Acceptance Verdict:** **BLOCKED**
 - **Technical Financial Integrity Verdict:** **PASS**
 - **Statutory Configuration Activation Status:** **BLOCKED (AWAITING_FINANCE_APPROVAL)**
-- **Developer Review Recommendation:** **READY FOR INDEPENDENT REVIEW**
+- **Developer Review Recommendation:** **READY FOR INDEPENDENT RE-REVIEW**
 
 ---
 
 ## 1. Verified Source Checkpoints & Baseline Ancestry
 
-Both repositories branched directly from their independently verified WP-05 checkpoints on `feature/release-wp06-financial-approval-gates`.
+Both repositories continue on `feature/release-wp06-financial-approval-gates`.
 
 ### Backend Repository: `AnishB-Personal/collectflow`
 - **Accepted WP-05 Baseline Commit:** `8e92be265d2e2117c6d5a7c07231e1e771c80612`
 - **Active Branch:** `feature/release-wp06-financial-approval-gates`
+- **Verified Review Head:** `411a6244c954d7e61ef72842817824d5be172008`
 - **Database Target:** PostgreSQL 16 on `127.0.0.1:5432/collectflow_test`
 - **Schema Revision:** Alembic revision `77e73a1cb221`
 
 ### Frontend Repository: `AnishB-Personal/cash-flow-buddy-101`
 - **Accepted WP-05 Baseline Commit:** `8289c9ca8eec03b0482b3401faffc83c1d36b0aa`
 - **Active Branch:** `feature/release-wp06-financial-approval-gates`
+- **Verified Review Head:** `71eed81e67f9f9b23dd404e6465a1ed597dfa20b`
 
 ---
 
-## 2. WP-06 Implementation Deliverables
+## 2. Review Corrections Implemented
 
-### WP06-01: Statutory Reference Data Finance Approval Boundary
+### WP06-01: Technical Financial Acceptance Evidence & Strict Invariant Verification
+- **File:** `scripts/release/verify_financial_readiness.py`, `scripts/release/generate_backend_test_evidence.py`
+- **Implemented Controls:**
+  - **Dataset Population Gate:** Rejects empty or insufficiently populated financial datasets. Strictly requires non-empty datasets with minimum entity counts (`invoices >= 1`, `payments >= 1`, `reversals >= 1`, `unbilled_pos >= 1`). Zero records cannot produce a technical PASS.
+  - **Structured PostgreSQL Regression Evidence Ingestion:** Ingests `artifacts/backend_test_evidence.json`, verifies source SHA match, parses test summary, requires `passed > 0`, `failed == 0`, `errors == 0`, and validates file SHA-256 checksum.
+  - **Verified Cross-Layer Reconciliation Report Ingestion:** Ingests `artifacts/reconciliation_summary.json`, verifies source SHA match, connected database match, requires `status == "PASS"`, `reconciliation_level == "FULL_FIVE_SOURCE"`, `formal_acceptance_eligible == True`, and verifies file SHA-256 checksum.
+  - **Independent Accounting Totals & Balance Verification:**
+    - `total_invoiced_gross == total_taxable_exclusive + total_tax`
+    - `total_invoiced_gross == total_invoice_settled + total_invoice_outstanding`
+    - `total_payment_settled == total_cash + total_tds`
+    - `total_invoice_settled == total_payment_settled`
+    - Computed using strict Python `Decimal` quantization; zero floating-point drift tolerated.
+  - **Strict Reversal Pairing & Lineage Verification:**
+    - Reversals must contain strictly negative cash and settled amounts.
+    - Every reversal must possess a valid `parent_transaction_id` pointing to an existing transaction (orphan reversals strictly rejected).
+    - Reversal and parent transaction must link to the exact same commercial invoice (`parent.invoice_id == r.invoice_id`).
+    - Exact net-zero settlement pairing: `parent.cash + r.cash == ₹0.00`, `parent.settled + r.settled == ₹0.00`, `parent.tds + r.tds == ₹0.00`.
+  - **Clean Status Separation:** Technical gate produces `PASS`, `FAIL`, or `BLOCKED` based solely on technical evidence. Corporate Finance authorization remains independent (`BLOCKED`).
+
+### WP06-02: Protect Direct Reference Initialization Function Calls
 - **File:** `scripts/init_production_db.py`
-- **Controls Implemented:**
-  - `load_reference_config()` enforces fail-closed governance: strictly refuses statutory reference configuration activation in production and staging (`CRITICAL GOVERNANCE ABORT`) because formal Corporate Finance approval remains pending (`AWAITING_FINANCE_APPROVAL`).
-  - Prohibits self-declared JSON approvals: `approval_status: finance_approved` within repository JSON files cannot self-authorize statutory master data insertion.
-  - `validate_financial_year_records()` enforces:
-    - Start date < end date.
-    - Indian statutory financial year convention (April 1 to March 31 of the succeeding year).
-    - Deduplication of financial year codes within configuration.
-    - Non-overlapping date intervals within configuration.
-    - Non-overlapping date intervals against pre-existing active database records.
-  - GST rate split consistency: strictly validates `cgst_rate + sgst_rate == igst_rate == rate`.
-  - Non-future and non-expired approval date verification.
-  - Preserved default-deferred initialization when reference configuration is omitted (`--ref-config` not provided).
+- **Implemented Controls:**
+  - Updated `init_reference_data(db, ref_config)`: direct Python function calls in production/staging environments attempting to initialize reference data with a statutory configuration abort fail-closed with `RuntimeError: CRITICAL GOVERNANCE ABORT`.
+  - Validates full governance structure, required fields (`config_version`, `approved_by`, `approval_reference`, `approval_date`, `controlled_source`, `effective_date`, `policy_references`, `financial_years`, `gst_rates`, `tds_sections`), non-expired dates, and Indian FY conventions before any database staging.
+  - Validates GST rate splits: `cgst_rate + sgst_rate == igst_rate == rate`.
+  - Preserved safe bootstrap flow when `ref_config` is `None` (deferred initialization).
 
-### WP06-02: Protected Reference Mutation Endpoints & RBAC Protection
-- **File:** `app/routers/settings.py`
-- **Controls Implemented:**
-  - Added `assert_statutory_mutation_permitted()`:
-    - In production and staging environments, rejects statutory reference mutations (financial years, GST rates, TDS rates) with fail-closed HTTP 403 Forbidden.
-    - Audits all rejected mutation attempts via `log_security_audit("STATUTORY_MUTATION_REJECTED", ...)`.
-  - Enforced Indian statutory FY convention in `/api/settings/financial-years` create endpoint.
-  - Added relational dependency protection in `/api/settings/financial-years/{code}` delete endpoint:
-    - Blocks deletion if any commercial invoices, purchase orders, or sales targets reference the financial year.
-  - Enforced duplicate code/name detection and tax rate range bounds `[0.0, 1.0]`.
+### WP06-03: Validate Source and Dataset Identity
+- **File:** `scripts/release/verify_financial_readiness.py`
+- **Implemented Controls:**
+  - `get_git_commit_sha()` strictly resolves exact 40-character commit SHAs. Unresolvable paths, non-git directories, or git errors fail closed with `ValueError` (no `UNKNOWN` fallbacks).
+  - Added support for `--expected-backend-sha` and `--expected-frontend-sha` (and `COLLECTFLOW_EXPECTED_BACKEND_SHA`, `COLLECTFLOW_EXPECTED_FRONTEND_SHA`). Any mismatch triggers immediate technical acceptance failure.
+  - Dynamic database inspection: executes `SELECT current_database();` and inspects `COLLECTFLOW_ENV`. Dynamically computes `dataset_classification` (e.g. `synthetic_postgresql_test_collectflow_test`).
+  - Production/staging protection: rejects connected database targets matching production or staging tokens unless explicit read-only review procedure is provided via `--allow-production-review`.
 
-### WP06-03: Technical Financial Integrity Verification
-- **Verified Invariants:**
-  - **Settlement Invariant:** `Total Settled = Cash Amount + TDS Amount` across all payment transactions.
-  - **Outstanding Invariant:** `Outstanding AR = Total Invoiced - Net Total Settled`.
-  - **Rounding Engine:** Decimal arithmetic with `ROUND_HALF_UP` on every invoice line item; integer paise matching; intra-state `CGST + SGST == GST`.
-  - **Reversal Integrity:** Signed negative cash and settled amounts on reversal transactions; net cash ₹0.00 and net settled ₹0.00 against parent payment transaction.
-  - **Unbilled Backlog Invariance:** Unbilled purchase orders contribute exactly ₹0.00 to recognized Accounts Receivable.
-  - **Historical Snapshot Invariance:** Modifying live customer billing details does not alter historical invoice billing snapshots (`snapshot_customer_name`, `snapshot_billing_address`).
-
-### WP06-04: Cross-Layer Financial Reconciliation Harness
-- **Script:** `scripts/verify_cross_layer_reconciliation.py`
-- **Automated Verification:**
-  - Reconciles 5 independent sources:
-    1. PostgreSQL 16 relational database
-    2. Backend REST API endpoints
-    3. Headless Chromium Playwright DOM capture
-    4. Authoritative Excel export workbook (.xlsx)
-    5. Authoritative CSV export file (.csv)
-  - Portable library path resolution dynamically locating Chromium dependencies.
-  - Safe headless fallback (`--allow-browser-not-executed`) reporting `NOT EXECUTED` rather than failing or fabricating fake data when browser execution is unconfigured.
-  - Machine-readable summary export (`--output`).
-
-### WP06-05: Finance & Business Sign-off Governance Package
-- **Review Documents Prepared (Status: `AWAITING_FINANCE_APPROVAL`):**
-  - `docs/finance/COLLECTFLOW_BPD01_REFERENCE_MASTERS_REVIEW.md`: BPD-01 statutory baseline review package for Indian FY convention, active financial years, and chart of statutory accounts.
-  - `docs/finance/COLLECTFLOW_BPD02_TAX_CONFIGURATION_REVIEW.md`: BPD-02 statutory tax configuration review package for GST rate splits (18%, 12%, 5%, 0%) and TDS sections (194C, 194J, 194J(b)).
-  - `docs/finance/COLLECTFLOW_BUSINESS_ACCEPTANCE_CHECKLIST.md`: Formal business acceptance criteria and sign-off checklist.
-  - **Zero Fabrication:** No signatures, timestamps, or authorization tokens were manufactured. All status indicators explicitly report `AWAITING_FINANCE_APPROVAL`.
-
-### WP06-06: Machine-Readable Financial Release Acceptance Gate
-- **Script:** `scripts/release/verify_financial_readiness.py`
-- **Output:** `artifacts/financial_readiness_manifest.json`
-- **Gate Evaluation:**
-  - Technical Financial Integrity: **PASS** (schema, balances, settlements, reversals, unbilled POs).
-  - Corporate Business Authorization: **BLOCKED** (governance docs and external approval service).
-  - Overall Readiness Verdict: **BLOCKED** (exit code 2).
-  - Captures exact Git commit SHAs for backend and frontend.
-
-### WP06-07: Frontend Financial Governance & Restricted Reference Configuration
-- **File:** `cash-flow-buddy-101/src/components/collectflow/reference-workflows.tsx`
-- **UI Enhancements:**
-  - Display Corporate Finance Governance advisory banner in live mode (`isLive`).
-  - Added explicit notifications explaining that statutory configuration mutations require formal Corporate Finance authorization under BPD-01/BPD-02.
-  - Retained all existing customer, purchase order, invoice, and payment workflows without regressions.
-
-### WP06-08: Financial Governance, Invariant & Gate Test Suite
-- **File:** `tests/test_wp06_financial_governance_and_integrity.py`
-- **18 Test Scenarios Implemented & Verified:**
-  1. `test_01_production_initialization_deferred_without_config`: Production init defers reference data safely without approved config.
-  2. `test_02_unapproved_tax_mutations_blocked_in_production`: Unapproved GST/TDS creation blocked (HTTP 403).
-  3. `test_03_financial_year_mutations_blocked_in_production`: FY modifications blocked in production/staging (HTTP 403).
-  4. `test_04_synthetic_config_rejected_in_production`: Synthetic fixtures rejected fail-closed in production.
-  5. `test_05_fabricated_finance_approval_metadata_rejected`: Self-declared `finance_approved` in JSON rejected fail-closed.
-  6. `test_06_missing_or_expired_approval_evidence_rejected`: Expired and future approval dates rejected.
-  7. `test_07_duplicate_or_conflicting_reference_records_rejected`: Rejects duplicate codes, overlapping intervals, and non-Indian FY conventions.
-  8. `test_08_historical_invoice_invariance_after_customer_change`: Customer mutations do not alter issued invoice snapshots.
-  9. `test_09_unauthorized_roles_rejected_from_statutory_endpoints`: Sales/viewer roles rejected with HTTP 403.
-  10. `test_10_decimal_arithmetic_and_per_line_gst_rounding`: Decimal arithmetic with per-line `ROUND_HALF_UP`.
-  11. `test_11_tds_settlement_reconciliation_invariant`: `Cash + TDS == Total Settled` across all payments.
-  12. `test_12_payment_reversal_pair_zero_net_settlement`: Reversal transactions record signed negative amounts and net to ₹0.00.
-  13. `test_13_altered_financial_export_values_detected`: Cross-layer reconciliation detects non-zero monetary difference.
-  14. `test_14_stale_browser_financial_snapshots_rejected`: Freshness validator rejects snapshots older than run start.
-  15. `test_15_missing_corporate_approval_files_return_blocked`: Missing governance review documents return BLOCKED.
-  16. `test_16_forged_financial_acceptance_pass_rejected`: Self-declared approval strings in markdown rejected as untrusted.
-  17. `test_17_source_commit_shas_recorded`: Financial readiness verifier extracts and records exact git SHAs.
-  18. `test_18_pending_business_approval_correctly_returns_blocked`: Technical PASS with pending business approval produces overall BLOCKED.
+### WP06-04: Distinguish Full vs. Partial Multi-Source Reconciliation
+- **File:** `scripts/verify_cross_layer_reconciliation.py`
+- **Implemented Controls:**
+  - Multi-source reconciliation reports `status = "PARTIAL_FOUR_SOURCE"`, `reconciliation_level = "PARTIAL_FOUR_SOURCE"`, and `formal_acceptance_eligible = false` when live browser UI verification is not executed.
+  - Full five-source PASS (`status = "PASS"`, `reconciliation_level = "FULL_FIVE_SOURCE"`, `formal_acceptance_eligible = true`) is granted only when Playwright Headless Chromium successfully captures and verifies live browser UI.
+  - `browser_override` (used in unit testing) explicitly flags `browser_status = "TEST_OVERRIDE"`, `reconciliation_level = "TEST_OVERRIDE_FOUR_SOURCE"`, and `formal_acceptance_eligible = false`. Test overrides cannot be accepted as formal release evidence.
+  - Structured output records `verified_sources`, `unverified_sources`, and a per-metric `comparisons` map distinguishing completed vs missing source comparisons.
 
 ---
 
 ## 3. Independent Multi-Source Financial Reconciliation Matrix
 
-Execution against live PostgreSQL 16 database, FastAPI backend, Playwright Chromium headless DOM, and authoritative export engines:
+Live execution with all 5 sources reconciled:
+1. PostgreSQL 16 database (`collectflow_test`)
+2. Backend REST API endpoints
+3. Browser UI (Playwright Headless Chromium DOM snapshot)
+4. Authoritative Excel export workbook (.xlsx)
+5. Authoritative CSV export file (.csv)
 
 ```
 ====================================================================================================================================
@@ -159,36 +117,58 @@ Annual Target            | ₹7500000.00  | ₹7500000.00  | ₹7500000.00    | 
 ## 4. Test Suite Execution Summary
 
 ### Backend:
-- Command: `pytest tests/`
-- Result: **292 passed, 71 skipped (quarantined legacy SQLite tests), 0 failed**
-- WP-06 Suite: **18 passed, 0 failed** (`tests/test_wp06_financial_governance_and_integrity.py`)
+- **Full Suite Command:** `pytest tests/ --junitxml=artifacts/backend_pytest_report.xml`
+- **Result:** **300 passed, 71 skipped (quarantined legacy SQLite Phase 1-3 tests), 0 failed** (Total: 371)
+- **WP-06 Test Suite:** `pytest tests/test_wp06_financial_governance_and_integrity.py`
+  - **Result:** **26 passed, 0 failed**
+  - Includes negative tests for empty datasets, orphan reversals, altered settlement totals, missing evidence files, partial reconciliation reports, test overrides, direct initialization in production, invalid GST rate splits, and mismatched Git commit SHAs.
 
 ### Frontend:
-- Command: `npm test -- --run`
-- Result: **44 test files passed (44/44), 620 tests passed (620/620)**
+- **Command:** `npm test -- --run`
+- **Result:** **44 test files passed (44/44), 620 tests passed (620/620)**
 
 ---
 
 ## 5. Machine-Readable Release Gate Verification
 
-- Command: `python3 scripts/release/verify_financial_readiness.py --output artifacts/financial_readiness_manifest.json`
-- Outcome:
+- **Command:** `python3 scripts/release/verify_financial_readiness.py --output artifacts/financial_readiness_manifest.json`
+- **Output:**
   ```json
   {
+    "report_type": "COLLECTFLOW_FINANCIAL_RELEASE_READINESS",
+    "execution_timestamp_utc": "2026-10-20T05:54:42.243246+00:00",
+    "backend_sha": "411a6244c954d7e61ef72842817824d5be172008",
+    "frontend_sha": "71eed81e67f9f9b23dd404e6465a1ed597dfa20b",
+    "dataset_classification": "synthetic_postgresql_test_collectflow_test",
     "technical_financial_integrity": {
-      "verdict": "PASS"
+      "verdict": "PASS",
+      "checks": {
+        "backend_sha_checkpoint": { "status": "PASS" },
+        "frontend_sha_checkpoint": { "status": "PASS" },
+        "schema_revision": { "status": "PASS", "revision": "77e73a1cb221" },
+        "dataset_environment": { "status": "PASS", "database": "collectflow_test" },
+        "dataset_population": { "status": "PASS", "counts": { "invoices": 1, "payments": 2, "reversals": 1, "unbilled_pos": 1 } },
+        "invoice_balance_invariants": { "status": "PASS" },
+        "accounting_totals_invariants": { "status": "PASS" },
+        "payment_settlement_invariants": { "status": "PASS" },
+        "reversal_integrity": { "status": "PASS" },
+        "unbilled_po_zero_ar": { "status": "PASS" },
+        "regression_test_evidence": { "status": "PASS", "summary": { "passed": 300, "failed": 0, "errors": 0 } },
+        "cross_layer_reconciliation_evidence": { "status": "PASS", "reconciliation_level": "FULL_FIVE_SOURCE", "formal_acceptance_eligible": true }
+      }
     },
     "business_authorization": {
       "verdict": "BLOCKED",
       "bpd01_status": "AWAITING_FINANCE_APPROVAL",
       "bpd02_status": "AWAITING_FINANCE_APPROVAL",
-      "checklist_status": "AWAITING_FINANCE_APPROVAL"
+      "checklist_status": "AWAITING_FINANCE_APPROVAL",
+      "external_finance_approval_service": "BLOCKED"
     },
     "overall_release_readiness": "BLOCKED",
-    "recommendation": "READY FOR INDEPENDENT REVIEW"
+    "recommendation": "READY FOR INDEPENDENT RE-REVIEW"
   }
   ```
-- Exit Code: `2` (BLOCKED)
+- **Exit Code:** `2` (BLOCKED)
 
 ---
 

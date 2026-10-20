@@ -60,6 +60,7 @@ from scripts.verify_cross_layer_reconciliation import (
 from scripts.release.verify_financial_readiness import (
     evaluate_business_authorization,
     evaluate_technical_integrity,
+    get_git_commit_sha,
     parse_governance_doc_status,
     verify_financial_readiness,
 )
@@ -491,10 +492,10 @@ def test_16_forged_financial_acceptance_pass_rejected(tmp_path):
 
 
 # ==============================================================================
-# WP06-08 Test 17: Mismatched Source Commit SHAs Recorded
+# WP06-08 Test 17: Source Commit SHAs Verified and Mismatches Rejected (WP06-03)
 # ==============================================================================
 def test_17_source_commit_shas_recorded(tmp_path):
-    """17. Financial readiness verifier extracts and records exact git SHAs."""
+    """17. Financial readiness verifier extracts exact git SHAs and rejects mismatches/unresolvable repos."""
     backend_dir = Path(__file__).resolve().parent.parent
     frontend_dir = backend_dir.parent / "cash-flow-buddy-101"
 
@@ -503,8 +504,37 @@ def test_17_source_commit_shas_recorded(tmp_path):
 
     assert "backend_sha" in report
     assert "frontend_sha" in report
-    assert len(report["backend_sha"]) == 40 or "UNKNOWN" in report["backend_sha"]
-    assert report["dataset_classification"] == "synthetic_postgresql_isolated_test"
+    assert len(report["backend_sha"]) == 40
+    assert len(report["frontend_sha"]) == 40
+    assert "UNKNOWN" not in report["backend_sha"]
+    assert "UNKNOWN" not in report["frontend_sha"]
+    assert "synthetic_postgresql" in report["dataset_classification"]
+
+    # Negative test 1: Non-existent or non-git directory fails closed
+    non_git_dir = tmp_path / "not_a_repo"
+    non_git_dir.mkdir()
+    with pytest.raises(ValueError) as exc_info:
+        get_git_commit_sha(non_git_dir)
+    assert "not a Git repository" in str(exc_info.value)
+
+    # Readiness verifier reports FAIL on unresolvable git repo
+    bad_repo_report = verify_financial_readiness(non_git_dir, frontend_dir)
+    assert bad_repo_report["technical_financial_integrity"]["verdict"] == "FAIL"
+    assert bad_repo_report["overall_release_readiness"] == "FAIL"
+
+    # Negative test 2: Mismatched expected backend SHA fails closed
+    mismatched_b_report = verify_financial_readiness(
+        backend_dir, frontend_dir, expected_backend_sha="0000000000000000000000000000000000000000"
+    )
+    assert mismatched_b_report["technical_financial_integrity"]["verdict"] == "FAIL"
+    assert any("Backend SHA mismatch" in err for err in mismatched_b_report["technical_financial_integrity"]["errors"])
+
+    # Negative test 3: Mismatched expected frontend SHA fails closed
+    mismatched_f_report = verify_financial_readiness(
+        backend_dir, frontend_dir, expected_frontend_sha="0000000000000000000000000000000000000000"
+    )
+    assert mismatched_f_report["technical_financial_integrity"]["verdict"] == "FAIL"
+    assert any("Frontend SHA mismatch" in err for err in mismatched_f_report["technical_financial_integrity"]["errors"])
 
 
 # ==============================================================================
@@ -513,14 +543,332 @@ def test_17_source_commit_shas_recorded(tmp_path):
 def test_18_pending_business_approval_correctly_returns_blocked():
     """18. When technical integrity passes but corporate approval is pending, overall status is BLOCKED."""
     backend_dir = Path(__file__).resolve().parent.parent
-    tech_verdict, _, _ = evaluate_technical_integrity(backend_dir)
-    biz_verdict, _, _ = evaluate_business_authorization(backend_dir)
+    frontend_dir = backend_dir.parent / "cash-flow-buddy-101"
 
-    assert tech_verdict == "PASS"
-    assert biz_verdict == "BLOCKED"
-
-    report = verify_financial_readiness(backend_dir, backend_dir.parent / "cash-flow-buddy-101")
+    report = verify_financial_readiness(
+        backend_dir=backend_dir,
+        frontend_dir=frontend_dir,
+        regression_evidence=backend_dir / "artifacts" / "backend_test_evidence.json",
+        reconciliation_summary=backend_dir / "artifacts" / "reconciliation_summary.json",
+    )
     assert report["technical_financial_integrity"]["verdict"] == "PASS"
     assert report["business_authorization"]["verdict"] == "BLOCKED"
     assert report["overall_release_readiness"] == "BLOCKED"
-    assert report["recommendation"] == "READY FOR INDEPENDENT REVIEW"
+    assert report["recommendation"] == "READY FOR INDEPENDENT RE-REVIEW"
+
+
+# ==============================================================================
+# WP06-08 Test 19: Direct Reference Initialization Blocked in Production (WP06-02)
+# ==============================================================================
+def test_19_direct_init_reference_data_blocked_in_production(db_session):
+    """19. Direct init_reference_data calls with statutory config abort in production/staging mode."""
+    sample_config = {
+        "config_version": "2026.1",
+        "approval_status": "finance_approved",
+        "approved_by": "Finance Lead",
+        "approval_reference": "FIN-REF-001",
+        "approval_date": "2026-04-01",
+        "controlled_source": "test",
+        "effective_date": "2026-04-01",
+        "policy_references": ["BPD-01", "BPD-02"],
+        "financial_years": [{"code": "FY 2026-27", "start_date": "2026-04-01", "end_date": "2027-03-31"}],
+        "gst_rates": [{"name": "GST 18%", "rate": "0.1800", "cgst_rate": "0.0900", "sgst_rate": "0.0900", "igst_rate": "0.1800"}],
+        "tds_sections": [{"section_code": "194C", "description": "Contractors", "default_rate": "0.0200"}],
+    }
+    with patch.dict(os.environ, {"COLLECTFLOW_ENV": "production"}):
+        with pytest.raises(RuntimeError) as exc_info:
+            init_reference_data(db_session, ref_config=sample_config)
+        assert "CRITICAL GOVERNANCE ABORT: Direct statutory reference initialization in production/staging is BLOCKED" in str(exc_info.value)
+
+
+# ==============================================================================
+# WP06-08 Test 20: Direct Reference Initialization Validates Governance & Rates (WP06-02)
+# ==============================================================================
+def test_20_direct_init_reference_data_validates_governance_integrity(db_session):
+    """20. Direct init_reference_data validates required governance fields and GST rate splits."""
+    # Missing required governance field
+    broken_config = {
+        "is_test_fixture": True,
+        "config_version": "2026.1",
+        # missing approved_by, approval_reference, etc.
+    }
+    with patch.dict(os.environ, {"COLLECTFLOW_ENV": "test"}):
+        with pytest.raises(ValueError) as exc_info:
+            init_reference_data(db_session, ref_config=broken_config)
+        assert "CRITICAL CONFIGURATION ERROR" in str(exc_info.value)
+
+    # Inconsistent GST rate split
+    invalid_split_config = {
+        "is_test_fixture": True,
+        "config_version": "2026.1",
+        "approved_by": "Test Approver",
+        "approval_reference": "TEST-REF-001",
+        "approval_date": "2026-04-01",
+        "controlled_source": "test",
+        "effective_date": "2026-04-01",
+        "policy_references": ["BPD-01"],
+        "financial_years": [{"code": "FY 2026-27", "start_date": "2026-04-01", "end_date": "2027-03-31"}],
+        "gst_rates": [{"name": "GST 18%", "rate": "0.1800", "cgst_rate": "0.0500", "sgst_rate": "0.0500", "igst_rate": "0.1800"}],
+        "tds_sections": [{"section_code": "194C", "description": "Contractors", "default_rate": "0.0200"}],
+    }
+    with patch.dict(os.environ, {"COLLECTFLOW_ENV": "test"}):
+        with pytest.raises(ValueError) as exc_info:
+            init_reference_data(db_session, ref_config=invalid_split_config)
+        assert "split inconsistent" in str(exc_info.value)
+
+
+# ==============================================================================
+# WP06-08 Test 21: Empty Dataset Rejected by Technical Acceptance Gate (WP06-01)
+# ==============================================================================
+def test_21_empty_dataset_rejected_by_technical_acceptance(tmp_path):
+    """21. Empty or insufficiently populated datasets cannot produce a technical PASS."""
+    backend_dir = Path(__file__).resolve().parent.parent
+    backend_sha = get_git_commit_sha(backend_dir)
+    frontend_sha = get_git_commit_sha(backend_dir.parent / "cash-flow-buddy-101")
+
+    # Mock database session returning 0 invoices
+    with patch("app.core.database.get_db_session") as mock_db_ctx:
+        mock_db = MagicMock()
+        mock_db_ctx.return_value.__enter__.return_value = mock_db
+        mock_db.execute.return_value.scalar.side_effect = ["collectflow_test", "collectflow_user", "77e73a1cb221"]
+        # Return empty list for invoices
+        mock_db.scalars.return_value.all.return_value = []
+
+        verdict, checks, errors, _ = evaluate_technical_integrity(
+            backend_dir=backend_dir,
+            backend_sha=backend_sha,
+            frontend_sha=frontend_sha,
+        )
+        assert verdict == "FAIL"
+        assert checks["dataset_population"]["status"] == "FAIL"
+        assert any("Insufficiently populated financial dataset" in err for err in errors)
+
+
+# ==============================================================================
+# WP06-08 Test 22: Orphan Reversals and Mismatched Linkages Rejected (WP06-01)
+# ==============================================================================
+def test_22_orphan_reversal_and_mismatched_linkage_rejected(tmp_path):
+    """22. Reversals with missing parents or mismatched invoice linkage fail closed."""
+    backend_dir = Path(__file__).resolve().parent.parent
+    backend_sha = get_git_commit_sha(backend_dir)
+    frontend_sha = get_git_commit_sha(backend_dir.parent / "cash-flow-buddy-101")
+
+    # Create mock objects: 1 invoice, 1 regular payment, 1 orphan reversal (parent not found)
+    mock_inv = MagicMock(total_amount=Decimal("100.00"), exclusive_amount=Decimal("84.75"), tax_amount=Decimal("15.25"), settlements=[])
+    mock_pay = MagicMock(transaction_type="PAYMENT", cash_amount=Decimal("100.00"), tds_amount=Decimal("0.00"), total_settled=Decimal("100.00"), parent_transaction_id=None, invoice_id=1)
+    mock_rev = MagicMock(
+        transaction_type="REVERSAL",
+        remittance_number="REV-ORPHAN-001",
+        cash_amount=Decimal("-100.00"),
+        tds_amount=Decimal("0.00"),
+        total_settled=Decimal("-100.00"),
+        parent_transaction_id=99999,
+        invoice_id=1,
+    )
+    mock_inv.settlements = [mock_pay, mock_rev]
+    mock_po = MagicMock(id=1, status="UNBILLED")
+
+    with patch("app.core.database.get_db_session") as mock_db_ctx:
+        mock_db = MagicMock()
+        mock_db_ctx.return_value.__enter__.return_value = mock_db
+        mock_db.execute.return_value.scalar.side_effect = ["collectflow_test", "collectflow_user", "77e73a1cb221"]
+        mock_db.scalars.return_value.all.side_effect = [
+            [mock_inv],              # invoices
+            [mock_pay, mock_rev],     # payments
+            [mock_po],               # unbilled_pos
+            [],                      # linked_invoices to unbilled POs
+        ]
+        # scalar lookup for parent returns None
+        mock_db.scalar.return_value = None
+
+        verdict, checks, errors, _ = evaluate_technical_integrity(
+            backend_dir=backend_dir,
+            backend_sha=backend_sha,
+            frontend_sha=frontend_sha,
+        )
+        assert verdict == "FAIL"
+        assert checks["reversal_integrity"]["status"] == "FAIL"
+        assert any("references non-existent parent ID" in err for err in errors)
+
+
+# ==============================================================================
+# WP06-08 Test 23: Altered Accounting and Settlement Totals Rejected (WP06-01)
+# ==============================================================================
+def test_23_altered_settlement_totals_rejected(tmp_path):
+    """23. Settlement arithmetic discrepancies trigger technical acceptance failure."""
+    backend_dir = Path(__file__).resolve().parent.parent
+    backend_sha = get_git_commit_sha(backend_dir)
+    frontend_sha = get_git_commit_sha(backend_dir.parent / "cash-flow-buddy-101")
+
+    # Mock payment with cash + tds != total_settled
+    mock_inv = MagicMock(total_amount=Decimal("100.00"), exclusive_amount=Decimal("84.75"), tax_amount=Decimal("15.25"), settlements=[])
+    mock_pay = MagicMock(
+        remittance_number="PAY-BAD-001",
+        transaction_type="PAYMENT",
+        cash_amount=Decimal("80.00"),
+        tds_amount=Decimal("10.00"),
+        total_settled=Decimal("95.00"),  # 80 + 10 != 95
+        parent_transaction_id=None,
+        invoice_id=1,
+    )
+    mock_parent = MagicMock(
+        id=2,
+        transaction_type="PAYMENT",
+        cash_amount=Decimal("10.00"),
+        tds_amount=Decimal("0.00"),
+        total_settled=Decimal("10.00"),
+        invoice_id=1,
+    )
+    mock_rev = MagicMock(
+        remittance_number="REV-001",
+        transaction_type="REVERSAL",
+        cash_amount=Decimal("-10.00"),
+        tds_amount=Decimal("0.00"),
+        total_settled=Decimal("-10.00"),
+        parent_transaction_id=2,
+        invoice_id=1,
+    )
+    mock_inv.settlements = [mock_pay, mock_parent, mock_rev]
+    mock_po = MagicMock(id=1, status="UNBILLED")
+
+    with patch("app.core.database.get_db_session") as mock_db_ctx:
+        mock_db = MagicMock()
+        mock_db_ctx.return_value.__enter__.return_value = mock_db
+        mock_db.execute.return_value.scalar.side_effect = ["collectflow_test", "collectflow_user", "77e73a1cb221"]
+        mock_db.scalars.return_value.all.side_effect = [
+            [mock_inv],
+            [mock_pay, mock_parent, mock_rev],
+            [mock_po],
+            [],
+        ]
+        mock_db.scalar.return_value = mock_parent
+
+        verdict, checks, errors, _ = evaluate_technical_integrity(
+            backend_dir=backend_dir,
+            backend_sha=backend_sha,
+            frontend_sha=frontend_sha,
+        )
+        assert verdict == "FAIL"
+        assert checks["payment_settlement_invariants"]["status"] == "FAIL"
+        assert any("settlement mismatch" in err for err in errors)
+
+
+# ==============================================================================
+# WP06-08 Test 24: Missing or Failed Regression Evidence Handled Fail-Closed (WP06-01)
+# ==============================================================================
+def test_24_missing_or_failed_regression_evidence_handled(tmp_path):
+    """24. Missing test evidence returns BLOCKED; failed test evidence returns FAIL."""
+    backend_dir = Path(__file__).resolve().parent.parent
+    backend_sha = get_git_commit_sha(backend_dir)
+    frontend_sha = get_git_commit_sha(backend_dir.parent / "cash-flow-buddy-101")
+
+    # Non-existent evidence file produces BLOCKED
+    verdict_missing, checks_missing, _, blocked_missing = evaluate_technical_integrity(
+        backend_dir=backend_dir,
+        backend_sha=backend_sha,
+        frontend_sha=frontend_sha,
+        regression_evidence_path=tmp_path / "non_existent_evidence.json",
+    )
+    assert checks_missing["regression_test_evidence"]["status"] == "BLOCKED"
+    assert any("Missing PostgreSQL regression test evidence file" in b for b in blocked_missing)
+
+    # Corrupted / failed evidence file produces FAIL
+    failed_ev_file = tmp_path / "failed_evidence.json"
+    failed_ev_file.write_text(
+        json.dumps({
+            "test_suite": "backend_pytest_regression",
+            "backend_sha": backend_sha,
+            "status": "FAIL",
+            "summary": {"total": 100, "passed": 98, "failed": 2, "errors": 0, "skipped": 0},
+        }),
+        encoding="utf-8",
+    )
+    verdict_failed, checks_failed, errors_failed, _ = evaluate_technical_integrity(
+        backend_dir=backend_dir,
+        backend_sha=backend_sha,
+        frontend_sha=frontend_sha,
+        regression_evidence_path=failed_ev_file,
+    )
+    assert verdict_failed == "FAIL"
+    assert checks_failed["regression_test_evidence"]["status"] == "FAIL"
+    assert any("contain failures" in err for err in errors_failed)
+
+
+# ==============================================================================
+# WP06-08 Test 25: Partial or Test Override Reconciliation Blocked/Rejected (WP06-01 & WP06-04)
+# ==============================================================================
+def test_25_partial_or_test_override_reconciliation_blocked_or_rejected(tmp_path):
+    """25. Partial 4-source reconciliation produces BLOCKED; test browser overrides produce FAIL."""
+    backend_dir = Path(__file__).resolve().parent.parent
+    backend_sha = get_git_commit_sha(backend_dir)
+    frontend_sha = get_git_commit_sha(backend_dir.parent / "cash-flow-buddy-101")
+
+    # 1. Partial reconciliation (browser NOT_EXECUTED) produces BLOCKED
+    partial_recon_file = tmp_path / "partial_recon.json"
+    partial_recon_file.write_text(
+        json.dumps({
+            "status": "PARTIAL_FOUR_SOURCE",
+            "reconciliation_level": "PARTIAL_FOUR_SOURCE",
+            "formal_acceptance_eligible": False,
+            "browser_status": "NOT_EXECUTED",
+            "backend_sha": backend_sha,
+            "database": "collectflow_test",
+            "invariants": {"reversal_net_zero": True},
+        }),
+        encoding="utf-8",
+    )
+    _, checks_partial, _, blocked_partial = evaluate_technical_integrity(
+        backend_dir=backend_dir,
+        backend_sha=backend_sha,
+        frontend_sha=frontend_sha,
+        reconciliation_summary_path=partial_recon_file,
+    )
+    assert checks_partial["cross_layer_reconciliation_evidence"]["status"] == "BLOCKED"
+    assert any("partial four-source" in b for b in blocked_partial)
+
+    # 2. Test override reconciliation produces FAIL
+    override_recon_file = tmp_path / "override_recon.json"
+    override_recon_file.write_text(
+        json.dumps({
+            "status": "TEST_OVERRIDE",
+            "reconciliation_level": "TEST_OVERRIDE_FOUR_SOURCE",
+            "formal_acceptance_eligible": False,
+            "browser_status": "TEST_OVERRIDE",
+            "backend_sha": backend_sha,
+            "database": "collectflow_test",
+            "invariants": {"reversal_net_zero": True},
+        }),
+        encoding="utf-8",
+    )
+    verdict_override, checks_override, errors_override, _ = evaluate_technical_integrity(
+        backend_dir=backend_dir,
+        backend_sha=backend_sha,
+        frontend_sha=frontend_sha,
+        reconciliation_summary_path=override_recon_file,
+    )
+    assert verdict_override == "FAIL"
+    assert checks_override["cross_layer_reconciliation_evidence"]["status"] == "FAIL"
+    assert any("synthetic test browser override" in err for err in errors_override)
+
+
+# ==============================================================================
+# WP06-08 Test 26: Production DB Target Rejected Without Read-Only Procedure (WP06-03)
+# ==============================================================================
+def test_26_production_target_db_rejected_without_authorization(tmp_path):
+    """26. Production/staging target databases reject synthetic verification without explicit authorization."""
+    backend_dir = Path(__file__).resolve().parent.parent
+    backend_sha = get_git_commit_sha(backend_dir)
+    frontend_sha = get_git_commit_sha(backend_dir.parent / "cash-flow-buddy-101")
+
+    with patch.dict(os.environ, {"COLLECTFLOW_ENV": "production"}):
+        # Without --allow-production-review
+        verdict_unauth, checks_unauth, errors_unauth, _ = evaluate_technical_integrity(
+            backend_dir=backend_dir,
+            backend_sha=backend_sha,
+            frontend_sha=frontend_sha,
+            allow_production_review=False,
+        )
+        assert verdict_unauth == "FAIL"
+        assert checks_unauth["dataset_environment"]["status"] == "FAIL"
+        assert any("Production or staging database target detected" in err for err in errors_unauth)
+

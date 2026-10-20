@@ -108,7 +108,7 @@ def test_targets_list_and_rbac(admin_headers, sales_headers, viewer_headers):
 
 def test_targets_upsert_validation_and_audit(admin_headers, sales_headers, finance_headers):
     with get_db_session() as db:
-        sales_user = db.query(User).filter(User.role == "sales").first()
+        sales_user = db.query(User).filter(User.username == "sandbox_sales").first()
         assert sales_user is not None
         uid = sales_user.id
 

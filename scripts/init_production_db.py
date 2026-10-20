@@ -540,6 +540,7 @@ def init_reference_data(db, ref_config: dict | None = None, verify_only: bool = 
     """
     Initialize statutory reference data only when an explicit Finance-approved configuration is provided.
     If ref_config is None, reference data initialization is deferred safely.
+    Validates governance authorization and configuration integrity before any database mutation (WP06-02).
     """
     if ref_config is None:
         return {
@@ -555,6 +556,97 @@ def init_reference_data(db, ref_config: dict | None = None, verify_only: bool = 
             "gst_rates": 0,
             "tds_sections": 0,
         }
+
+    # WP06-02: Protect direct Python function calls. In production and staging, refuse activation
+    # of statutory reference configuration without independently authenticated Corporate Finance approval.
+    env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
+    is_prod_or_staging = any(token in env_mode for token in ("prod", "stag")) or (
+        env_mode not in APPROVED_TEST_FIXTURE_ENVS
+    )
+    if is_prod_or_staging:
+        raise RuntimeError(
+            "CRITICAL GOVERNANCE ABORT: Direct statutory reference initialization in production/staging is BLOCKED "
+            "pending independently authenticated Corporate Finance authorization (BPD-01/BPD-02 status: AWAITING_FINANCE_APPROVAL)."
+        )
+
+    # Validate structure and required governance fields before mutations
+    if not isinstance(ref_config, dict):
+        raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config must be a dictionary.")
+
+    is_test_fixture = bool(ref_config.get("is_test_fixture", False))
+    raw_status = str(ref_config.get("approval_status", "")).strip()
+    raw_approver = str(ref_config.get("approved_by", "")).strip()
+    raw_ref = str(ref_config.get("approval_reference", "")).strip()
+    is_synthetic = is_test_fixture or any("TEST" in s.upper() for s in (raw_status, raw_approver, raw_ref))
+
+    if is_synthetic:
+        assert_test_fixture_permitted(env_mode)
+    else:
+        if raw_status.lower() != "finance_approved":
+            raise ValueError(
+                f"CRITICAL CONFIGURATION ERROR: Statutory reference config approval_status must be 'finance_approved' "
+                f"(got '{raw_status}'). Unapproved statutory reference values cannot be populated."
+            )
+
+    required_governance_fields = [
+        "config_version",
+        "approved_by",
+        "approval_reference",
+        "approval_date",
+        "controlled_source",
+        "effective_date",
+        "policy_references",
+        "financial_years",
+        "gst_rates",
+        "tds_sections",
+    ]
+    for field in required_governance_fields:
+        if field not in ref_config or ref_config[field] is None:
+            raise ValueError(f"CRITICAL CONFIGURATION ERROR: Reference config missing required '{field}' governance metadata.")
+
+    # Validate approval date
+    app_date_str = str(ref_config.get("approval_date", "")).strip()
+    if not app_date_str:
+        raise ValueError("CRITICAL CONFIGURATION ERROR: Reference config missing required 'approval_date' metadata.")
+    try:
+        app_d = date.fromisoformat(app_date_str)
+        if app_d > date.today():
+            raise ValueError(f"Approval date '{app_date_str}' cannot be in the future.")
+    except Exception as exc:
+        raise ValueError(f"CRITICAL CONFIGURATION ERROR: Invalid approval_date: {exc}")
+
+    expiry_date_str = str(ref_config.get("expiry_date") or ref_config.get("expires_at") or "").strip()
+    if expiry_date_str:
+        try:
+            exp_d = date.fromisoformat(expiry_date_str)
+            if exp_d < date.today():
+                raise ValueError(f"Statutory reference approval has expired on {expiry_date_str}.")
+        except Exception as exc:
+            raise ValueError(f"CRITICAL CONFIGURATION ERROR: Invalid expiry_date: {exc}")
+
+    # Validate GST rate splits
+    for gst_data in ref_config.get("gst_rates", []):
+        name = str(gst_data.get("name", "")).strip()
+        if not name:
+            raise ValueError("CRITICAL CONFIGURATION ERROR: GST rate missing required 'name' field.")
+        r = Decimal(str(gst_data.get("rate", "0")))
+        cgst = Decimal(str(gst_data.get("cgst_rate", "0")))
+        sgst = Decimal(str(gst_data.get("sgst_rate", "0")))
+        igst = Decimal(str(gst_data.get("igst_rate", "0")))
+        if cgst + sgst != igst or igst != r:
+            raise ValueError(
+                f"CRITICAL CONFIGURATION ERROR: GST rate '{name}' split inconsistent: "
+                f"CGST {cgst} + SGST {sgst} != IGST {igst} == rate {r}"
+            )
+
+    # Validate TDS sections
+    for tds_data in ref_config.get("tds_sections", []):
+        sec_code = str(tds_data.get("section_code", "")).strip()
+        if not sec_code:
+            raise ValueError("CRITICAL CONFIGURATION ERROR: TDS section missing required 'section_code' field.")
+        rate_dec = Decimal(str(tds_data.get("default_rate", "0")))
+        if rate_dec < Decimal("0.00") or rate_dec > Decimal("1.00"):
+            raise ValueError(f"CRITICAL CONFIGURATION ERROR: TDS section '{sec_code}' rate {rate_dec} out of bounds [0.0, 1.0].")
 
     results = {"financial_years": 0, "gst_rates": 0, "tds_sections": 0}
 

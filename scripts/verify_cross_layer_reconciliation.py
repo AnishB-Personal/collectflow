@@ -68,7 +68,7 @@ project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 import requests
 import openpyxl
 
@@ -313,6 +313,7 @@ def verify_cross_layer_reconciliation(
     print("\n[Source 1: PostgreSQL 16 Database]")
     with get_db_session() as db:
         conn_info = db.bind.url
+        pg_database_name = str(conn_info.database)
         print(f"  Connected: {conn_info.database} on {conn_info.host}")
         assert "test" in str(conn_info.database).lower(), "Safety violation: Not connected to test database!"
 
@@ -447,13 +448,16 @@ def verify_cross_layer_reconciliation(
     # Source 3: Actual Browser-Rendered UI Values (Fresh Playwright Capture)
     # -------------------------------------------------------------------------
     print("\n[Source 3: Actual Browser-Rendered UI (Fresh Playwright DOM Inspection)]")
-    if browser_override is not None:
-        print("  Using provided browser override data for verification test...")
+    is_browser_override = browser_override is not None
+    if is_browser_override:
+        print("  Using provided browser override data for verification test (TEST OVERRIDE ONLY)...")
         browser_data = browser_override
+        browser_status = "TEST_OVERRIDE"
     else:
         browser_data = execute_fresh_browser_capture(
             run_id, run_start_utc, allow_not_executed=allow_browser_not_executed
         )
+        browser_status = "PASS" if browser_data is not None else "NOT_EXECUTED"
 
     if browser_data is not None:
         browser_invoiced = quantize_dec(browser_data.get("invoiced_gross"))
@@ -634,14 +638,23 @@ def verify_cross_layer_reconciliation(
     ]
 
     all_passed = True
+    comparisons = {}
+    source_names = ["postgresql", "backend_api", "browser_ui", "excel_xlsx", "csv_export"]
     for name, v_pg, v_api, v_ui, v_xl, v_csv in checks:
-        applicable_vals = [v for v in [v_pg, v_api, v_ui, v_xl, v_csv] if v is not None]
+        vals = [v_pg, v_api, v_ui, v_xl, v_csv]
+        sources_compared = [s for s, v in zip(source_names, vals) if v is not None]
+        missing_sources = []
+        if name in ("Invoiced Gross", "Taxable Exclusive", "Cash Received", "TDS Deducted", "Total Net Settled", "Balance Outstanding", "Annual Target"):
+            if v_ui is None and browser_status == "NOT_EXECUTED":
+                missing_sources.append("browser_ui")
+
+        applicable_vals = [v for v in vals if v is not None]
         assert len(applicable_vals) >= 2, f"Insufficient sources for comparison: {name}"
 
         # Differences against PostgreSQL anchor
         diffs = [abs(v - v_pg) for v in applicable_vals]
         max_diff = max(diffs)
-        status = "MATCH (₹0.00)" if max_diff == Decimal("0.00") else "MISMATCH!"
+        metric_status = "MATCH (₹0.00)" if max_diff == Decimal("0.00") else "MISMATCH!"
         if max_diff != Decimal("0.00"):
             all_passed = False
 
@@ -651,7 +664,14 @@ def verify_cross_layer_reconciliation(
         s_xl = f"₹{v_xl}" if v_xl is not None else "N/A (Export)"
         s_csv = f"₹{v_csv}" if v_csv is not None else "N/A (Export)"
 
-        print(f"{name:<24} | {s_pg:<12} | {s_api:<12} | {s_ui:<14} | {s_xl:<12} | {s_csv:<12} | ₹{max_diff:<7} | {status}")
+        print(f"{name:<24} | {s_pg:<12} | {s_api:<12} | {s_ui:<14} | {s_xl:<12} | {s_csv:<12} | ₹{max_diff:<7} | {metric_status}")
+
+        comparisons[name] = {
+            "sources_compared": sources_compared,
+            "missing_sources": missing_sources,
+            "max_delta": str(max_diff),
+            "status": metric_status,
+        }
 
     print("-" * 132)
 
@@ -749,11 +769,55 @@ def verify_cross_layer_reconciliation(
     assert all_passed, "FATAL: Cross-layer financial reconciliation failed due to one or more source mismatches!"
     print("\nSUCCESS: All independent sources reconciled with exact zero monetary delta (₹0.00)!")
 
+    if browser_status == "PASS":
+        reconciliation_level = "FULL_FIVE_SOURCE"
+        formal_acceptance_eligible = True
+    elif browser_status == "NOT_EXECUTED":
+        reconciliation_level = "PARTIAL_FOUR_SOURCE"
+        formal_acceptance_eligible = False
+    else:
+        reconciliation_level = "TEST_OVERRIDE_FOUR_SOURCE"
+        formal_acceptance_eligible = False
+
+    verified_sources = ["postgresql", "rest_api", "excel_xlsx", "csv_export"]
+    if browser_status == "PASS":
+        verified_sources.append("browser_ui")
+    unverified_sources = [s for s in ["postgresql", "rest_api", "browser_ui", "excel_xlsx", "csv_export"] if s not in verified_sources]
+
+    if not all_passed:
+        overall_recon_status = "FAIL"
+    else:
+        if reconciliation_level == "FULL_FIVE_SOURCE":
+            overall_recon_status = "PASS"
+        elif reconciliation_level == "PARTIAL_FOUR_SOURCE":
+            overall_recon_status = "PARTIAL_FOUR_SOURCE"
+        else:
+            overall_recon_status = "TEST_OVERRIDE"
+
+    try:
+        git_sha = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except Exception:
+        git_sha = "UNKNOWN"
+
     summary_report = {
-        "status": "PASS" if all_passed else "FAIL",
+        "status": overall_recon_status,
+        "reconciliation_level": reconciliation_level,
+        "formal_acceptance_eligible": formal_acceptance_eligible,
+        "is_synthetic_override": is_browser_override,
         "run_id": run_id,
         "run_start_utc": run_start_utc.isoformat(),
-        "browser_status": "PASS" if browser_data is not None else "NOT_EXECUTED",
+        "backend_sha": git_sha,
+        "database": pg_database_name,
+        "environment": os.environ.get("COLLECTFLOW_ENV", "test"),
+        "verified_sources": verified_sources,
+        "unverified_sources": unverified_sources,
+        "browser_status": browser_status,
+        "comparisons": comparisons,
         "metrics": {
             "invoiced_gross": str(pg_invoiced),
             "exclusive_amount": str(pg_exclusive),
@@ -798,5 +862,7 @@ if __name__ == "__main__":
         output_json=args.output,
     )
     if res.get("status") == "PASS":
+        sys.exit(0)
+    elif args.allow_browser_not_executed and res.get("status") == "PARTIAL_FOUR_SOURCE":
         sys.exit(0)
     sys.exit(1)
