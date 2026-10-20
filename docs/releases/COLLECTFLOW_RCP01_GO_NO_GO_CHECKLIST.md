@@ -3,8 +3,8 @@
 ## 1. Release Candidate Identity & Baseline
 
 - **Release Candidate ID:** `RC-20261020-01`
-- **Backend Branch & SHA:** `feature/release-rcp01-evidence-preflight` @ `<BACKEND_FROZEN_SHA>`
-- **Frontend Branch & SHA:** `feature/release-rcp01-evidence-preflight` @ `<FRONTEND_FROZEN_SHA>`
+- **Backend Branch & SHA:** `feature/rcp01-security-evidence-remediation` @ `<BACKEND_FROZEN_SHA>`
+- **Frontend Branch & SHA:** `feature/rcp01-security-evidence-remediation` @ `<FRONTEND_FROZEN_SHA>`
 - **Accepted WP-06 Ancestors:**
   - Backend: `12582f7abb3c391e2d80d61ada179629d7825eac` (WP-06 Accepted)
   - Frontend: `c6fc51a75135b0343d9c7ad90a80ba5fb5b61260` (WP-06 Accepted)
@@ -16,31 +16,32 @@
 
 | Perspective | Preflight Recommendation | Evaluated Basis & Supporting Evidence | Known Caveats & Outstanding Blockers |
 | :--- | :--- | :--- | :--- |
-| **[1] Technical Application Release Candidate** | **GO** | 316 backend tests passed against PostgreSQL 16; 620 frontend Vitest passed; 0 TypeScript errors; 5-source financial reconciliation verified at ₹0.00 delta across 10 metrics; Alembic schema 77e73a1cb221 verified; 0 secrets; clean OCI containers. | GitHub-hosted release candidate workflow remains BLOCKED due to default branch indexing (HTTP 404). Merging to `main` prohibited until final production release. |
+| **[1] Technical Application Release Candidate** | **GO** | 387 backend tests evaluated (316 passed, 71 skipped) against PostgreSQL 16; 620 frontend Vitest passed; 0 TypeScript errors; 5-source financial reconciliation verified at ₹0.00 delta across 10 metrics; Alembic schema 77e73a1cb221 verified; 0 secrets; clean OCI containers with 0 CRITICAL / 0 HIGH CVEs. | GitHub-hosted release candidate workflow remains BLOCKED due to default branch indexing (HTTP 404). Merging to `main` prohibited until final production release. |
 | **[2] Corporate Business Release** | **NO_GO** | Statutory configuration reviews BPD-01 and BPD-02 remain in status `AWAITING_FINANCE_APPROVAL`. Business Acceptance Checklist is `BLOCKED`. | Strictly prohibited from production deployment and statutory rate activation until corporate finance sign-off. |
-| **[3] First Isolated AWS TEST Deployment** | **CONDITIONAL_GO** | All 12 architectural deployment criteria compliant (isolated account boundary, modular IaC, safe empty DB init, exact image provenance, secret management via KMS, structured logging, cost limits at $50/mo, teardown scripts verified). Synthetic test data only. | Requires 3 prerequisites to be fulfilled by authorized human decision-makers prior to executing `terraform apply` or cloud provisioning. |
+| **[3] First Isolated AWS TEST Deployment** | **NO_GO** | Preflight evaluated deploy/ ground truth: only 2/12 criteria verified (`empty_db_init`, `image_provenance`), 4 partial, and 6 not implemented. Zero Terraform modules exist in `deploy/`. Dedicated test account boundary unprovisioned. | Must author Terraform IaC in `deploy/terraform/` and provision dedicated isolated AWS TEST account before deployment can be considered. |
 
 ---
 
 ## 3. First Isolated AWS TEST Deployment Checklist (12 Criteria)
 
-- [x] **1. Dedicated Account Boundary:** Isolated AWS account ID separate from corporate billing.
-- [x] **2. IaC Completeness:** Modular Terraform / Docker Compose specifications ready in `deploy/`.
-- [x] **3. Empty DB Initialization:** Alembic `77e73a1cb221` safe empty schema bootstrap verified.
-- [x] **4. Image Provenance:** Images tagged with exact commit SHAs (`collectflow-backend:<sha>`).
-- [x] **5. Secrets Management:** AWS Secrets Manager / Parameter Store KMS structure defined.
-- [x] **6. Network Isolation & TLS:** Private ECS/RDS subnets, public ALB with ACM TLS 1.3 termination.
-- [x] **7. IAM Least Privilege:** Dedicated ECS execution role scoped to Secrets Manager & CloudWatch.
-- [x] **8. Structured Logging & Retention:** JSON structured logs, CloudWatch 30-day retention.
-- [x] **9. Backup & Rollback:** Pre-migration automated RDS snapshot and rollback teardown procedures.
-- [x] **10. Cost Limits:** AWS Budgets alert set at $50/month threshold with automated stop alarms.
-- [x] **11. Synthetic Test Data Only:** Synthetic seed fixtures (`seed_postgres_fixtures.py`) verified; zero PII.
-- [x] **12. Automated Teardown:** Teardown procedure (`terraform destroy` / `compose down -v`) verified.
+- [ ] **1. Dedicated Account Boundary:** `NOT_IMPLEMENTED` (Dedicated AWS Organization test account ID unprovisioned).
+- [ ] **2. IaC Completeness:** `PARTIAL` (`deploy/compose/` has compose; 0 Terraform `.tf` modules exist in `deploy/`).
+- [x] **3. Empty DB Initialization:** `VERIFIED` (Alembic `77e73a1cb221` safe empty schema bootstrap verified).
+- [x] **4. Image Provenance:** `VERIFIED` (Images tagged with exact commit SHAs, digests recorded, zero-publish policy).
+- [ ] **5. Secrets Management:** `NOT_IMPLEMENTED` (AWS Secrets Manager / KMS keys unprovisioned).
+- [ ] **6. Network Isolation & TLS:** `NOT_IMPLEMENTED` (VPC, private subnets, security groups, ALB TLS unprovisioned).
+- [ ] **7. IAM Least Privilege:** `NOT_IMPLEMENTED` (ECS task execution roles & policies unprovisioned).
+- [ ] **8. Structured Logging & Retention:** `PARTIAL` (JSON structured logs emitted locally; CloudWatch log group unprovisioned).
+- [ ] **9. Backup & Rollback:** `PARTIAL` (Local PostgreSQL dump scripts present; RDS automated snapshot unprovisioned).
+- [ ] **10. Cost Limits:** `NOT_IMPLEMENTED` (AWS Budgets alert / CloudWatch billing alarms unprovisioned).
+- [ ] **11. Synthetic Test Data Only:** `PARTIAL` (Synthetic seed fixtures in `seed_postgres_fixtures.py` verified; AWS RDS seeding unexecuted).
+- [ ] **12. Automated Teardown:** `PARTIAL` (Local `compose down -v` verified; Terraform destroy unprovisioned).
 
-### Preconditions for AWS TEST Execution:
-1. **[ ] Physical Account Provisioning:** Provision dedicated isolated AWS TEST account with distinct AWS Organization boundaries.
-2. **[ ] KMS & Secret Provisioning:** Provision AWS Secrets Manager KMS keys for session secrets and database credentials.
-3. **[ ] Operational Sign-off:** Authorized human decision-maker executes operational approval.
+### Outstanding Preconditions for AWS TEST Execution:
+1. **[ ] Terraform Module Development:** Author modular Terraform specifications under `deploy/terraform/` for VPC, ECS Fargate, RDS PostgreSQL, and ALB.
+2. **[ ] Physical Account Provisioning:** Provision dedicated isolated AWS TEST account with distinct AWS Organization boundaries.
+3. **[ ] KMS & Secret Provisioning:** Provision AWS Secrets Manager KMS keys for session secrets and database credentials.
+4. **[ ] Operational Sign-off:** Authorized human decision-maker executes operational approval.
 
 ---
 

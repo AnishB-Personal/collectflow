@@ -85,7 +85,9 @@ if command -v trivy &>/dev/null; then
     
     # Run scan without suppressing tool execution errors; do not ignore unfixed vulnerabilities (WP05-F02)
     TRIVY_RC=0
+    mkdir -p "${HOME}/.cache/trivy"
     trivy image \
+        --cache-dir "${HOME}/.cache/trivy" \
         --scanners vuln \
         --severity HIGH,CRITICAL \
         --format json \
