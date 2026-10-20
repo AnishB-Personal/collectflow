@@ -79,6 +79,24 @@ The objective of WP-06 is to establish trustworthy financial and business releas
 - Differentiates full 5-source reconciliation (`FULL_FIVE_SOURCE PASS`) from partial 4-source runs (`PARTIAL_FOUR_SOURCE BLOCKED`) and test overrides (`TEST_OVERRIDE FAIL`).
 - Zero monetary tolerance (₹0.00 delta across all metrics).
 
+### WP06-R01: Reconciliation Evidence Integrity
+- **Script:** `scripts/release/verify_financial_readiness.py`, `scripts/verify_cross_layer_reconciliation.py`.
+- Enforces presence and validity of both backend and frontend source SHAs (rejecting `UNKNOWN`).
+- Requires `status == PASS`, `reconciliation_level == FULL_FIVE_SOURCE`, `browser_status == PASS`, `formal_acceptance_eligible == True`, and `is_synthetic_override == False`.
+- Verifies all 5 expected sources and all 10 financial metrics with exact ₹0.00 delta.
+- Verifies all 6 statutory invariants as strict booleans, and cross-checks metrics directly against PostgreSQL.
+
+### WP06-R02: Pytest XML Report Verification
+- **Script:** `scripts/release/generate_backend_test_evidence.py`, `scripts/release/verify_financial_readiness.py`.
+- Parses JUnit XML, computes XML SHA-256, records execution provenance (`hostname`, `execution_timestamp_utc`), and verifies mandatory suites.
+- Verifies XML report existence and checksum against JSON evidence, recomputes test counts, and rejects any discrepancy or extra skips (> 71).
+
+### WP06-R03: Formal Source and Environment Controls
+- **Script:** `scripts/release/verify_financial_readiness.py`.
+- Strictly requires explicitly pinned backend and frontend SHAs for formal acceptance (`BLOCKED` otherwise).
+- Verifies repository directory markers and remote origin URLs for both repositories.
+- Rejects production/staging databases and unauthorized review flags (`CRITICAL GOVERNANCE ABORT`).
+
 ### WP06-05: Finance & Business Sign-off Governance Package
 - Documents created under `docs/finance/`:
   - `COLLECTFLOW_BPD01_REFERENCE_MASTERS_REVIEW.md`
@@ -90,7 +108,7 @@ The objective of WP-06 is to establish trustworthy financial and business releas
 
 ## 4. Verification & Gate Execution
 
-1. Full backend pytest regression: `pytest tests/ --junitxml=artifacts/backend_pytest_report.xml` (300 passed, 71 skipped, 0 failed).
+1. Full backend pytest regression: `pytest tests/ --junitxml=artifacts/backend_pytest_report.xml` (303 passed, 71 skipped, 0 failed).
 2. Generate backend regression evidence: `scripts/release/generate_backend_test_evidence.py` -> `artifacts/backend_test_evidence.json`.
 3. Frontend vitest regression: `npm test -- --run` (44 files passed, 620 tests passed).
 4. Cross-layer reconciliation: `scripts/verify_cross_layer_reconciliation.py --output artifacts/reconciliation_summary.json` (5-source ₹0.00 delta MATCH).

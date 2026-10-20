@@ -22,6 +22,16 @@ def compute_file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+MANDATORY_FINANCIAL_SUITES = [
+    "tests.test_wp06_financial_governance_and_integrity",
+    "tests.test_stage4c3_orders_invoices",
+    "tests.test_stage4c4_payments_adjustments",
+    "tests.test_stage4c5_reporting_targets_exports",
+    "tests.test_postgres_domain_models",
+    "tests.contracts.test_domain_contracts",
+]
+
+
 def generate_backend_test_evidence(
     xml_path: Path,
     output_json: Path,
@@ -45,12 +55,30 @@ def generate_backend_test_evidence(
     total_failures = 0
     total_errors = 0
     total_skipped = 0
+    xml_timestamp = None
+    xml_hostname = None
+    xml_time_sec = 0.0
+    discovered_classes = set()
 
     for suite in suites:
         total_tests += int(suite.attrib.get("tests", 0))
         total_failures += int(suite.attrib.get("failures", 0))
         total_errors += int(suite.attrib.get("errors", 0))
         total_skipped += int(suite.attrib.get("skipped", 0))
+        if not xml_timestamp and suite.attrib.get("timestamp"):
+            xml_timestamp = suite.attrib.get("timestamp")
+        if not xml_hostname and suite.attrib.get("hostname"):
+            xml_hostname = suite.attrib.get("hostname")
+        if suite.attrib.get("time"):
+            try:
+                xml_time_sec += float(suite.attrib.get("time"))
+            except ValueError:
+                pass
+
+        for tc in suite.findall("testcase"):
+            cn = tc.attrib.get("classname")
+            if cn:
+                discovered_classes.add(cn)
 
     passed = total_tests - total_failures - total_errors - total_skipped
     if passed < 0:
@@ -65,13 +93,20 @@ def generate_backend_test_evidence(
     )
     backend_sha = res.stdout.strip()
 
-    status = "PASS" if total_failures == 0 and total_errors == 0 and passed > 0 else "FAIL"
+    missing_suites = [s for s in MANDATORY_FINANCIAL_SUITES if s not in discovered_classes]
+    status = (
+        "PASS"
+        if total_failures == 0 and total_errors == 0 and passed > 0 and not missing_suites
+        else "FAIL"
+    )
     xml_sha256 = compute_file_sha256(xml_path)
 
     evidence = {
         "test_suite": "backend_pytest_regression",
         "backend_sha": backend_sha,
-        "execution_timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "execution_timestamp_utc": xml_timestamp or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "hostname": xml_hostname or "unknown",
+        "duration_seconds": round(xml_time_sec, 3),
         "status": status,
         "summary": {
             "total": total_tests,
@@ -80,6 +115,8 @@ def generate_backend_test_evidence(
             "errors": total_errors,
             "skipped": total_skipped,
         },
+        "mandatory_suites_present": not missing_suites,
+        "missing_mandatory_suites": missing_suites,
         "xml_report_sha256": xml_sha256,
         "report_xml": str(xml_path.resolve()),
     }

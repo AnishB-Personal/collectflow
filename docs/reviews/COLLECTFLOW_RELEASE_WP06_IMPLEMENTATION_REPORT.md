@@ -74,6 +74,40 @@ Both repositories continue on `feature/release-wp06-financial-approval-gates`.
   - `browser_override` (used in unit testing) explicitly flags `browser_status = "TEST_OVERRIDE"`, `reconciliation_level = "TEST_OVERRIDE_FOUR_SOURCE"`, and `formal_acceptance_eligible = false`. Test overrides cannot be accepted as formal release evidence.
   - Structured output records `verified_sources`, `unverified_sources`, and a per-metric `comparisons` map distinguishing completed vs missing source comparisons.
 
+### WP06-R01: Validate Complete Reconciliation Evidence
+- **File:** `scripts/release/verify_financial_readiness.py`, `scripts/verify_cross_layer_reconciliation.py`
+- **Implemented Controls:**
+  - Requires exact backend and frontend source revisions in formal reconciliation evidence (`artifacts/reconciliation_summary.json`); rejects missing or `UNKNOWN` source SHAs.
+  - Requires `status == "PASS"`, `reconciliation_level == "FULL_FIVE_SOURCE"`, `browser_status == "PASS"`, `formal_acceptance_eligible == True`, and `is_synthetic_override == False`.
+  - Requires all 5 expected source identities (`postgresql`, `rest_api`, `browser_ui`, `excel_xlsx`, `csv_export`).
+  - Verifies all 10 expected financial metric comparisons and all 6 statutory invariants (`cash_plus_tds_equals_settled`, `invoiced_minus_settled_equals_outstanding`, `reversal_net_zero`, `unbilled_ar_zero`, `ar_aging_sums_to_outstanding`, `target_reconciled`).
+  - Rejects empty, missing, non-boolean, or incomplete invariant dictionaries.
+  - Enforces that every applicable comparison's monetary delta equals exactly ₹0.00.
+  - Cross-checks reconciliation metrics directly against independently queried PostgreSQL totals (e.g. invoiced gross, taxable exclusive, GST, cash, TDS, net settled, outstanding AR).
+  - Validates database and dataset identity matches current environment.
+  - Enforces evidence freshness (<= 24 hours, not in future).
+  - Added comprehensive negative tests for empty invariants, missing browser status, missing source revisions, fabricated `FULL_FIVE_SOURCE` PASS, missing financial metrics, nonzero delta, and reconciliation totals inconsistent with PostgreSQL.
+
+### WP06-R02: Verify Underlying Pytest XML Evidence
+- **File:** `scripts/release/generate_backend_test_evidence.py`, `scripts/release/verify_financial_readiness.py`
+- **Implemented Controls:**
+  - `generate_backend_test_evidence.py` directly parses the JUnit XML test report (`artifacts/backend_pytest_report.xml`), extracts test counts, suite names, binds hostname and execution timestamp, computes SHA-256 of the XML file, and writes `artifacts/backend_test_evidence.json`.
+  - `verify_financial_readiness.py` requires referenced pytest XML report to exist, recomputes SHA-256, and verifies exact match with JSON evidence `xml_report_sha256`.
+  - Reparses XML independently and verifies passed, failed, errored, and skipped counts match JSON evidence. Rejects any discrepancy as evidence forgery.
+  - Rejects zero tests, failed tests, errored tests, and unapproved additional skips (> 71).
+  - Enforces mandatory financial test suites (`tests.test_wp06_financial_governance_and_integrity`, `tests.test_stage4c3_orders_invoices`, `tests.test_stage4c4_payments_adjustments`, `tests.test_stage4c5_reporting_targets_exports`, `tests.test_postgres_domain_models`, `tests.contracts.test_domain_contracts`).
+  - Binds evidence to exact backend SHA, execution provenance (`hostname`, `execution_timestamp_utc`), and enforces freshness (<= 24 hours).
+  - Added comprehensive negative tests for altered XML reports, forged JSON counts, missing XML, mismatched SHA, and stale evidence.
+
+### WP06-R03: Enforce Formal Source and Environment Controls
+- **File:** `scripts/release/verify_financial_readiness.py`
+- **Implemented Controls:**
+  - Requires explicitly pinned backend and frontend SHAs for formal release acceptance via `--expected-backend-sha` and `--expected-frontend-sha` (or env vars). Missing expected SHAs strictly produces `BLOCKED`, never `PASS`.
+  - Validates repository identity (verifying directory markers and git remote origin matching `collectflow` and `cash-flow-buddy-101`) to prevent executing release gates against unverified repositories.
+  - Enforces isolated test environments: `COLLECTFLOW_ENV` must be in `{"test", "ci", "isolated_test"}` and database name in `{"collectflow_test", "collectflow_ci"}`.
+  - Strictly rejects `--allow-production-review` or production/staging target databases (`CRITICAL GOVERNANCE ABORT`) during formal financial release verification.
+  - Added negative tests for unpinned revisions, mismatched repositories, and unauthorized production-review switches.
+
 ---
 
 ## 3. Independent Multi-Source Financial Reconciliation Matrix
@@ -118,10 +152,10 @@ Annual Target            | ₹7500000.00  | ₹7500000.00  | ₹7500000.00    | 
 
 ### Backend:
 - **Full Suite Command:** `pytest tests/ --junitxml=artifacts/backend_pytest_report.xml`
-- **Result:** **300 passed, 71 skipped (quarantined legacy SQLite Phase 1-3 tests), 0 failed** (Total: 371)
+- **Result:** **303 passed, 71 skipped (quarantined legacy SQLite Phase 1-3 tests), 0 failed** (Total: 374)
 - **WP-06 Test Suite:** `pytest tests/test_wp06_financial_governance_and_integrity.py`
-  - **Result:** **26 passed, 0 failed**
-  - Includes negative tests for empty datasets, orphan reversals, altered settlement totals, missing evidence files, partial reconciliation reports, test overrides, direct initialization in production, invalid GST rate splits, and mismatched Git commit SHAs.
+  - **Result:** **29 passed, 0 failed**
+  - Includes negative tests for empty datasets, orphan reversals, altered settlement totals, missing evidence files, partial reconciliation reports, test overrides, direct initialization in production, invalid GST rate splits, mismatched Git commit SHAs, altered XML reports, forged test counts, missing XML evidence, unpinned revisions, repository identity mismatches, unauthorized production-review switches, empty invariants, missing browser status, fabricated FULL_FIVE_SOURCE PASS, and reconciliation totals inconsistent with PostgreSQL.
 
 ### Frontend:
 - **Command:** `npm test -- --run`

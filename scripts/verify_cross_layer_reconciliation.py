@@ -794,15 +794,28 @@ def verify_cross_layer_reconciliation(
         else:
             overall_recon_status = "TEST_OVERRIDE"
 
+    b_dir = project_root if (project_root / "pyproject.toml").exists() else project_root.parent / "collectflow"
+    f_dir = project_root if (project_root / "package.json").exists() else project_root.parent / "cash-flow-buddy-101"
+
     try:
-        git_sha = subprocess.run(
-            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+        b_sha = subprocess.run(
+            ["git", "-C", str(b_dir), "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             check=True,
         ).stdout.strip()
     except Exception:
-        git_sha = "UNKNOWN"
+        b_sha = "UNKNOWN"
+
+    try:
+        f_sha = subprocess.run(
+            ["git", "-C", str(f_dir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except Exception:
+        f_sha = "UNKNOWN"
 
     summary_report = {
         "status": overall_recon_status,
@@ -811,7 +824,8 @@ def verify_cross_layer_reconciliation(
         "is_synthetic_override": is_browser_override,
         "run_id": run_id,
         "run_start_utc": run_start_utc.isoformat(),
-        "backend_sha": git_sha,
+        "backend_sha": b_sha,
+        "frontend_sha": f_sha,
         "database": pg_database_name,
         "environment": os.environ.get("COLLECTFLOW_ENV", "test"),
         "verified_sources": verified_sources,

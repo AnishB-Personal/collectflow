@@ -5,13 +5,14 @@ CollectFlow Financial Release Readiness & Business Acceptance Gate (Release Prep
 Evaluates and separates:
 1. Technical Financial Integrity (Automated Gates: PostgreSQL domain models, Alembic schema revision,
    Decimal precision, payment/settlement invariants, issued invoice immutability, reversal pairing integrity,
-   PostgreSQL regression evidence, cross-layer reconciliation verification).
+   PostgreSQL regression evidence with underlying XML verification, cross-layer multi-source reconciliation
+   evidence with ₹0.00 deltas and database total cross-checks).
 2. Corporate Business Authorization (Governance Gates: BPD-01 Reference Masters Policy,
    BPD-02 Tax Configuration Policy, Corporate Finance Sign-Off, Business UAT Acceptance).
 
 Acceptance Rules:
 - A failed financial invariant must produce FAIL.
-- Missing required test evidence must produce BLOCKED or FAIL, never PASS.
+- Missing required test evidence or unpinned source checkpoints must produce BLOCKED or FAIL, never PASS.
 - Pending Finance approval must produce BLOCKED.
 - Self-declared approvals in JSON or commit metadata must be rejected.
 - Application technical verification can PASS independently of Finance approval.
@@ -30,6 +31,7 @@ import json
 import os
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,6 +45,48 @@ if os.environ.get("COLLECTFLOW_ENV") == "test" and "COLLECTFLOW_DATABASE_URL" no
     )
 
 EXPECTED_ALEMBIC_REVISION = "77e73a1cb221"
+APPROVED_TEST_ENVS = {"test", "ci", "isolated_test"}
+APPROVED_TEST_DATABASES = {"collectflow_test", "collectflow_ci"}
+BASELINE_MAX_SKIPS = 71
+
+MANDATORY_FINANCIAL_SUITES = [
+    "tests.test_wp06_financial_governance_and_integrity",
+    "tests.test_stage4c3_orders_invoices",
+    "tests.test_stage4c4_payments_adjustments",
+    "tests.test_stage4c5_reporting_targets_exports",
+    "tests.test_postgres_domain_models",
+    "tests.contracts.test_domain_contracts",
+]
+
+EXPECTED_RECONCILIATION_SOURCES = [
+    "postgresql",
+    "rest_api",
+    "browser_ui",
+    "excel_xlsx",
+    "csv_export",
+]
+
+EXPECTED_RECONCILIATION_COMPARISONS = [
+    "Invoiced Gross",
+    "Taxable Exclusive",
+    "GST Tax Amount",
+    "Cash Received",
+    "TDS Deducted",
+    "Total Net Settled",
+    "Balance Outstanding",
+    "Unbilled PO Backlog",
+    "Unbilled Recognized AR",
+    "Annual Target",
+]
+
+EXPECTED_RECONCILIATION_INVARIANTS = [
+    "cash_plus_tds_equals_settled",
+    "invoiced_minus_settled_equals_outstanding",
+    "reversal_net_zero",
+    "unbilled_ar_zero",
+    "ar_aging_sums_to_outstanding",
+    "target_reconciled",
+]
 
 
 def compute_file_sha256(path: Path) -> str:
@@ -78,6 +122,40 @@ def get_git_commit_sha(repo_path: Path) -> str:
     return sha
 
 
+def verify_repository_identity(repo_path: Path, expected_name: str) -> None:
+    """
+    Verifies repository directory marker files and git remote origin identity (WP06-R03.3).
+    """
+    if not repo_path or not Path(repo_path).exists():
+        raise ValueError(f"CRITICAL ERROR: Repository path does not exist: {repo_path}")
+    git_dir = Path(repo_path) / ".git"
+    if not git_dir.exists():
+        raise ValueError(f"CRITICAL ERROR: Path is not a Git repository: {repo_path}")
+
+    if expected_name == "collectflow":
+        if not (Path(repo_path) / "pyproject.toml").exists() or not (Path(repo_path) / "app").exists():
+            raise ValueError(f"CRITICAL ERROR: Backend repository marker missing in {repo_path}")
+    elif expected_name == "cash-flow-buddy-101":
+        if not (Path(repo_path) / "package.json").exists() or not (Path(repo_path) / "src").exists():
+            raise ValueError(f"CRITICAL ERROR: Frontend repository marker missing in {repo_path}")
+
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(repo_path), "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            url = res.stdout.strip().lower()
+            if expected_name.lower() not in url:
+                raise ValueError(
+                    f"Repository identity mismatch for {repo_path}: remote origin '{url}' does not match expected '{expected_name}'."
+                )
+    except Exception as exc:
+        if isinstance(exc, ValueError):
+            raise
+
+
 def parse_governance_doc_status(path: Path) -> Tuple[str, Optional[str]]:
     """
     Parses governance document status without trusting self-declared approvals.
@@ -94,7 +172,6 @@ def parse_governance_doc_status(path: Path) -> Tuple[str, Optional[str]]:
                 status = "AWAITING_FINANCE_APPROVAL"
                 break
             if "APPROVED" in line:
-                # WP06-01 / WP06-06: Self-declared approval string in markdown is rejected without external PKI
                 status = "SELF_DECLARED_APPROVAL_REJECTED"
                 break
 
@@ -116,14 +193,29 @@ def evaluate_technical_integrity(
     allow_production_review: bool = False,
 ) -> Tuple[str, Dict[str, Any], List[str], List[str]]:
     """
-    Evaluates technical financial integrity invariants.
+    Evaluates technical financial integrity invariants, regression XML evidence, and multi-source reconciliation.
     Returns (verdict, checks, errors, blocked_reasons).
     """
     errors: List[str] = []
     blocked_reasons: List[str] = []
     checks: Dict[str, Any] = {}
 
-    # 1. Source SHA verification against expected checkpoints (WP06-03)
+    # 1. Source SHA verification & pinning against expected checkpoints (WP06-03, WP06-R03)
+    if not expected_backend_sha or not expected_frontend_sha:
+        err = (
+            "Formal release acceptance requires explicitly pinned backend and frontend SHAs "
+            "(--expected-backend-sha and --expected-frontend-sha). Unpinned evaluation cannot produce technical PASS."
+        )
+        checks["expected_sha_pinning"] = {
+            "status": "BLOCKED",
+            "expected_backend_sha": expected_backend_sha,
+            "expected_frontend_sha": expected_frontend_sha,
+            "error": err,
+        }
+        blocked_reasons.append(err)
+    else:
+        checks["expected_sha_pinning"] = {"status": "PASS", "pinned": True}
+
     if expected_backend_sha:
         if backend_sha.lower() != expected_backend_sha.lower():
             err = f"Backend SHA mismatch: expected '{expected_backend_sha}', got '{backend_sha}'"
@@ -132,7 +224,7 @@ def evaluate_technical_integrity(
         else:
             checks["backend_sha_checkpoint"] = {"status": "PASS", "sha": backend_sha}
     else:
-        checks["backend_sha_checkpoint"] = {"status": "PASS", "sha": backend_sha, "note": "Unpinned expected SHA"}
+        checks["backend_sha_checkpoint"] = {"status": "BLOCKED", "sha": backend_sha, "note": "Unpinned expected SHA"}
 
     if expected_frontend_sha:
         if frontend_sha.lower() != expected_frontend_sha.lower():
@@ -142,10 +234,10 @@ def evaluate_technical_integrity(
         else:
             checks["frontend_sha_checkpoint"] = {"status": "PASS", "sha": frontend_sha}
     else:
-        checks["frontend_sha_checkpoint"] = {"status": "PASS", "sha": frontend_sha, "note": "Unpinned expected SHA"}
+        checks["frontend_sha_checkpoint"] = {"status": "BLOCKED", "sha": frontend_sha, "note": "Unpinned expected SHA"}
 
-    # 2. Database connection, environment & Alembic Schema Revision (WP06-03)
-    env_mode = (os.environ.get("COLLECTFLOW_ENV") or "test").strip().lower()
+    # 2. Database connection, environment & Alembic Schema Revision (WP06-03, WP06-R03)
+    env_mode = (os.environ.get("COLLECTFLOW_ENV") or "").strip().lower()
     pg_database_name = "unknown"
     try:
         sys.path.insert(0, str(backend_dir))
@@ -162,31 +254,46 @@ def evaluate_technical_integrity(
             else:
                 checks["schema_revision"] = {"status": "PASS", "revision": current_rev}
 
+        # WP06-R03.4 & WP06-R03.5: Reject production/staging targets and reject self-declared bypass switch
+        if allow_production_review:
+            err = (
+                "CRITICAL GOVERNANCE ABORT: Self-declared --allow-production-review switch is rejected. "
+                "Synthetic release verification cannot be authorized against production/staging databases "
+                "pending an independently controlled corporate governance procedure."
+            )
+            errors.append(err)
+            checks["production_review_switch"] = {"status": "FAIL", "error": err}
+
         is_prod_or_staging = any(tok in env_mode for tok in ("prod", "stag")) or any(
             tok in str(pg_database_name).lower() for tok in ("prod", "stag")
         )
         if is_prod_or_staging:
-            dataset_classification = f"production_or_staging_{pg_database_name}"
-            if not allow_production_review:
-                err = (
-                    f"Production or staging database target detected ('{pg_database_name}', env='{env_mode}') "
-                    f"for synthetic financial verification without authorized read-only review procedure (--allow-production-review)."
-                )
-                errors.append(err)
-                checks["dataset_environment"] = {
-                    "status": "FAIL",
-                    "database": pg_database_name,
-                    "environment": env_mode,
-                    "error": err,
-                }
-            else:
-                checks["dataset_environment"] = {
-                    "status": "PASS",
-                    "database": pg_database_name,
-                    "environment": env_mode,
-                    "dataset_classification": dataset_classification,
-                    "note": "Authorized read-only production review mode",
-                }
+            err = (
+                f"CRITICAL GOVERNANCE ABORT: Production or staging database target detected "
+                f"('{pg_database_name}', env='{env_mode}'). Synthetic financial verification is strictly prohibited "
+                f"on production/staging environments."
+            )
+            errors.append(err)
+            checks["dataset_environment"] = {
+                "status": "FAIL",
+                "database": pg_database_name,
+                "environment": env_mode,
+                "error": err,
+            }
+            dataset_classification = f"unauthorized_production_target_{pg_database_name}"
+        elif env_mode not in APPROVED_TEST_ENVS or pg_database_name not in APPROVED_TEST_DATABASES:
+            err = (
+                f"Target database '{pg_database_name}' (env: '{env_mode}') is not an approved isolated test target "
+                f"(approved databases: {sorted(APPROVED_TEST_DATABASES)}, approved envs: {sorted(APPROVED_TEST_ENVS)})."
+            )
+            errors.append(err)
+            checks["dataset_environment"] = {
+                "status": "FAIL",
+                "database": pg_database_name,
+                "environment": env_mode,
+                "error": err,
+            }
+            dataset_classification = f"unapproved_target_{pg_database_name}"
         else:
             dataset_classification = f"synthetic_postgresql_{env_mode}_{pg_database_name}"
             checks["dataset_environment"] = {
@@ -203,6 +310,15 @@ def evaluate_technical_integrity(
         dataset_classification = "unverified_connection"
 
     # 3. Direct PostgreSQL financial domain invariants & accounting totals (WP06-01)
+    total_invoiced_gross = Decimal("0.00")
+    total_exclusive = Decimal("0.00")
+    total_tax = Decimal("0.00")
+    total_invoice_settled = Decimal("0.00")
+    total_invoice_outstanding = Decimal("0.00")
+    total_cash = Decimal("0.00")
+    total_tds = Decimal("0.00")
+    total_payment_settled = Decimal("0.00")
+
     try:
         from app.models.domain_models import CommercialInvoice, PaymentTransaction, PurchaseOrder
         from sqlalchemy import select
@@ -216,8 +332,7 @@ def evaluate_technical_integrity(
             regular_payments = [p for p in payments if p.transaction_type == "PAYMENT"]
             unbilled_pos = db.scalars(select(PurchaseOrder).where(PurchaseOrder.status == "UNBILLED")).all()
 
-            # WP06-01.1: Prevent empty or insufficiently populated financial datasets from producing technical PASS
-            min_counts_ok = True
+            # Minimum population requirements
             pop_detail = {
                 "invoices": len(invoices),
                 "payments": len(regular_payments),
@@ -225,7 +340,6 @@ def evaluate_technical_integrity(
                 "unbilled_pos": len(unbilled_pos),
             }
             if len(invoices) < 1 or len(regular_payments) < 1 or len(reversals) < 1 or len(unbilled_pos) < 1:
-                min_counts_ok = False
                 err = (
                     f"Insufficiently populated financial dataset cannot produce an unqualified technical PASS: "
                     f"invoices={len(invoices)} (min 1), payments={len(regular_payments)} (min 1), "
@@ -236,20 +350,12 @@ def evaluate_technical_integrity(
             else:
                 checks["dataset_population"] = {"status": "PASS", "counts": pop_detail}
 
-            # WP06-01.4: Independently verify invoice settlement, outstanding balances and accounting totals
-            total_invoiced_gross = Decimal("0.00")
-            total_exclusive = Decimal("0.00")
-            total_tax = Decimal("0.00")
-            total_invoice_settled = Decimal("0.00")
-            total_invoice_outstanding = Decimal("0.00")
-
             inv_settled_ok = True
             for inv in invoices:
                 inv_gross = Decimal(str(inv.total_amount))
                 inv_excl = Decimal(str(inv.exclusive_amount))
                 inv_tx = Decimal(str(inv.tax_amount))
 
-                # Lineage settlement sum from transactions
                 settled_on_inv = sum(
                     (Decimal(str(t.total_settled)) for t in inv.settlements if t.transaction_type in ("PAYMENT", "REVERSAL")),
                     Decimal("0.00"),
@@ -276,7 +382,6 @@ def evaluate_technical_integrity(
                 "total_outstanding": str(total_invoice_outstanding),
             }
 
-            # Accounting totals integrity: Gross = Excl + Tax, and Gross = Settled + Outstanding
             accounting_totals_ok = True
             if abs(total_invoiced_gross - (total_exclusive + total_tax)) > Decimal("0.00"):
                 accounting_totals_ok = False
@@ -293,10 +398,6 @@ def evaluate_technical_integrity(
                 "gross_equals_settled_plus_outstanding": abs(total_invoiced_gross - (total_invoice_settled + total_invoice_outstanding)) == Decimal("0.00"),
             }
 
-            # Payment transactions invariant: Total Settled = Cash + TDS
-            total_cash = Decimal("0.00")
-            total_tds = Decimal("0.00")
-            total_payment_settled = Decimal("0.00")
             pay_invariants_ok = True
             for p in payments:
                 c = Decimal(str(p.cash_amount))
@@ -309,14 +410,12 @@ def evaluate_technical_integrity(
                 expected_settled = c + t
                 if abs(expected_settled - s) > Decimal("0.00"):
                     pay_invariants_ok = False
-                    errors.append(
-                        f"Payment {p.remittance_number} settlement mismatch: total_settled {s} != {expected_settled}"
-                    )
-            # Payments total settled must equal invoices total settled
+                    errors.append(f"Payment {p.remittance_number} settlement mismatch: total_settled {s} != {expected_settled}")
+
             if abs(total_payment_settled - total_invoice_settled) > Decimal("0.00"):
                 pay_invariants_ok = False
                 errors.append(
-                    f"Cross-table settlement mismatch: Payment transactions settled {total_payment_settled} != Invoices settled {total_invoice_settled}"
+                    f"Cross-table settlement mismatch: Payments settled {total_payment_settled} != Invoices settled {total_invoice_settled}"
                 )
 
             checks["payment_settlement_invariants"] = {
@@ -327,7 +426,6 @@ def evaluate_technical_integrity(
                 "total_settled": str(total_payment_settled),
             }
 
-            # WP06-01.5: Reversal integrity: reject missing parents, mismatched invoice linkage, invalid pairing
             reversals_ok = True
             for r in reversals:
                 r_cash = Decimal(str(r.cash_amount))
@@ -349,14 +447,12 @@ def evaluate_technical_integrity(
                     errors.append(f"Reversal {r.remittance_number} references non-existent parent ID {r.parent_transaction_id}.")
                     continue
 
-                # Verify invoice linkage match
                 if parent.invoice_id != r.invoice_id:
                     reversals_ok = False
                     errors.append(
                         f"Reversal {r.remittance_number} invoice_id ({r.invoice_id}) does not match parent transaction invoice_id ({parent.invoice_id})."
                     )
 
-                # Verify exact net zero pairing
                 net_settled = Decimal(str(parent.total_settled)) + r_settled
                 net_cash = Decimal(str(parent.cash_amount)) + r_cash
                 net_tds = Decimal(str(parent.tds_amount)) + r_tds
@@ -369,7 +465,6 @@ def evaluate_technical_integrity(
 
             checks["reversal_integrity"] = {"status": "PASS" if reversals_ok else "FAIL", "checked": len(reversals)}
 
-            # Check unbilled POs: must not generate accounts receivable
             unbilled_po_ids = [p.id for p in unbilled_pos]
             linked_invoices = db.scalars(
                 select(CommercialInvoice).where(CommercialInvoice.po_id.in_(unbilled_po_ids))
@@ -392,7 +487,7 @@ def evaluate_technical_integrity(
         errors.append(f"Domain invariant inspection error: {exc}")
         checks["domain_invariants"] = {"status": "FAIL", "error": str(exc)}
 
-    # 4. PostgreSQL regression test evidence ingestion (WP06-01.2)
+    # 4. PostgreSQL regression test evidence ingestion & XML verification (WP06-R02)
     if not regression_evidence_path or not regression_evidence_path.is_file():
         checks["regression_test_evidence"] = {
             "status": "BLOCKED",
@@ -413,21 +508,111 @@ def evaluate_technical_integrity(
                 "errors": ev_content.get("errors", 0),
             }
             ev_sha = ev_content.get("backend_sha") or ev_content.get("source_sha")
-            passed_cnt = ev_summary.get("passed", 0)
-            failed_cnt = ev_summary.get("failed", 0)
-            error_cnt = ev_summary.get("errors", 0)
+            ev_xml_path_str = ev_content.get("report_xml")
+            ev_xml_sha = ev_content.get("xml_report_sha256")
+            ev_timestamp = ev_content.get("execution_timestamp_utc")
 
             ev_ok = True
             ev_errs = []
-            if ev_sha != backend_sha:
+
+            # 4.1 Bind evidence to exact tested backend SHA
+            if not ev_sha or ev_sha == "UNKNOWN" or ev_sha != backend_sha:
                 ev_ok = False
-                ev_errs.append(f"Evidence source SHA mismatch: evidence has '{ev_sha}', current backend is '{backend_sha}'")
-            if failed_cnt > 0 or error_cnt > 0:
+                ev_errs.append(f"Regression evidence source SHA mismatch: evidence has '{ev_sha}', current backend is '{backend_sha}'")
+
+            # 4.2 Verify referenced pytest XML exists and recompute SHA-256
+            if not ev_xml_path_str:
+                xml_path = backend_dir / "artifacts" / "backend_pytest_report.xml"
+            else:
+                xml_path = Path(ev_xml_path_str)
+                if not xml_path.is_absolute():
+                    xml_path = backend_dir / xml_path
+
+            if not xml_path.is_file():
                 ev_ok = False
-                ev_errs.append(f"Regression tests contain failures ({failed_cnt}) or errors ({error_cnt})")
-            if passed_cnt <= 0:
+                ev_errs.append(f"Underlying pytest XML report not found at: {xml_path}")
+            else:
+                actual_xml_sha = compute_file_sha256(xml_path)
+                if ev_xml_sha and actual_xml_sha != ev_xml_sha:
+                    ev_ok = False
+                    ev_errs.append(
+                        f"Pytest XML report checksum mismatch: JSON evidence has '{ev_xml_sha}', "
+                        f"recalculated XML checksum is '{actual_xml_sha}' (altered XML detected)"
+                    )
+
+                # 4.3 Reparse XML and independently recalculate test counts
+                try:
+                    tree = ET.parse(xml_path)
+                    root = tree.getroot()
+                    suites = root.findall("testsuite") if root.tag == "testsuites" else ([root] if root.tag == "testsuite" else [])
+                    xml_total = sum(int(s.attrib.get("tests", 0)) for s in suites)
+                    xml_failures = sum(int(s.attrib.get("failures", 0)) for s in suites)
+                    xml_errors = sum(int(s.attrib.get("errors", 0)) for s in suites)
+                    xml_skipped = sum(int(s.attrib.get("skipped", 0)) for s in suites)
+                    xml_passed = xml_total - xml_failures - xml_errors - xml_skipped
+
+                    discovered_classes = set()
+                    for s in suites:
+                        for tc in s.findall("testcase"):
+                            cn = tc.attrib.get("classname")
+                            if cn:
+                                discovered_classes.add(cn)
+
+                    # Compare XML vs JSON counts
+                    if (
+                        xml_total != ev_summary.get("total")
+                        or xml_passed != ev_summary.get("passed")
+                        or xml_failures != ev_summary.get("failed")
+                        or xml_errors != ev_summary.get("errors")
+                        or xml_skipped != ev_summary.get("skipped")
+                    ):
+                        ev_ok = False
+                        ev_errs.append(
+                            f"Discrepancy detected between pytest XML report and JSON evidence counts: "
+                            f"XML=(total={xml_total}, passed={xml_passed}, failed={xml_failures}, errors={xml_errors}, skipped={xml_skipped}) vs "
+                            f"JSON=(total={ev_summary.get('total')}, passed={ev_summary.get('passed')}, failed={ev_summary.get('failed')}, errors={ev_summary.get('errors')}, skipped={ev_summary.get('skipped')}) "
+                            f"(forged JSON evidence detected)"
+                        )
+
+                    if xml_passed <= 0 or xml_total <= 0:
+                        ev_ok = False
+                        ev_errs.append(f"Pytest report reported zero passed tests ({xml_passed} / {xml_total})")
+                    if xml_failures > 0 or xml_errors > 0:
+                        ev_ok = False
+                        ev_errs.append(f"Pytest report contains failed tests ({xml_failures}) or errors ({xml_errors})")
+                    if xml_skipped > BASELINE_MAX_SKIPS:
+                        ev_ok = False
+                        ev_errs.append(f"Unapproved additional skipped tests: {xml_skipped} exceeds baseline threshold of {BASELINE_MAX_SKIPS}")
+
+                    missing_mandatory_suites = [s for s in MANDATORY_FINANCIAL_SUITES if s not in discovered_classes]
+                    if missing_mandatory_suites:
+                        ev_ok = False
+                        ev_errs.append(f"Pytest report missing mandatory financial test suite(s): {missing_mandatory_suites}")
+
+                except Exception as xml_exc:
+                    ev_ok = False
+                    ev_errs.append(f"Error parsing underlying pytest XML report: {xml_exc}")
+
+            # 4.4 Freshness check
+            if ev_timestamp:
+                try:
+                    dt = datetime.datetime.fromisoformat(ev_timestamp)
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=datetime.timezone.utc)
+                    if (dt - now).total_seconds() > 300:
+                        ev_ok = False
+                        ev_errs.append(f"Pytest evidence execution timestamp is in the future: {ev_timestamp}")
+                    elif (now - dt).total_seconds() > 86400:
+                        ev_ok = False
+                        ev_errs.append(f"Stale pytest evidence: timestamp {ev_timestamp} is older than 24 hours")
+                except Exception:
+                    ev_ok = False
+                    ev_errs.append(f"Invalid execution_timestamp_utc format in regression evidence: {ev_timestamp}")
+            else:
                 ev_ok = False
-                ev_errs.append(f"Regression tests reported zero passed tests ({passed_cnt})")
+                ev_errs.append("Regression evidence missing required execution_timestamp_utc")
+
             if ev_status != "PASS":
                 ev_ok = False
                 ev_errs.append(f"Regression test evidence status is not PASS ('{ev_status}')")
@@ -438,6 +623,7 @@ def evaluate_technical_integrity(
                     "checksum_sha256": ev_sha256,
                     "backend_sha": ev_sha,
                     "summary": ev_summary,
+                    "xml_verified": True,
                 }
             else:
                 checks["regression_test_evidence"] = {
@@ -450,7 +636,7 @@ def evaluate_technical_integrity(
             checks["regression_test_evidence"] = {"status": "FAIL", "error": str(exc)}
             errors.append(f"Invalid regression test evidence JSON: {exc}")
 
-    # 5. Cross-layer financial reconciliation report ingestion (WP06-01.3 & WP06-04)
+    # 5. Cross-layer financial reconciliation report ingestion & deep integrity (WP06-R01)
     if not reconciliation_summary_path or not reconciliation_summary_path.is_file():
         checks["cross_layer_reconciliation_evidence"] = {
             "status": "BLOCKED",
@@ -466,10 +652,36 @@ def evaluate_technical_integrity(
             recon_level = recon_content.get("reconciliation_level")
             recon_eligible = recon_content.get("formal_acceptance_eligible")
             recon_browser_status = recon_content.get("browser_status")
-            recon_sha = recon_content.get("backend_sha")
+            recon_b_sha = recon_content.get("backend_sha")
+            recon_f_sha = recon_content.get("frontend_sha")
             recon_db = recon_content.get("database")
-            recon_invariants = recon_content.get("invariants", {})
+            recon_env = recon_content.get("environment")
+            recon_run_id = recon_content.get("run_id")
+            recon_run_start = recon_content.get("run_start_utc")
+            recon_invariants = recon_content.get("invariants")
+            recon_metrics = recon_content.get("metrics")
+            recon_comparisons = recon_content.get("comparisons")
+            recon_override = recon_content.get("is_synthetic_override")
 
+            recon_ok = True
+            recon_errs = []
+
+            # 5.1 Required source revisions (WP06-R01.1, WP06-R01.2)
+            if not recon_b_sha or recon_b_sha == "UNKNOWN" or not recon_f_sha or recon_f_sha == "UNKNOWN":
+                recon_ok = False
+                recon_errs.append(
+                    f"Reconciliation evidence missing required backend_sha ('{recon_b_sha}') "
+                    f"or frontend_sha ('{recon_f_sha}') source revision."
+                )
+            else:
+                if recon_b_sha != backend_sha:
+                    recon_ok = False
+                    recon_errs.append(f"Reconciliation report backend SHA mismatch: report has '{recon_b_sha}', current is '{backend_sha}'")
+                if recon_f_sha != frontend_sha:
+                    recon_ok = False
+                    recon_errs.append(f"Reconciliation report frontend SHA mismatch: report has '{recon_f_sha}', current is '{frontend_sha}'")
+
+            # 5.2 Status, level, browser execution, formal acceptance, no override (WP06-R01.3)
             if (
                 recon_status == "PARTIAL_FOUR_SOURCE"
                 or recon_level == "PARTIAL_FOUR_SOURCE"
@@ -485,56 +697,147 @@ def evaluate_technical_integrity(
                 blocked_reasons.append(
                     "Cross-layer reconciliation is partial four-source; live Playwright UI verification was not executed."
                 )
+                recon_ok = False
+            elif recon_override is True or recon_browser_status == "TEST_OVERRIDE" or recon_eligible is False:
+                recon_ok = False
+                recon_errs.append(
+                    f"Synthetic test browser override detected (override={recon_override}, browser={recon_browser_status}, eligible={recon_eligible}). "
+                    f"Test-only overrides cannot be accepted for formal release candidate verification."
+                )
             elif (
-                recon_browser_status == "TEST_OVERRIDE"
-                or recon_content.get("is_synthetic_override")
-                or recon_eligible is False
+                recon_status != "PASS"
+                or recon_level != "FULL_FIVE_SOURCE"
+                or recon_browser_status != "PASS"
+                or recon_eligible is not True
+                or recon_override is not False
             ):
-                checks["cross_layer_reconciliation_evidence"] = {
-                    "status": "FAIL",
-                    "checksum_sha256": recon_sha256,
-                    "reconciliation_level": recon_level,
-                    "browser_status": recon_browser_status,
-                    "detail": "Synthetic test browser override detected. Test-only overrides cannot be accepted for formal release candidate verification.",
-                }
-                errors.append("Reconciliation report contains synthetic test browser override.")
-            elif recon_status != "PASS" or recon_level != "FULL_FIVE_SOURCE":
-                checks["cross_layer_reconciliation_evidence"] = {
-                    "status": "FAIL",
-                    "checksum_sha256": recon_sha256,
-                    "reconciliation_level": recon_level,
-                    "status_found": recon_status,
-                }
-                errors.append(f"Reconciliation report status '{recon_status}' / level '{recon_level}' is not accepted.")
-            else:
-                recon_errs = []
-                if recon_sha and recon_sha != "UNKNOWN" and recon_sha != backend_sha:
-                    recon_errs.append(
-                        f"Reconciliation report backend SHA mismatch: report has '{recon_sha}', current is '{backend_sha}'"
-                    )
-                if recon_db and pg_database_name != "unknown" and recon_db != pg_database_name:
-                    recon_errs.append(
-                        f"Reconciliation report database mismatch: report has '{recon_db}', current is '{pg_database_name}'"
-                    )
-                if not all(recon_invariants.values()):
-                    failed_invs = [k for k, v in recon_invariants.items() if not v]
-                    recon_errs.append(f"Reconciliation invariants failed: {failed_invs}")
+                recon_ok = False
+                recon_errs.append(
+                    f"Reconciliation evidence invalid: status='{recon_status}', level='{recon_level}', "
+                    f"browser='{recon_browser_status}', eligible='{recon_eligible}', override='{recon_override}'"
+                )
 
-                if not recon_errs:
-                    checks["cross_layer_reconciliation_evidence"] = {
-                        "status": "PASS",
-                        "checksum_sha256": recon_sha256,
-                        "reconciliation_level": recon_level,
-                        "formal_acceptance_eligible": True,
-                        "verified_sources": recon_content.get("verified_sources", []),
-                    }
-                else:
-                    checks["cross_layer_reconciliation_evidence"] = {
-                        "status": "FAIL",
-                        "checksum_sha256": recon_sha256,
-                        "errors": recon_errs,
-                    }
-                    errors.extend(recon_errs)
+            # 5.3 All 5 source identities (WP06-R01.4)
+            verified_srcs = recon_content.get("verified_sources") or []
+            unverified_srcs = recon_content.get("unverified_sources") or []
+            if set(verified_srcs) != set(EXPECTED_RECONCILIATION_SOURCES) or len(unverified_srcs) > 0:
+                recon_ok = False
+                recon_errs.append(
+                    f"Reconciliation verified sources mismatch: expected {sorted(EXPECTED_RECONCILIATION_SOURCES)}, "
+                    f"got {sorted(verified_srcs)} (unverified: {unverified_srcs})"
+                )
+
+            # 5.4 Comparisons and zero delta verification (WP06-R01.5, WP06-R01.7)
+            if not isinstance(recon_comparisons, dict) or not recon_comparisons:
+                recon_ok = False
+                recon_errs.append("Reconciliation comparisons dictionary is empty or missing")
+            else:
+                for comp_metric in EXPECTED_RECONCILIATION_COMPARISONS:
+                    if comp_metric not in recon_comparisons:
+                        recon_ok = False
+                        recon_errs.append(f"Reconciliation comparisons missing required financial metric: '{comp_metric}'")
+                    else:
+                        c_data = recon_comparisons[comp_metric]
+                        raw_delta = str(c_data.get("max_delta", ""))
+                        try:
+                            delta_dec = Decimal(raw_delta)
+                            if delta_dec != Decimal("0.00"):
+                                recon_ok = False
+                                recon_errs.append(f"Non-zero delta for comparison '{comp_metric}': ₹{delta_dec}")
+                        except Exception:
+                            recon_ok = False
+                            recon_errs.append(f"Invalid max_delta for comparison '{comp_metric}': '{raw_delta}'")
+
+            # 5.5 Invariants verification (WP06-R01.5, WP06-R01.6)
+            if not isinstance(recon_invariants, dict) or not recon_invariants:
+                recon_ok = False
+                recon_errs.append("Reconciliation invariants dictionary is empty or missing")
+            else:
+                for inv_key in EXPECTED_RECONCILIATION_INVARIANTS:
+                    if inv_key not in recon_invariants:
+                        recon_ok = False
+                        recon_errs.append(f"Reconciliation missing required statutory invariant: '{inv_key}'")
+                    else:
+                        val = recon_invariants[inv_key]
+                        if type(val) is not bool or val is not True:
+                            recon_ok = False
+                            recon_errs.append(f"Reconciliation invariant '{inv_key}' is not True boolean (got {val})")
+
+            # 5.6 Reconciliation totals vs. independently calculated PostgreSQL totals (WP06-R01.8)
+            if not isinstance(recon_metrics, dict) or not recon_metrics:
+                recon_ok = False
+                recon_errs.append("Reconciliation metrics dictionary is empty or missing")
+            else:
+                expected_pg_matches = [
+                    ("invoiced_gross", str(total_invoiced_gross)),
+                    ("exclusive_amount", str(total_exclusive)),
+                    ("tax_amount", str(total_tax)),
+                    ("cash_received", str(total_cash)),
+                    ("tds_deducted", str(total_tds)),
+                    ("total_settled", str(total_invoice_settled)),
+                    ("total_outstanding", str(total_invoice_outstanding)),
+                    ("unbilled_recognized_ar", "0.00"),
+                ]
+                for metric_name, expected_db_val in expected_pg_matches:
+                    actual_recon_val = str(recon_metrics.get(metric_name, ""))
+                    try:
+                        if Decimal(actual_recon_val) != Decimal(expected_db_val):
+                            recon_ok = False
+                            recon_errs.append(
+                                f"Reconciliation totals inconsistent with PostgreSQL database for '{metric_name}': "
+                                f"recon={actual_recon_val} != db={expected_db_val}"
+                            )
+                    except Exception:
+                        recon_ok = False
+                        recon_errs.append(f"Invalid metric value in reconciliation report for '{metric_name}': '{actual_recon_val}'")
+
+            # 5.7 Database and environment identity (WP06-R01.9)
+            if recon_db != pg_database_name:
+                recon_ok = False
+                recon_errs.append(f"Reconciliation report database mismatch: report has '{recon_db}', current is '{pg_database_name}'")
+            if recon_env != env_mode:
+                recon_ok = False
+                recon_errs.append(f"Reconciliation report environment mismatch: report has '{recon_env}', current is '{env_mode}'")
+
+            # 5.8 Current-run evidence identity and freshness (WP06-R01.10)
+            if not recon_run_id or not isinstance(recon_run_id, str):
+                recon_ok = False
+                recon_errs.append("Reconciliation report missing valid run_id")
+            if recon_run_start:
+                try:
+                    r_dt = datetime.datetime.fromisoformat(recon_run_start)
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    if r_dt.tzinfo is None:
+                        r_dt = r_dt.replace(tzinfo=datetime.timezone.utc)
+                    if (r_dt - now).total_seconds() > 300:
+                        recon_ok = False
+                        recon_errs.append(f"Reconciliation report timestamp is in the future: {recon_run_start}")
+                    elif (now - r_dt).total_seconds() > 86400:
+                        recon_ok = False
+                        recon_errs.append(f"Stale reconciliation report: timestamp {recon_run_start} is older than 24 hours")
+                except Exception:
+                    recon_ok = False
+                    recon_errs.append(f"Invalid run_start_utc format in reconciliation report: {recon_run_start}")
+            else:
+                recon_ok = False
+                recon_errs.append("Reconciliation report missing required run_start_utc")
+
+            if recon_ok:
+                checks["cross_layer_reconciliation_evidence"] = {
+                    "status": "PASS",
+                    "checksum_sha256": recon_sha256,
+                    "reconciliation_level": recon_level,
+                    "formal_acceptance_eligible": True,
+                    "verified_sources": verified_srcs,
+                }
+            elif "cross_layer_reconciliation_evidence" not in checks:
+                checks["cross_layer_reconciliation_evidence"] = {
+                    "status": "FAIL",
+                    "checksum_sha256": recon_sha256,
+                    "errors": recon_errs,
+                }
+                errors.extend(recon_errs)
+
         except Exception as exc:
             checks["cross_layer_reconciliation_evidence"] = {"status": "FAIL", "error": str(exc)}
             errors.append(f"Invalid reconciliation summary JSON: {exc}")
@@ -591,17 +894,14 @@ def evaluate_business_authorization(
         evidence_hashes["CHECKLIST"] = compute_file_sha256(chk_path)
 
     # 4. External Corporate Finance Approval Source
-    # Currently no external PKI / governance service is integrated
     checks["external_finance_approval_service"] = {
         "status": "BLOCKED",
         "detail": "Corporate Finance Directorate approval service / signed order not integrated (AWAITING_FINANCE_APPROVAL).",
     }
 
-    # Business verdict determination
     if any(s == "FAIL" for s in (bpd01_status, bpd02_status, chk_status)):
         verdict = "FAIL"
     else:
-        # Expected state: all documents are AWAITING_FINANCE_APPROVAL -> BLOCKED
         verdict = "BLOCKED"
 
     return verdict, {"checks": checks, "evidence_hashes": evidence_hashes}, errors
@@ -620,6 +920,17 @@ def verify_financial_readiness(
     timestamp_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
     expected_b_sha = expected_backend_sha or os.environ.get("COLLECTFLOW_EXPECTED_BACKEND_SHA")
     expected_f_sha = expected_frontend_sha or os.environ.get("COLLECTFLOW_EXPECTED_FRONTEND_SHA")
+
+    # 0. Repository identity verification (WP06-R03.3)
+    repo_identity_errors: List[str] = []
+    try:
+        verify_repository_identity(backend_dir, "collectflow")
+    except Exception as exc:
+        repo_identity_errors.append(str(exc))
+    try:
+        verify_repository_identity(frontend_dir, "cash-flow-buddy-101")
+    except Exception as exc:
+        repo_identity_errors.append(str(exc))
 
     # Resolve git commit SHAs (fail closed if invalid/unresolvable, WP06-03)
     sha_resolution_error = None
@@ -648,15 +959,22 @@ def verify_financial_readiness(
     print("=" * 110)
 
     # 1. Technical Evaluation
-    if sha_resolution_error:
+    if sha_resolution_error or repo_identity_errors:
         tech_verdict = "FAIL"
+        tech_errors = []
+        if sha_resolution_error:
+            tech_errors.append(sha_resolution_error)
+        tech_errors.extend(repo_identity_errors)
         tech_checks = {
             "source_sha_resolution": {
-                "status": "FAIL",
+                "status": "FAIL" if sha_resolution_error else "PASS",
                 "error": sha_resolution_error,
-            }
+            },
+            "repository_identity": {
+                "status": "FAIL" if repo_identity_errors else "PASS",
+                "errors": repo_identity_errors,
+            },
         }
-        tech_errors = [sha_resolution_error]
         tech_blocked: List[str] = []
         dataset_classification = "unverified_repository"
     else:
@@ -670,12 +988,13 @@ def verify_financial_readiness(
             reconciliation_summary_path=reconciliation_summary,
             allow_production_review=allow_production_review,
         )
+        tech_checks["repository_identity"] = {"status": "PASS", "verified": True}
         dataset_classification = tech_checks.get("dataset_classification", "synthetic_postgresql_isolated_test")
 
     print(f"\n[1] Technical Financial Integrity Gate: {tech_verdict}")
     for k, v in tech_checks.items():
         if isinstance(v, dict):
-            print(f"    - {k:<34}: {v.get('status')}")
+            print(f"    - {k:<36}: {v.get('status')}")
     if tech_errors:
         for err in tech_errors:
             print(f"      ERROR: {err}")
@@ -687,17 +1006,12 @@ def verify_financial_readiness(
     biz_verdict, biz_data, biz_errors = evaluate_business_authorization(backend_dir)
     print(f"\n[2] Corporate Business Authorization Gate: {biz_verdict}")
     for k, v in biz_data.get("checks", {}).items():
-        print(f"    - {k:<34}: {v.get('status')}")
+        print(f"    - {k:<36}: {v.get('status')}")
     if biz_errors:
         for err in biz_errors:
             print(f"      NOTICE: {err}")
 
     # 3. Overall Release Readiness Determination
-    # Rules:
-    # - If technical integrity FAIL -> Overall FAIL
-    # - If technical integrity BLOCKED -> Overall BLOCKED
-    # - If technical integrity PASS and business authorization BLOCKED -> Overall BLOCKED
-    # - If both PASS -> Overall PASS
     if tech_verdict == "FAIL" or biz_verdict == "FAIL":
         overall_status = "FAIL"
         recommendation = "NEEDS ATTENTION"
@@ -726,6 +1040,8 @@ def verify_financial_readiness(
         "execution_timestamp_utc": timestamp_utc,
         "backend_sha": backend_sha,
         "frontend_sha": frontend_sha,
+        "expected_backend_sha": expected_b_sha,
+        "expected_frontend_sha": expected_f_sha,
         "dataset_classification": dataset_classification,
         "technical_financial_integrity": {
             "verdict": tech_verdict,
@@ -778,7 +1094,7 @@ def main():
     parser.add_argument(
         "--allow-production-review",
         action="store_true",
-        help="Authorize read-only review against production/staging dataset",
+        help="Attempt review against production/staging dataset (rejected fail-closed)",
     )
     parser.add_argument("--output", type=Path, default=None, help="Output JSON path for report")
     args = parser.parse_args()
@@ -800,10 +1116,8 @@ def main():
     if overall == "PASS":
         sys.exit(0)
     elif overall == "BLOCKED" and tech == "PASS":
-        # Technical PASS, Business BLOCKED (software ready, waiting on external Finance approval)
         sys.exit(2)
     else:
-        # Technical FAIL or BLOCKED
         sys.exit(1)
 
 
