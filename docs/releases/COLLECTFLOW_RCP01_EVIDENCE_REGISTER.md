@@ -5,8 +5,8 @@
 This Evidence Register documents the complete inventory of verifiable, machine-readable artifacts generated during the Release Candidate preflight execution for **RC-20261020-01** following security and preflight remediation.
 
 Every artifact listed below is bound to the frozen source commits of both repositories:
-- Backend (`collectflow`): `<BACKEND_FROZEN_SHA>`
-- Frontend (`cash-flow-buddy-101`): `<FRONTEND_FROZEN_SHA>`
+- Backend (`collectflow`): `2193ab4cc490ab9f48545e9b1536454a08aaf343`
+- Frontend (`cash-flow-buddy-101`): `5e5dcefc7f001fc0150c37b3c8b04f2b70de783c`
 
 All artifacts are hashed using SHA-256 and indexed in the master manifest [`artifacts/rcp01/rcp01_release_evidence_manifest.json`](file:///home/anishb/projects/personal/collectflow/artifacts/rcp01/rcp01_release_evidence_manifest.json).
 
@@ -18,8 +18,8 @@ All artifacts are hashed using SHA-256 and indexed in the master manifest [`arti
 | :--- | :--- |
 | **Manifest Identifier** | `COLLECTFLOW_RCP01_RELEASE_EVIDENCE_INDEX` |
 | **Release Candidate ID** | `RC-20261020-01` |
-| **Backend Commit SHA** | `<BACKEND_FROZEN_SHA>` |
-| **Frontend Commit SHA** | `<FRONTEND_FROZEN_SHA>` |
+| **Backend Commit SHA** | `2193ab4cc490ab9f48545e9b1536454a08aaf343` |
+| **Frontend Commit SHA** | `5e5dcefc7f001fc0150c37b3c8b04f2b70de783c` |
 | **Branch (Both Repos)** | `feature/rcp01-security-evidence-remediation` |
 | **Backend Ancestor** | `12582f7abb3c391e2d80d61ada179629d7825eac` (WP-06 Accepted) |
 | **Frontend Ancestor** | `c6fc51a75135b0343d9c7ad90a80ba5fb5b61260` (WP-06 Accepted) |
@@ -61,8 +61,8 @@ Verify the master manifest against disk artifacts and expected Git revisions:
 ```bash
 python3 scripts/release/run_rcp01_preflight.py \
   --verify-manifest artifacts/rcp01/rcp01_release_evidence_manifest.json \
-  --expected-backend-sha <BACKEND_FROZEN_SHA> \
-  --expected-frontend-sha <FRONTEND_FROZEN_SHA>
+  --expected-backend-sha 2193ab4cc490ab9f48545e9b1536454a08aaf343 \
+  --expected-frontend-sha 5e5dcefc7f001fc0150c37b3c8b04f2b70de783c
 ```
 
 ### 4.2 Full Unit and Negative Test Suite

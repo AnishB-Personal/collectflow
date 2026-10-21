@@ -60,6 +60,7 @@ def valid_rcp01_manifest(tmp_path: Path) -> Tuple[Path, dict]:
         "sha256": compute_file_sha256(b_aud),
         "producing_tool": "pip_audit",
         "status": "PASS",
+        "exit_code": 0,
     }
 
     # Write frontend dependency audit
@@ -70,6 +71,7 @@ def valid_rcp01_manifest(tmp_path: Path) -> Tuple[Path, dict]:
         "sha256": compute_file_sha256(f_aud),
         "producing_tool": "npm_audit",
         "status": "PASS",
+        "exit_code": 0,
     }
 
     # Write SAST report
@@ -78,6 +80,7 @@ def valid_rcp01_manifest(tmp_path: Path) -> Tuple[Path, dict]:
         "scanner_provenance": "bandit 1.8.3 and ruff 0.9.1",
         "status": "PASS",
         "bandit": {
+            "exit_code": 0,
             "high_severity_count": 0,
             "medium_severity_count": 0,
             "low_severity_count": 0,
@@ -85,6 +88,7 @@ def valid_rcp01_manifest(tmp_path: Path) -> Tuple[Path, dict]:
             "status": "PASS",
         },
         "ruff": {
+            "exit_code": 0,
             "violations_count": 0,
             "status": "PASS",
         },
@@ -105,6 +109,7 @@ def valid_rcp01_manifest(tmp_path: Path) -> Tuple[Path, dict]:
         "sha256": compute_file_sha256(bandit_raw),
         "producing_tool": "bandit 1.8.3",
         "status": "PASS",
+        "exit_code": 0,
     }
 
     ruff_raw = artifacts_dir / "ruff_raw.json"
@@ -113,6 +118,27 @@ def valid_rcp01_manifest(tmp_path: Path) -> Tuple[Path, dict]:
         "path": str(ruff_raw),
         "sha256": compute_file_sha256(ruff_raw),
         "producing_tool": "ruff 0.9.1",
+        "status": "PASS",
+        "exit_code": 0,
+    }
+
+    # Write raw Vitest report (RCP01-R05)
+    f_vitest = artifacts_dir / "frontend_vitest_report.json"
+    vitest_file_results = [{"ancestorTitles": [], "status": "passed", "name": f"test_{i}.test.ts"} for i in range(44)]
+    vitest_raw_data = {
+        "numTotalTests": 620,
+        "numPassedTests": 620,
+        "numFailedTests": 0,
+        "numPendingTests": 0,
+        "numTodoTests": 0,
+        "testResults": vitest_file_results,
+        "success": True,
+    }
+    f_vitest.write_text(json.dumps(vitest_raw_data), encoding="utf-8")
+    inventory["frontend_vitest_report_json"] = {
+        "path": str(f_vitest),
+        "sha256": compute_file_sha256(f_vitest),
+        "producing_tool": "vitest-v4.1.11",
         "status": "PASS",
     }
 
@@ -215,9 +241,13 @@ def valid_rcp01_manifest(tmp_path: Path) -> Tuple[Path, dict]:
                 "verdict": "PASS",
             },
             "frontend_vitest": {
+                "test_files_total": 44,
                 "test_files_passed": 44,
+                "test_files_failed": 0,
+                "total_tests": 620,
                 "tests_passed": 620,
                 "tests_failed": 0,
+                "tests_skipped": 0,
                 "verdict": "PASS",
             },
             "frontend_typescript": {"status": "PASS"},
@@ -683,3 +713,186 @@ def test_17_invalid_sbom_document_rejected(valid_rcp01_manifest):
     is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
     assert not is_valid
     assert any("Backend SBOM components list is missing or empty" in err for err in errors)
+
+
+def test_18_smaller_vitest_execution_cannot_represent_full_suite(valid_rcp01_manifest):
+    """Test 18: Smaller vitest execution cannot be represented as full suite (RCP01-R05)."""
+    manifest_file, manifest = valid_rcp01_manifest
+    inv = manifest["artifact_inventory"]
+    vt_path = Path(inv["frontend_vitest_report_json"]["path"])
+
+    # 1. Manifest claims 620 tests / 44 files, but raw report only executed 22 tests in 1 file
+    small_vitest = {
+        "numTotalTests": 22,
+        "numPassedTests": 22,
+        "numFailedTests": 0,
+        "numPendingTests": 0,
+        "numTodoTests": 0,
+        "testResults": [{"ancestorTitles": [], "status": "passed", "name": "single.test.ts"}],
+        "success": True,
+    }
+    vt_path.write_text(json.dumps(small_vitest), encoding="utf-8")
+    inv["frontend_vitest_report_json"]["sha256"] = compute_file_sha256(vt_path)
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Frontend vitest test counts discrepancy" in err for err in errors)
+    assert any("Frontend vitest file counts discrepancy" in err for err in errors)
+
+    # 2. Manifest accurately reports 22 tests, but fails minimum required 600 tests
+    manifest["component_ci"]["frontend_vitest"]["tests_passed"] = 22
+    manifest["component_ci"]["frontend_vitest"]["test_files_passed"] = 1
+    manifest["component_ci"]["frontend_vitest"]["test_files_total"] = 1
+    manifest["component_ci"]["frontend_vitest"]["total_tests"] = 22
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Incomplete frontend vitest regression: tests passed 22 < required minimum 600" in err for err in errors)
+
+    # 3. Raw report with test failure and success=False
+    fail_vitest = {
+        "numTotalTests": 620,
+        "numPassedTests": 619,
+        "numFailedTests": 1,
+        "numPendingTests": 0,
+        "numTodoTests": 0,
+        "testResults": [{"ancestorTitles": [], "status": "failed", "name": f"test_{i}.test.ts"} for i in range(44)],
+        "success": False,
+    }
+    vt_path.write_text(json.dumps(fail_vitest), encoding="utf-8")
+    inv["frontend_vitest_report_json"]["sha256"] = compute_file_sha256(vt_path)
+    manifest["component_ci"]["frontend_vitest"]["tests_passed"] = 619
+    manifest["component_ci"]["frontend_vitest"]["tests_failed"] = 1
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Frontend vitest did not PASS" in err for err in errors)
+    assert any("execution success=False" in err for err in errors)
+
+    # 4. Raw report with unexpected skipped tests
+    skip_vitest = {
+        "numTotalTests": 620,
+        "numPassedTests": 615,
+        "numFailedTests": 0,
+        "numPendingTests": 5,
+        "numTodoTests": 0,
+        "testResults": [{"ancestorTitles": [], "status": "passed", "name": f"test_{i}.test.ts"} for i in range(44)],
+        "success": True,
+    }
+    vt_path.write_text(json.dumps(skip_vitest), encoding="utf-8")
+    inv["frontend_vitest_report_json"]["sha256"] = compute_file_sha256(vt_path)
+    manifest["component_ci"]["frontend_vitest"]["tests_passed"] = 615
+    manifest["component_ci"]["frontend_vitest"]["tests_failed"] = 0
+    manifest["component_ci"]["frontend_vitest"]["test_files_passed"] = 44
+    manifest["component_ci"]["frontend_vitest"]["test_files_total"] = 44
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("indicates 5 unexpected skipped tests" in err for err in errors)
+
+
+def test_19_contradictory_scanner_exit_codes_and_reports_rejected(valid_rcp01_manifest):
+    """Test 19: Contradictory scanner exit codes and reports are rejected (RCP01-R06)."""
+    manifest_file, manifest = valid_rcp01_manifest
+    inv = manifest["artifact_inventory"]
+
+    # 1. pip-audit: exit 1 with 0 vulnerabilities
+    inv["backend_audit_report"]["exit_code"] = 1
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Contradictory pip-audit scanner state: exit code 1 with 0 reported vulnerabilities" in err for err in errors)
+
+    # 2. pip-audit: exit 0 with >0 vulnerabilities
+    inv["backend_audit_report"]["exit_code"] = 0
+    b_aud_path = Path(inv["backend_audit_report"]["path"])
+    b_aud_path.write_text(
+        json.dumps({"dependencies": [{"name": "urllib3", "version": "1.26.4", "vulns": [{"id": "PYSEC-2021-1"}]}]}),
+        encoding="utf-8",
+    )
+    inv["backend_audit_report"]["sha256"] = compute_file_sha256(b_aud_path)
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Contradictory pip-audit scanner state: exit code 0 with 1 reported vulnerabilities" in err for err in errors)
+
+    # Reset pip-audit
+    b_aud_path.write_text(json.dumps({"dependencies": [{"name": "fastapi", "version": "0.110.0", "vulns": []}]}), encoding="utf-8")
+    inv["backend_audit_report"]["sha256"] = compute_file_sha256(b_aud_path)
+    inv["backend_audit_report"]["exit_code"] = 0
+
+    # 3. pip-audit: execution error (exit 2)
+    inv["backend_audit_report"]["exit_code"] = 2
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("pip-audit execution error recorded: exit code 2" in err for err in errors)
+    inv["backend_audit_report"]["exit_code"] = 0
+
+    # 4. Ruff: exit 1 with 0 violations
+    sast_path = Path(inv["sast_lint_report"]["path"])
+    sast_data = json.loads(sast_path.read_text(encoding="utf-8"))
+    sast_data["ruff"]["exit_code"] = 1
+    sast_data["ruff"]["violations_count"] = 0
+    sast_path.write_text(json.dumps(sast_data), encoding="utf-8")
+    inv["sast_lint_report"]["sha256"] = compute_file_sha256(sast_path)
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Contradictory Ruff linter state: exit code 1 with 0 reported violations" in err for err in errors)
+
+    # 5. Ruff: exit 0 with >0 violations
+    sast_data["ruff"]["exit_code"] = 0
+    sast_data["ruff"]["violations_count"] = 3
+    sast_path.write_text(json.dumps(sast_data), encoding="utf-8")
+    inv["sast_lint_report"]["sha256"] = compute_file_sha256(sast_path)
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Contradictory Ruff linter state: exit code 0 with 3 reported violations" in err for err in errors)
+
+    # 6. Ruff: execution error (exit 2)
+    sast_data["ruff"]["exit_code"] = 2
+    sast_data["ruff"]["violations_count"] = 0
+    sast_path.write_text(json.dumps(sast_data), encoding="utf-8")
+    inv["sast_lint_report"]["sha256"] = compute_file_sha256(sast_path)
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Ruff execution error recorded: exit code 2" in err for err in errors)
+    sast_data["ruff"]["exit_code"] = 0
+    sast_data["ruff"]["violations_count"] = 0
+
+    # 7. Bandit: exit 1 with 0 findings
+    sast_data["bandit"]["exit_code"] = 1
+    sast_data["bandit"]["total_findings"] = 0
+    sast_path.write_text(json.dumps(sast_data), encoding="utf-8")
+    inv["sast_lint_report"]["sha256"] = compute_file_sha256(sast_path)
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Contradictory Bandit scanner state: exit code 1 with 0 reported findings" in err for err in errors)
+
+    # 8. Bandit: exit 0 with >0 findings
+    sast_data["bandit"]["exit_code"] = 0
+    sast_data["bandit"]["total_findings"] = 2
+    sast_path.write_text(json.dumps(sast_data), encoding="utf-8")
+    inv["sast_lint_report"]["sha256"] = compute_file_sha256(sast_path)
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Contradictory Bandit scanner state: exit code 0 with 2 reported findings" in err for err in errors)
+
+    # 9. Bandit: execution error (exit 2)
+    sast_data["bandit"]["exit_code"] = 2
+    sast_data["bandit"]["total_findings"] = 0
+    sast_path.write_text(json.dumps(sast_data), encoding="utf-8")
+    inv["sast_lint_report"]["sha256"] = compute_file_sha256(sast_path)
+    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    is_valid, errors = verify_rcp01_evidence_manifest(manifest_file, check_disk_files=True)
+    assert not is_valid
+    assert any("Bandit execution error recorded: exit code 2" in err for err in errors)

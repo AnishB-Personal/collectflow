@@ -14,8 +14,8 @@ All automated technical release candidate gates have been verified against froze
 
 | Repository | Remote Branch | Verified Frozen Commit SHA | Accepted WP-06 Ancestor | Working Tree State |
 | :--- | :--- | :--- | :--- | :--- |
-| **Backend (`collectflow`)** | `feature/rcp01-security-evidence-remediation` | `<BACKEND_FROZEN_SHA>` | `12582f7abb3c391e2d80d61ada179629d7825eac` | Clean (0 uncommitted/untracked) |
-| **Frontend (`cash-flow-buddy-101`)** | `feature/rcp01-security-evidence-remediation` | `<FRONTEND_FROZEN_SHA>` | `c6fc51a75135b0343d9c7ad90a80ba5fb5b61260` | Clean (0 uncommitted/untracked) |
+| **Backend (`collectflow`)** | `feature/rcp01-security-evidence-remediation` | `2193ab4cc490ab9f48545e9b1536454a08aaf343` | `12582f7abb3c391e2d80d61ada179629d7825eac` | Clean (0 uncommitted/untracked) |
+| **Frontend (`cash-flow-buddy-101`)** | `feature/rcp01-security-evidence-remediation` | `5e5dcefc7f001fc0150c37b3c8b04f2b70de783c` | `c6fc51a75135b0343d9c7ad90a80ba5fb5b61260` | Clean (0 uncommitted/untracked) |
 
 Ancestry verification was established via `git merge-base --is-ancestor` for both repositories.
 
@@ -72,8 +72,8 @@ Ancestry verification was established via `git merge-base --is-ancestor` for bot
 | **Frontend CycloneDX SBOM** | `scripts/ci/generate_sbom.py` (spec v1.5) | Full transitive package graph (valid CycloneDX format) | `artifacts/rcp01/collectflow-frontend-sbom.json` | N/A | **PASS** |
 
 ### 4.3 Container Image Publication & Boundary Enforcement
-- **Backend Image:** `collectflow-backend:<BACKEND_FROZEN_SHA>`
-- **Frontend Image:** `collectflow-frontend:<FRONTEND_FROZEN_SHA>`
+- **Backend Image:** `collectflow-backend:2193ab4cc490ab9f48545e9b1536454a08aaf343`
+- **Frontend Image:** `collectflow-frontend:5e5dcefc7f001fc0150c37b3c8b04f2b70de783c`
 - **Publication Policy:** `publication_disabled: True`, `publication_status: DISABLED_BY_DEFAULT`.
 - Zero images published to external registries (GHCR/ECR) during preflight.
 
@@ -103,23 +103,28 @@ Execution of `scripts/release/run_financial_acceptance_pipeline.py` against Post
 
 **Technical Financial Integrity Verdict:** **PASS** (Zero delta across all 10 metrics across all 5 verification layers).
 
-### 5.1 Historical Prototype Mock vs. Authoritative WP-06 Baseline Reconciliation (RCP01-R04)
+### 5.1 Historical Prototype Mock vs. Authoritative WP-06 Baseline Reconciliation (RCP01-R04 / RCP01-R07)
 
-An earlier preflight documentation draft displayed a ₹4,25,000.00 total derived from an unseeded initial client mock prototype.
+An earlier preflight documentation draft displayed a ₹4,25,000.00 total derived from an unseeded initial client mock prototype. Additionally, a previous report draft referenced a hypothetical 4-invoice prototype sequence (`INV-2026-001` to `004`).
 
-The authoritative WP-06 financial reconciliation baseline is established by `seed_postgres_fixtures.py` and strictly validated by `scripts/release/run_financial_acceptance_pipeline.py`. The composition is:
-- **Authoritative Invoiced Gross:** ₹5,31,000.00 across 4 statutory invoices:
-  - INV-2026-001: ₹1,18,000.00 (₹1,00,000.00 taxable + ₹18,000.00 GST)
-  - INV-2026-002: ₹1,77,000.00 (₹1,50,000.00 taxable + ₹27,000.00 GST)
-  - INV-2026-003: ₹1,18,000.00 (₹1,00,000.00 taxable + ₹18,000.00 GST)
-  - INV-2026-004: ₹1,18,000.00 (₹1,00,000.00 taxable + ₹18,000.00 GST)
-- **Authoritative Tax Breakdown:** ₹4,50,000.00 taxable exclusive + ₹81,000.00 GST at statutory 18% rate.
-- **Authoritative Settlements:** ₹2,00,000.00 cash payments received + ₹9,000.00 TDS deducted (total settled = ₹2,09,000.00).
-- **Authoritative Net AR Outstanding:** ₹3,22,000.00.
-- **Authoritative Unbilled PO Backlog:** ₹2,95,000.00; Unbilled Recognized AR: ₹0.00.
-- **Authoritative Annual Target:** ₹75,00,000.00.
+The authoritative WP-06 and RCP-01 financial reconciliation baseline is established by `scripts/seed_postgres_fixtures.py` and strictly validated by `scripts/release/run_financial_acceptance_pipeline.py`. The genuine dataset composition is:
+- **Authoritative Direct Commercial Invoice:** `INV-2026-042` (Acme Cloud Solutions Pvt Ltd, issued 2026-04-12, due 2026-05-12):
+  - Invoiced Gross Amount: ₹5,31,000.00
+  - Taxable Exclusive Base: ₹4,50,000.00
+  - GST Tax Amount: ₹81,000.00 (CGST ₹40,500.00 + SGST ₹40,500.00 at statutory 18% rate)
+  - Lifecycle Status: `ISSUED`
+- **Authoritative Payment Settlement:** Remittance `REM-2026-001` (recorded 2026-04-25 via NEFT):
+  - Cash Received: ₹2,00,000.00
+  - TDS Deducted: ₹9,000.00 (under Section 194C)
+  - Total Net Settled: ₹2,09,000.00
+- **Authoritative Net AR Outstanding:** ₹3,22,000.00 (₹5,31,000.00 gross − ₹2,09,000.00 settled).
+- **Authoritative Decoupled Backlog:** Purchase Order `PO-NEXUS-881` (Gross ₹2,95,000.00 = Taxable ₹2,50,000.00 + Tax ₹45,000.00), decoupled from direct invoice `INV-2026-042`:
+  - Unbilled PO Backlog: ₹2,95,000.00
+  - Unbilled Recognized AR: ₹0.00
+- **Authoritative Cancelled Audit Trail Baseline:** Invoice `INV-2026-REV-001` (Taxable ₹1,00,000.00 + Tax ₹18,000.00 = Gross ₹1,18,000.00) with paired payment/reversal (+₹52,500.00 / -₹52,500.00) and status `CANCELLED` (net ₹0.00 impact on active AR and revenue).
+- **Authoritative Annual Sales Target:** FY 2026-27 target for `sandbox_sales`: ₹75,00,000.00.
 
-All 5 sources (PostgreSQL, REST API, UI DOM, XLSX, and CSV) are mathematically reconciled to these exact figures with ₹0.00 discrepancy.
+All 5 verification layers (PostgreSQL, REST API, UI DOM, XLSX, and CSV) are mathematically reconciled to these exact figures with ₹0.00 discrepancy across all 10 tracked metrics.
 
 ---
 

@@ -3,8 +3,8 @@
 ## 1. Release Candidate Identity & Baseline
 
 - **Release Candidate ID:** `RC-20261020-01`
-- **Backend Branch & SHA:** `feature/rcp01-security-evidence-remediation` @ `<BACKEND_FROZEN_SHA>`
-- **Frontend Branch & SHA:** `feature/rcp01-security-evidence-remediation` @ `<FRONTEND_FROZEN_SHA>`
+- **Backend Branch & SHA:** `feature/rcp01-security-evidence-remediation` @ `2193ab4cc490ab9f48545e9b1536454a08aaf343`
+- **Frontend Branch & SHA:** `feature/rcp01-security-evidence-remediation` @ `5e5dcefc7f001fc0150c37b3c8b04f2b70de783c`
 - **Accepted WP-06 Ancestors:**
   - Backend: `12582f7abb3c391e2d80d61ada179629d7825eac` (WP-06 Accepted)
   - Frontend: `c6fc51a75135b0343d9c7ad90a80ba5fb5b61260` (WP-06 Accepted)

@@ -384,6 +384,7 @@ def verify_rcp01_evidence_manifest(
     required_artifacts = [
         "backend_pytest_report_xml",
         "backend_test_evidence_json",
+        "frontend_vitest_report_json",
         "frontend_test_summary_json",
         "secret_scan_report_json",
         "backend_cyclonedx_sbom",
@@ -455,6 +456,42 @@ def verify_rcp01_evidence_manifest(
     f_vt = ci.get("frontend_vitest", {})
     if f_vt.get("verdict") != "PASS" or f_vt.get("tests_failed", 1) != 0:
         errors.append(f"Frontend vitest did not PASS: verdict={f_vt.get('verdict')}, failed={f_vt.get('tests_failed')}")
+    if f_vt.get("tests_passed", 0) < 600:
+        errors.append(f"Incomplete frontend vitest regression: tests passed {f_vt.get('tests_passed')} < required minimum 600")
+
+    # Reconcile frontend test counts against underlying raw Vitest JSON report (RCP01-R05)
+    vt_art = inv.get("frontend_vitest_report_json")
+    if vt_art and check_disk_files:
+        vt_path = Path(vt_art.get("path", ""))
+        if vt_path.is_file():
+            try:
+                vt_raw = json.loads(vt_path.read_text(encoding="utf-8"))
+                raw_total = vt_raw.get("numTotalTests", 0)
+                raw_pass = vt_raw.get("numPassedTests", 0)
+                raw_fail = vt_raw.get("numFailedTests", 0)
+                raw_pending = vt_raw.get("numPendingTests", 0) + vt_raw.get("numTodoTests", 0)
+                raw_test_results = vt_raw.get("testResults", [])
+                raw_files_total = len(raw_test_results)
+                raw_files_passed = sum(1 for f in raw_test_results if f.get("status") == "passed")
+
+                if f_vt.get("tests_passed") != raw_pass or f_vt.get("tests_failed") != raw_fail:
+                    errors.append(
+                        f"Frontend vitest test counts discrepancy: manifest claims ({f_vt.get('tests_passed')} passed, {f_vt.get('tests_failed')} failed), "
+                        f"but actual raw Vitest report records ({raw_pass} passed, {raw_fail} failed)."
+                    )
+                if f_vt.get("test_files_passed") != raw_files_passed or f_vt.get("test_files_total") != raw_files_total:
+                    errors.append(
+                        f"Frontend vitest file counts discrepancy: manifest claims ({f_vt.get('test_files_passed')} passed files of {f_vt.get('test_files_total')}), "
+                        f"but actual raw Vitest report has ({raw_files_passed} passed files of {raw_files_total})."
+                    )
+                if not vt_raw.get("success", False):
+                    errors.append("Frontend raw Vitest report indicates execution success=False.")
+                if raw_total == 0:
+                    errors.append("Frontend raw Vitest report indicates zero total tests executed.")
+                if raw_pending > 0:
+                    errors.append(f"Frontend raw Vitest report indicates {raw_pending} unexpected skipped tests.")
+            except Exception as e:
+                errors.append(f"Failed to inspect raw frontend Vitest report: {e}")
 
     f_ts = ci.get("frontend_typescript", {})
     if f_ts.get("status") != "PASS":
@@ -527,7 +564,7 @@ def verify_rcp01_evidence_manifest(
     if aws.get("compliant_count", 0) == aws.get("criteria_count", 12):
         errors.append("AWS readiness cannot claim 12/12 compliance when Terraform/IaC and account isolation boundaries are not implemented.")
 
-    # 9. Supply chain anti-fabrication and false-zero checks (RCP01-F02)
+    # 9. Supply chain anti-fabrication, false-zero, and scanner consistency checks (RCP01-F02, RCP01-R06)
     sec_findings = data.get("security_findings", {})
     b_audit_info = inv.get("backend_audit_report")
     if b_audit_info and check_disk_files:
@@ -542,6 +579,14 @@ def verify_rcp01_evidence_manifest(
                     act_vulns = sum(len(d.get("vulns", [])) for d in deps)
                     if act_vulns > 0 and sec_findings.get("dependency_vulnerabilities", {}).get("status") == "PASS":
                         errors.append(f"Backend audit records {act_vulns} active vulnerabilities but manifest claimed PASS (false-zero detected).")
+                    pip_exit = b_audit_info.get("exit_code")
+                    if pip_exit is not None:
+                        if pip_exit == 0 and act_vulns > 0:
+                            errors.append(f"Contradictory pip-audit scanner state: exit code 0 with {act_vulns} reported vulnerabilities.")
+                        elif pip_exit == 1 and act_vulns == 0:
+                            errors.append("Contradictory pip-audit scanner state: exit code 1 with 0 reported vulnerabilities.")
+                        elif pip_exit not in (0, 1):
+                            errors.append(f"pip-audit execution error recorded: exit code {pip_exit}.")
             except Exception as e:
                 errors.append(f"Malformed backend dependency audit evidence: {e}")
 
@@ -556,12 +601,21 @@ def verify_rcp01_evidence_manifest(
                     errors.append("Frontend dependency audit evidence is an empty placeholder (missing 'metadata.vulnerabilities').")
                 else:
                     act_high_crit = meta_v.get("high", 0) + meta_v.get("critical", 0)
+                    act_total_npm = meta_v.get("total", 0)
                     if act_high_crit > 0 and sec_findings.get("dependency_vulnerabilities", {}).get("status") == "PASS":
                         errors.append(f"Frontend audit records {act_high_crit} high/critical vulnerabilities but manifest claimed PASS (false-zero detected).")
+                    npm_exit = f_audit_info.get("exit_code")
+                    if npm_exit is not None:
+                        if npm_exit == 0 and act_high_crit > 0:
+                            errors.append(f"Contradictory npm audit scanner state: exit code 0 with {act_high_crit} HIGH/CRITICAL vulnerabilities.")
+                        elif npm_exit != 0 and act_total_npm == 0:
+                            errors.append("Contradictory npm audit scanner state: nonzero exit code with 0 total vulnerabilities reported.")
             except Exception as e:
                 errors.append(f"Malformed frontend dependency audit evidence: {e}")
 
     sast_info = inv.get("sast_lint_report")
+    bandit_raw_info = inv.get("bandit_raw_report")
+    ruff_raw_info = inv.get("ruff_raw_report")
     if sast_info and check_disk_files:
         sast_path = Path(sast_info.get("path", ""))
         if sast_path.is_file():
@@ -571,13 +625,41 @@ def verify_rcp01_evidence_manifest(
                     errors.append("SAST report is missing tool execution provenance.")
                 bandit_obj = s_data.get("bandit", {})
                 b_high = bandit_obj.get("high_severity_count", 0)
+                b_total = bandit_obj.get("total_findings", 0)
+                b_exit = bandit_obj.get("exit_code")
+                if b_exit is None and bandit_raw_info:
+                    b_exit = bandit_raw_info.get("exit_code")
+
+                # Bandit exit code and report consistency (RCP01-R06)
+                if b_exit is not None:
+                    if b_exit == 0 and b_total > 0:
+                        errors.append(f"Contradictory Bandit scanner state: exit code 0 with {b_total} reported findings.")
+                    elif b_exit == 1 and b_total == 0:
+                        errors.append("Contradictory Bandit scanner state: exit code 1 with 0 reported findings.")
+                    elif b_exit not in (0, 1):
+                        errors.append(f"Bandit execution error recorded: exit code {b_exit}.")
+
                 if b_high > 0:
                     if s_data.get("status") == "PASS":
                         errors.append(f"Bandit recorded {b_high} HIGH severity findings but SAST report claimed PASS.")
                     if matrix.get("technical_application_release_candidate", {}).get("recommendation") == "GO":
                         errors.append(f"Technical recommendation cannot be GO when Bandit detected {b_high} HIGH severity findings.")
+
                 ruff_obj = s_data.get("ruff", {})
                 r_viol = ruff_obj.get("violations_count", 0)
+                r_exit = ruff_obj.get("exit_code")
+                if r_exit is None and ruff_raw_info:
+                    r_exit = ruff_raw_info.get("exit_code")
+
+                # Ruff exit code and report consistency (RCP01-R06)
+                if r_exit is not None:
+                    if r_exit == 0 and r_viol > 0:
+                        errors.append(f"Contradictory Ruff linter state: exit code 0 with {r_viol} reported violations.")
+                    elif r_exit == 1 and r_viol == 0:
+                        errors.append("Contradictory Ruff linter state: exit code 1 with 0 reported violations (missing or empty findings report).")
+                    elif r_exit not in (0, 1):
+                        errors.append(f"Ruff execution error recorded: exit code {r_exit}.")
+
                 if r_viol > 0:
                     if s_data.get("status") == "PASS":
                         errors.append(f"Ruff recorded {r_viol} syntax/contract violations but SAST report claimed PASS.")
@@ -585,6 +667,47 @@ def verify_rcp01_evidence_manifest(
                         errors.append(f"Technical recommendation cannot be GO when Ruff detected {r_viol} syntax/contract violations.")
             except Exception as e:
                 errors.append(f"Malformed SAST evidence report: {e}")
+
+    # Validate raw Bandit and Ruff reports on disk
+    bandit_raw_info = inv.get("bandit_raw_report")
+    if bandit_raw_info and check_disk_files:
+        b_raw_path = Path(bandit_raw_info.get("path", ""))
+        if b_raw_path.is_file():
+            try:
+                b_raw_data = json.loads(b_raw_path.read_text(encoding="utf-8"))
+                if not isinstance(b_raw_data, dict) or "results" not in b_raw_data:
+                    errors.append("Bandit raw report is missing 'results' field.")
+                else:
+                    raw_b_count = len(b_raw_data.get("results", []))
+                    if sast_info:
+                        s_data = json.loads(Path(sast_info["path"]).read_text(encoding="utf-8"))
+                        if s_data.get("bandit", {}).get("total_findings") != raw_b_count:
+                            errors.append(
+                                f"Discrepancy in Bandit findings count: SAST report records {s_data.get('bandit', {}).get('total_findings')}, "
+                                f"but bandit_raw.json contains {raw_b_count}."
+                            )
+            except Exception as e:
+                errors.append(f"Failed to inspect Bandit raw report: {e}")
+
+    ruff_raw_info = inv.get("ruff_raw_report")
+    if ruff_raw_info and check_disk_files:
+        r_raw_path = Path(ruff_raw_info.get("path", ""))
+        if r_raw_path.is_file():
+            try:
+                r_raw_data = json.loads(r_raw_path.read_text(encoding="utf-8"))
+                if not isinstance(r_raw_data, list):
+                    errors.append("Ruff raw report JSON is not a list.")
+                else:
+                    raw_r_count = len(r_raw_data)
+                    if sast_info:
+                        s_data = json.loads(Path(sast_info["path"]).read_text(encoding="utf-8"))
+                        if s_data.get("ruff", {}).get("violations_count") != raw_r_count:
+                            errors.append(
+                                f"Discrepancy in Ruff violations count: SAST report records {s_data.get('ruff', {}).get('violations_count')}, "
+                                f"but ruff_raw.json contains {raw_r_count}."
+                            )
+            except Exception as e:
+                errors.append(f"Failed to inspect Ruff raw report: {e}")
 
     # Validate CycloneDX SBOMs
     for sbom_key, sbom_label in (("backend_cyclonedx_sbom", "Backend"), ("frontend_cyclonedx_sbom", "Frontend")):
@@ -647,6 +770,87 @@ def verify_rcp01_evidence_manifest(
 
     is_valid = len(errors) == 0
     return is_valid, errors
+
+
+def bundle_sanitized_evidence_package(artifacts_dir: Path) -> Tuple[Path, Path]:
+    """
+    Consolidates acceptance evidence into a sanitized tar.gz archive and writes SHA256SUMS.
+    Includes:
+      - pytest JUnit XML (backend_pytest_report.xml)
+      - raw Vitest JSON (frontend_vitest_report.json)
+      - Bandit/Ruff reports (sast_lint_report.json, bandit_raw.json, ruff_raw.json)
+      - pip-audit/npm-audit reports (backend_audit_report.json, frontend_audit_report.json)
+      - Trivy container scan reports (backend_trivy_report.json, frontend_trivy_report.json)
+      - image metadata (backend_image_meta.json, frontend_image_meta.json)
+      - CycloneDX SBOMs (collectflow-backend-sbom.json, collectflow-frontend-sbom.json, and .sha256)
+      - 5-source cross-layer reconciliation summary (reconciliation_summary.json)
+      - financial readiness manifest (financial_readiness_manifest.json)
+      - release candidate manifest (release-manifest.json)
+      - master evidence manifest (rcp01_release_evidence_manifest.json)
+      - frontend test summary (frontend_test_summary.json)
+      - backend test evidence (backend_test_evidence.json)
+      - secret scan report (secret_scan_report.json)
+      - cross repo pairing report (cross_repo_report.json)
+    """
+    import shutil
+    import tarfile
+
+    # Ensure financial evidence files are copied/available at artifacts_dir root level
+    fin_dir = artifacts_dir / "financial"
+    if fin_dir.is_dir():
+        for fname in ("reconciliation_summary.json", "financial_readiness_manifest.json"):
+            src = fin_dir / fname
+            dst = artifacts_dir / fname
+            if src.is_file() and not dst.is_file():
+                shutil.copy2(src, dst)
+
+    target_files = [
+        "backend_pytest_report.xml",
+        "backend_test_evidence.json",
+        "frontend_vitest_report.json",
+        "frontend_test_summary.json",
+        "secret_scan_report.json",
+        "sast_lint_report.json",
+        "bandit_raw.json",
+        "ruff_raw.json",
+        "backend_audit_report.json",
+        "frontend_audit_report.json",
+        "collectflow-backend-sbom.json",
+        "collectflow-backend-sbom.json.sha256",
+        "collectflow-frontend-sbom.json",
+        "collectflow-frontend-sbom.json.sha256",
+        "backend_image_meta.json",
+        "frontend_image_meta.json",
+        "backend_trivy_report.json",
+        "frontend_trivy_report.json",
+        "cross_repo_report.json",
+        "release-manifest.json",
+        "reconciliation_summary.json",
+        "financial_readiness_manifest.json",
+        "rcp01_release_evidence_manifest.json",
+    ]
+
+    # Generate SHA256SUMS inventory
+    sha256sums_path = artifacts_dir / "SHA256SUMS"
+    sha_lines = []
+    bundle_files = []
+    for fname in target_files:
+        fpath = artifacts_dir / fname
+        if fpath.is_file():
+            csum = compute_file_sha256(fpath)
+            sha_lines.append(f"{csum}  {fname}\n")
+            bundle_files.append(fpath)
+
+    sha256sums_path.write_text("".join(sha_lines), encoding="utf-8")
+    bundle_files.append(sha256sums_path)
+
+    # Build sanitized tar.gz archive
+    archive_path = artifacts_dir / "collectflow_rcp01_evidence_package.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tar:
+        for fpath in bundle_files:
+            tar.add(fpath, arcname=fpath.name)
+
+    return archive_path, sha256sums_path
 
 
 def run_preflight(
@@ -799,27 +1003,91 @@ def run_preflight(
 
     b_ev_data = json.loads(b_ev_path.read_text(encoding="utf-8"))
 
-    # 6. Application Correctness: Frontend Vitest & TypeScript Verification
+    # 6. Application Correctness: Frontend Vitest & TypeScript Verification (RCP01-R05)
     print("\n[STAGE 1B: Frontend Vitest & TypeScript] Executing frontend test suite & typecheck...")
     f_test_report = artifacts_dir / "frontend_test_summary.json"
-    res_vitest = run_command(["npm", "test", "--", "--run"], cwd=frontend_dir)
+    f_raw_vitest_path = artifacts_dir / "frontend_vitest_report.json"
+
+    res_vitest_ver = run_command(["npx", "vitest", "--version"], cwd=frontend_dir)
+    vitest_ver_str = res_vitest_ver.stdout.strip().splitlines()[0] if res_vitest_ver.stdout else "vitest"
+
+    vitest_cmd = [
+        "npm",
+        "test",
+        "--",
+        "--reporter=json",
+        f"--outputFile={f_raw_vitest_path}",
+    ]
+    res_vitest = run_command(vitest_cmd, cwd=frontend_dir)
     if res_vitest.returncode != 0:
-        print("FATAL: Frontend Vitest suite failed", file=sys.stderr)
+        print(f"FATAL: Frontend Vitest suite failed with exit code {res_vitest.returncode}", file=sys.stderr)
+        return 1
+
+    if not f_raw_vitest_path.is_file() or f_raw_vitest_path.stat().st_size == 0:
+        print(f"FATAL: Frontend Vitest failed to produce machine-readable report: {f_raw_vitest_path}", file=sys.stderr)
+        return 1
+
+    try:
+        vt_raw_data = json.loads(f_raw_vitest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"FATAL: Failed to parse raw Vitest JSON report: {exc}", file=sys.stderr)
+        return 1
+
+    for req_field in ("numTotalTests", "numPassedTests", "numFailedTests", "testResults", "success"):
+        if req_field not in vt_raw_data:
+            print(f"FATAL: Raw Vitest report missing mandatory field '{req_field}'", file=sys.stderr)
+            return 1
+
+    vt_total_tests = int(vt_raw_data.get("numTotalTests", 0))
+    vt_passed_tests = int(vt_raw_data.get("numPassedTests", 0))
+    vt_failed_tests = int(vt_raw_data.get("numFailedTests", 0))
+    vt_skipped_tests = int(vt_raw_data.get("numPendingTests", 0)) + int(vt_raw_data.get("numTodoTests", 0))
+    vt_test_results = vt_raw_data.get("testResults", [])
+
+    if not isinstance(vt_test_results, list) or len(vt_test_results) == 0:
+        print("FATAL: Raw Vitest report contains no testResults (empty suite)", file=sys.stderr)
+        return 1
+
+    vt_files_total = len(vt_test_results)
+    vt_files_passed = sum(1 for f in vt_test_results if f.get("status") == "passed")
+    vt_files_failed = sum(1 for f in vt_test_results if f.get("status") == "failed")
+    vt_success = bool(vt_raw_data.get("success", False))
+
+    # Reject zero tests, test failures, unexpected skips, or unsuccessful runs (RCP01-R05)
+    if vt_total_tests == 0:
+        print("FATAL: Zero frontend tests were executed by Vitest", file=sys.stderr)
+        return 1
+    if vt_failed_tests > 0:
+        print(f"FATAL: Vitest reported {vt_failed_tests} failed tests", file=sys.stderr)
+        return 1
+    if vt_files_failed > 0:
+        print(f"FATAL: Vitest reported {vt_files_failed} failed test files", file=sys.stderr)
+        return 1
+    if vt_skipped_tests > 0:
+        print(f"FATAL: Vitest reported {vt_skipped_tests} unexpected skipped tests", file=sys.stderr)
+        return 1
+    if not vt_success:
+        print("FATAL: Vitest reported success=False", file=sys.stderr)
         return 1
 
     f_test_data = {
         "test_suite": "frontend_vitest",
         "frontend_sha": frontend_sha,
         "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "tool_version": vitest_ver_str,
         "status": "PASS",
         "verdict": "PASS",
-        "passed": 620,
-        "failed": 0,
-        "skipped": 0,
-        "test_files_passed": 44,
-        "test_files_total": 44,
-        "tests_passed": 620,
-        "tests_failed": 0,
+        "passed": vt_passed_tests,
+        "failed": vt_failed_tests,
+        "skipped": vt_skipped_tests,
+        "total_tests": vt_total_tests,
+        "test_files_total": vt_files_total,
+        "test_files_passed": vt_files_passed,
+        "test_files_failed": vt_files_failed,
+        "tests_passed": vt_passed_tests,
+        "tests_failed": vt_failed_tests,
+        "raw_report_file": str(f_raw_vitest_path),
+        "raw_report_sha256": compute_file_sha256(f_raw_vitest_path),
     }
     f_test_report.write_text(json.dumps(f_test_data, indent=2), encoding="utf-8")
 
@@ -839,7 +1107,7 @@ def run_preflight(
         print("FATAL: Secret scanning detected potential secrets or failed", file=sys.stderr)
         return 1
 
-    # SAST / Lint checks: Real execution of Bandit AST security scanner and Ruff syntax/contracts linter (RCP01-F02, RCP01-R01)
+    # SAST / Lint checks: Real execution of Bandit AST security scanner and Ruff syntax/contracts linter (RCP01-F02, RCP01-R01, RCP01-R06)
     sast_report = artifacts_dir / "sast_lint_report.json"
     bandit_bin = backend_dir / "venv" / "bin" / "bandit"
     if not bandit_bin.is_file():
@@ -871,6 +1139,14 @@ def run_preflight(
         print(f"FATAL: Malformed Bandit report JSON: {exc}", file=sys.stderr)
         return 1
 
+    # Enforce Bandit scanner exit code and report consistency (RCP01-R06)
+    if res_bandit.returncode == 0 and len(bandit_results) > 0:
+        print(f"FATAL: Contradictory Bandit scanner state: exit code 0 with {len(bandit_results)} findings reported", file=sys.stderr)
+        return 1
+    if res_bandit.returncode == 1 and len(bandit_results) == 0:
+        print("FATAL: Contradictory Bandit scanner state: exit code 1 with 0 findings reported", file=sys.stderr)
+        return 1
+
     bandit_high = sum(1 for r in bandit_results if str(r.get("issue_severity", "")).upper() == "HIGH")
     bandit_medium = sum(1 for r in bandit_results if str(r.get("issue_severity", "")).upper() == "MEDIUM")
     bandit_low = sum(1 for r in bandit_results if str(r.get("issue_severity", "")).upper() == "LOW")
@@ -889,7 +1165,14 @@ def run_preflight(
         print(f"FATAL: Ruff linter execution failed with exit code {res_ruff.returncode}: {res_ruff.stderr}", file=sys.stderr)
         return 1
 
-    ruff_raw.write_text(res_ruff.stdout or "[]", encoding="utf-8")
+    if res_ruff.returncode == 1:
+        if not res_ruff.stdout or not res_ruff.stdout.strip():
+            print("FATAL: Ruff exited with code 1 but findings report is empty or missing", file=sys.stderr)
+            return 1
+        ruff_raw.write_text(res_ruff.stdout, encoding="utf-8")
+    else:
+        ruff_raw.write_text(res_ruff.stdout if (res_ruff.stdout and res_ruff.stdout.strip()) else "[]", encoding="utf-8")
+
     try:
         ruff_results = json.loads(ruff_raw.read_text(encoding="utf-8"))
         if not isinstance(ruff_results, list):
@@ -899,7 +1182,15 @@ def run_preflight(
         print(f"FATAL: Malformed Ruff linter JSON output: {exc}", file=sys.stderr)
         return 1
 
-    ruff_status = "PASS" if len(ruff_results) == 0 else "FAIL"
+    # Enforce Ruff exit code and report consistency (RCP01-R06)
+    if res_ruff.returncode == 0 and len(ruff_results) > 0:
+        print(f"FATAL: Contradictory Ruff linter state: exit code 0 with {len(ruff_results)} violations reported", file=sys.stderr)
+        return 1
+    if res_ruff.returncode == 1 and len(ruff_results) == 0:
+        print("FATAL: Contradictory Ruff linter state: exit code 1 with 0 violations reported", file=sys.stderr)
+        return 1
+
+    ruff_status = "PASS" if (len(ruff_results) == 0 and res_ruff.returncode == 0) else "FAIL"
 
     total_lint_errors = len(bandit_results) + len(ruff_results)
     sast_status = "PASS" if (bandit_status == "PASS" and ruff_status == "PASS") else "FAIL"
@@ -937,7 +1228,7 @@ def run_preflight(
     }
     sast_report.write_text(json.dumps(sast_data, indent=2), encoding="utf-8")
 
-    # Dependency audits: Real execution of pip-audit on backend and npm audit on frontend (RCP01-F02, RCP01-R01)
+    # Dependency audits: Real execution of pip-audit on backend and npm audit on frontend (RCP01-F02, RCP01-R01, RCP01-R06)
     res_pip_ver = run_command([str(venv_python), "-m", "pip_audit", "--version"], cwd=backend_dir)
     pip_ver_str = res_pip_ver.stdout.strip() if res_pip_ver.stdout else "pip-audit"
 
@@ -975,14 +1266,23 @@ def run_preflight(
     except Exception as exc:
         print(f"FATAL: Failed to parse pip-audit report JSON: {exc}", file=sys.stderr)
         return 1
-    pip_status = "PASS" if pip_vulns == 0 else "FAIL"
+
+    # Enforce pip-audit exit code and report consistency (RCP01-R06)
+    if res_pip.returncode == 0 and pip_vulns > 0:
+        print(f"FATAL: Contradictory pip-audit scanner state: exit code 0 with {pip_vulns} reported vulnerabilities", file=sys.stderr)
+        return 1
+    if res_pip.returncode == 1 and pip_vulns == 0:
+        print("FATAL: Contradictory pip-audit scanner state: exit code 1 with 0 reported vulnerabilities", file=sys.stderr)
+        return 1
+
+    pip_status = "PASS" if (pip_vulns == 0 and res_pip.returncode == 0) else "FAIL"
 
     res_npm_ver = run_command(["npm", "--version"], cwd=frontend_dir)
     npm_ver_str = f"npm v{res_npm_ver.stdout.strip()}" if res_npm_ver.stdout else "npm"
 
     f_audit_report = artifacts_dir / "frontend_audit_report.json"
     res_npm = run_command(["npm", "audit", "--json"], cwd=frontend_dir)
-    if not res_npm.stdout:
+    if not res_npm.stdout or not res_npm.stdout.strip():
         print(f"FATAL: npm audit produced no output (exit {res_npm.returncode})", file=sys.stderr)
         return 1
 
@@ -1002,6 +1302,15 @@ def run_preflight(
     except Exception as exc:
         print(f"FATAL: Failed to parse npm audit output as JSON: {exc}", file=sys.stderr)
         return 1
+
+    # Enforce npm audit exit code and report consistency (RCP01-R06)
+    if res_npm.returncode == 0 and npm_high_crit > 0:
+        print(f"FATAL: Contradictory npm audit scanner state: exit code 0 with {npm_high_crit} HIGH/CRITICAL vulnerabilities", file=sys.stderr)
+        return 1
+    if res_npm.returncode != 0 and meta_vulns.get("total", 0) == 0:
+        print("FATAL: Contradictory npm audit scanner state: nonzero exit code with 0 total vulnerabilities reported", file=sys.stderr)
+        return 1
+
     npm_status = "PASS" if npm_high_crit == 0 and res_npm.returncode == 0 else "FAIL"
 
     # 8. CycloneDX SBOM Generation (RCP01-R01)
@@ -1272,6 +1581,12 @@ def run_preflight(
             "producing_tool": "generate_backend_test_evidence.py",
             "status": "PASS",
         },
+        "frontend_vitest_report_json": {
+            "path": str(f_raw_vitest_path),
+            "sha256": compute_file_sha256(f_raw_vitest_path),
+            "producing_tool": vitest_ver_str,
+            "status": "PASS",
+        },
         "frontend_test_summary_json": {
             "path": str(f_test_report),
             "sha256": compute_file_sha256(f_test_report),
@@ -1331,12 +1646,14 @@ def run_preflight(
             "sha256": compute_file_sha256(b_audit_report),
             "producing_tool": "pip_audit_vulnerability_scanner",
             "status": pip_status,
+            "exit_code": res_pip.returncode,
         },
         "frontend_audit_report": {
             "path": str(f_audit_report),
             "sha256": compute_file_sha256(f_audit_report),
             "producing_tool": "npm_audit_vulnerability_scanner",
             "status": npm_status,
+            "exit_code": res_npm.returncode,
         },
         "sast_lint_report": {
             "path": str(sast_report),
@@ -1349,12 +1666,14 @@ def run_preflight(
             "sha256": compute_file_sha256(bandit_raw),
             "producing_tool": bandit_ver_str,
             "status": bandit_status,
+            "exit_code": res_bandit.returncode,
         },
         "ruff_raw_report": {
             "path": str(ruff_raw),
             "sha256": compute_file_sha256(ruff_raw),
             "producing_tool": ruff_ver_str,
             "status": ruff_status,
+            "exit_code": res_ruff.returncode,
         },
         "backend_trivy_report": {
             "path": str(b_trivy_path),
@@ -1499,9 +1818,13 @@ def run_preflight(
                 "verdict": b_ev_data["status"],
             },
             "frontend_vitest": {
+                "test_files_total": f_test_data["test_files_total"],
                 "test_files_passed": f_test_data["test_files_passed"],
+                "test_files_failed": f_test_data["test_files_failed"],
+                "total_tests": f_test_data["total_tests"],
                 "tests_passed": f_test_data["tests_passed"],
                 "tests_failed": f_test_data["tests_failed"],
+                "tests_skipped": f_test_data["skipped"],
                 "verdict": f_test_data["status"],
             },
             "frontend_typescript": {"status": "PASS"},
@@ -1572,10 +1895,13 @@ def run_preflight(
                 "annual_target": "₹75,00,000.00",
             },
             "baseline_reconciliation_note": (
-                "The authoritative WP-06 baseline establishes gross invoiced revenue of ₹5,31,000.00 "
-                "(₹4,50,000.00 taxable exclusive + ₹81,000.00 GST at 18%) across 4 statutory invoices. "
-                "The historical ₹4,25,000.00 figure derived from an early prototype mock prior to WP-06 "
-                "authoritative PostgreSQL database seed fixtures."
+                "The authoritative WP-06 / RCP-01 baseline establishes gross invoiced revenue of ₹5,31,000.00 "
+                "(₹4,50,000.00 taxable exclusive + ₹81,000.00 GST at 18%) anchored by commercial invoice "
+                "INV-2026-042 (with unbilled backlog PO-NEXUS-881 of ₹2,95,000.00 and cancelled audit pair "
+                "INV-2026-REV-001 netting ₹0.00). Outstanding balance is ₹3,22,000.00 after settlement "
+                "REM-2026-001 (₹2,00,000.00 cash + ₹9,000.00 TDS = ₹2,09,000.00). The earlier '4 statutory invoices' "
+                "statement and historical ₹4,25,000.00 figure derived from prototype iterations prior to authoritative "
+                "PostgreSQL seed fixtures."
             ),
         },
         "business_approvals": business_gov_result,
@@ -1616,7 +1942,13 @@ def run_preflight(
         return 1
     print("  Master evidence manifest self-validation PASSED.")
 
-    # 16. Post-execution source & worktree check
+    # 16. Bundle Sanitized Evidence Package & SHA256SUMS Inventory (RCP01-08)
+    print("\n[STAGE 10: Packaging] Generating SHA256SUMS inventory and packaging evidence archive...")
+    archive_path, sha256sums_path = bundle_sanitized_evidence_package(artifacts_dir)
+    print(f"  SHA256SUMS inventory written to: {sha256sums_path}")
+    print(f"  Sanitized Evidence Package created at: {archive_path}")
+
+    # 17. Post-execution source & worktree check
     final_backend_sha = get_git_commit_sha(backend_dir)
     final_frontend_sha = get_git_commit_sha(frontend_dir)
     if final_backend_sha != backend_sha or final_frontend_sha != frontend_sha:
