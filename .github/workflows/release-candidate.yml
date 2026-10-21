@@ -1,0 +1,247 @@
+name: CollectFlow Release Candidate Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc_id:
+        description: "Release Candidate Identifier (e.g., RC-20261019-01)"
+        required: true
+        default: "RC-20261019-01"
+      backend_sha:
+        description: "Expected Backend Commit SHA"
+        required: true
+      frontend_sha:
+        description: "Expected Frontend Commit SHA"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify-release-candidate:
+    name: Consolidated Release Candidate Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: collectflow_user
+          POSTGRES_PASSWORD: collectflow_secret
+          POSTGRES_DB: collectflow_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready -U collectflow_user -d collectflow_test
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Backend Source
+        id: checkout_backend
+        continue-on-error: true
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: AnishB-Personal/collectflow
+          path: collectflow
+          ref: ${{ github.event.inputs.backend_sha }}
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+
+      - name: Handle Backend Checkout Failure (RC_BLOCKED)
+        if: steps.checkout_backend.outcome != 'success'
+        run: |
+          echo "::error::Checkout failed for backend repository AnishB-Personal/collectflow at ref ${{ github.event.inputs.backend_sha }}."
+          echo "Release candidate verification is BLOCKED due to inaccessible backend source or missing credentials."
+          echo "Status: RC_BLOCKED"
+          exit 2
+
+      - name: Checkout Frontend Source
+        id: checkout_frontend
+        continue-on-error: true
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: AnishB-Personal/cash-flow-buddy-101
+          path: cash-flow-buddy-101
+          ref: ${{ github.event.inputs.frontend_sha }}
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+
+      - name: Handle Frontend Checkout Failure (RC_BLOCKED)
+        if: steps.checkout_frontend.outcome != 'success'
+        run: |
+          echo "::error::Checkout failed for frontend repository AnishB-Personal/cash-flow-buddy-101 at ref ${{ github.event.inputs.frontend_sha }}."
+          echo "Release candidate verification is BLOCKED due to inaccessible frontend source or missing credentials."
+          echo "Status: RC_BLOCKED"
+          exit 2
+
+      - name: Verify Exact Immutable Git Revisions
+        run: |
+          ACT_B_SHA=$(git -C collectflow rev-parse HEAD)
+          ACT_F_SHA=$(git -C cash-flow-buddy-101 rev-parse HEAD)
+          echo "Backend HEAD:  ${ACT_B_SHA} (expected: ${{ github.event.inputs.backend_sha }})"
+          echo "Frontend HEAD: ${ACT_F_SHA} (expected: ${{ github.event.inputs.frontend_sha }})"
+          if [[ "${ACT_B_SHA}" != "${{ github.event.inputs.backend_sha }}" ]]; then
+            echo "ERROR: Backend commit SHA mismatch! Expected ${{ github.event.inputs.backend_sha }}, got ${ACT_B_SHA}"
+            exit 1
+          fi
+          if [[ "${ACT_F_SHA}" != "${{ github.event.inputs.frontend_sha }}" ]]; then
+            echo "ERROR: Frontend commit SHA mismatch! Expected ${{ github.event.inputs.frontend_sha }}, got ${ACT_F_SHA}"
+            exit 1
+          fi
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@0b93645e9fb737c336084004c238c36e99f829f0 # v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: "22"
+
+      - name: Install and Verify Pinned Trivy Scanner (Immutable Source & Checksum)
+        env:
+          TRIVY_VERSION: "0.58.2"
+          EXPECTED_SHA256: "aa2c0ed6932ae70171b4f0f3fdb0403e29d9ce7e6fddad0ea08d440fdd695742"
+        run: |
+          TAR_PATH="/tmp/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "Downloading Trivy v${TRIVY_VERSION} from official immutable release..."
+          curl -sfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o "${TAR_PATH}"
+          ACTUAL_SHA="$(sha256sum "${TAR_PATH}" | awk '{print $1}')"
+          echo "Downloaded Tarball SHA-256: ${ACTUAL_SHA}"
+          if [[ "${ACTUAL_SHA}" != "${EXPECTED_SHA256}" ]]; then
+            echo "ERROR: Trivy tarball checksum verification failed! Expected ${EXPECTED_SHA256}, got ${ACTUAL_SHA}"
+            exit 1
+          fi
+          sudo tar -xzf "${TAR_PATH}" -C /usr/local/bin trivy
+          sudo chmod +x /usr/local/bin/trivy
+          TRIVY_BIN=$(which trivy)
+          TRIVY_VER=$(trivy --version | head -n 1)
+          echo "Scanner binary:    ${TRIVY_BIN}"
+          echo "Scanner version:   ${TRIVY_VER}"
+          echo "Scanner checksum:  ${ACTUAL_SHA}"
+          if [[ -z "${TRIVY_BIN}" || -z "${TRIVY_VER}" || "${TRIVY_VER}" != *"0.58.2"* ]]; then
+            echo "ERROR: Pinned Trivy installation verification failed"
+            exit 1
+          fi
+
+      - name: Build & Scan Backend OCI Image
+        run: |
+          cd collectflow
+          chmod +x scripts/ci/build_and_scan_image.sh
+          ./scripts/ci/build_and_scan_image.sh backend collectflow-backend /tmp/backend-image-meta.json no-publish /tmp/backend-trivy-report.json
+
+      - name: Build & Scan Frontend OCI Image
+        run: |
+          cd cash-flow-buddy-101
+          chmod +x scripts/ci/build_and_scan_image.sh
+          ./scripts/ci/build_and_scan_image.sh frontend collectflow-frontend /tmp/frontend-image-meta.json no-publish /tmp/frontend-trivy-report.json
+
+      - name: Execute Backend Quality Verification & Full Pytest Suite
+        env:
+          COLLECTFLOW_ENV: test
+          COLLECTFLOW_DATABASE_URL: postgresql+psycopg://collectflow_user:collectflow_secret@127.0.0.1:5432/collectflow_test
+          COLLECTFLOW_SESSION_COOKIE_SECRET: test_session_secret_at_least_32_characters_long_1234
+          COLLECTFLOW_CSRF_SECRET: test_csrf_secret_at_least_32_characters_long_1234
+        run: |
+          cd collectflow
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pip-audit pytest
+          ruff check . --output-format json -o /tmp/backend-lint-report.json
+          pip-audit -r requirements.txt -f json -o /tmp/backend-pip-audit.json
+          python3 scripts/ci/scan_secrets.py --root . --json-output /tmp/backend-secret-scan.json
+          alembic upgrade head
+          pytest tests/ --junitxml=/tmp/backend-pytest.xml
+          python3 -c "
+          import xml.etree.ElementTree as ET, json, sys
+          try:
+              tree = ET.parse('/tmp/backend-pytest.xml')
+              root = tree.getroot()
+              s = root if root.tag == 'testsuite' else root.find('testsuite')
+              tests = int(s.attrib.get('tests', 0))
+              failures = int(s.attrib.get('failures', 0)) + int(s.attrib.get('errors', 0))
+              skipped = int(s.attrib.get('skipped', 0))
+              passed = tests - failures - skipped
+              if passed <= 0 or failures > 0:
+                  print(f'ERROR: Backend pytest failure (passed={passed}, failures={failures})', file=sys.stderr)
+                  sys.exit(1)
+              verdict = 'PASS'
+              with open('/tmp/backend-test-summary.json', 'w') as f:
+                  json.dump({'passed': passed, 'failed': failures, 'skipped': skipped, 'verdict': verdict}, f, indent=2)
+          except Exception as e:
+              print(f'ERROR: Failed parsing backend pytest XML: {e}', file=sys.stderr)
+              sys.exit(1)
+          "
+
+      - name: Execute Frontend Quality Verification & Full Regression Suites
+        run: |
+          cd cash-flow-buddy-101
+          npm ci
+          echo "Installing Playwright Chromium browser and Linux system dependencies..."
+          if ! npx playwright install --with-deps chromium; then
+            echo "ERROR: Playwright Chromium browser and system dependencies installation failed (WP05-H02)"
+            exit 1
+          fi
+          PW_VER=$(npx playwright --version)
+          echo "Verified Playwright version: ${PW_VER}"
+          npm run typecheck
+          npm run lint -- --format json -o /tmp/frontend-lint-report.json
+          npm audit --audit-level=high
+          npm audit --json > /tmp/frontend-npm-audit.json
+          python3 scripts/ci/scan_secrets.py --root . --json-output /tmp/frontend-secret-scan.json
+          npm test -- --reporter=json --outputFile=/tmp/frontend-vitest-report.json
+          python3 -c "
+          import json, sys
+          try:
+              with open('/tmp/frontend-vitest-report.json') as f:
+                  data = json.load(f)
+              if 'numPassedTests' not in data or 'numFailedTests' not in data:
+                  raise ValueError('Missing numPassedTests or numFailedTests in Vitest JSON report')
+              num_passed = data['numPassedTests']
+              num_failed = data['numFailedTests']
+              num_total = data.get('numTotalTests', num_passed + num_failed)
+              if num_passed <= 0 or num_failed > 0:
+                  raise ValueError(f'Frontend Vitest failure (passed={num_passed}, failed={num_failed})')
+              verdict = 'PASS'
+              with open('/tmp/frontend-test-summary.json', 'w') as out:
+                  json.dump({'passed': num_passed, 'failed': num_failed, 'total': num_total, 'verdict': verdict}, out, indent=2)
+          except Exception as e:
+              print(f'ERROR: Failed to parse frontend Vitest report: {e}', file=sys.stderr)
+              sys.exit(1)
+          "
+          npx playwright test e2e/stage2-responsive.spec.ts --config=playwright.mock.config.ts
+
+      - name: Disposable Compose Integration & Database Mutation Tests
+        run: |
+          cd collectflow
+          chmod +x scripts/ci/test_disposable_compose.sh
+          ./scripts/ci/test_disposable_compose.sh
+
+      - name: Run Consolidated Release Candidate Gate
+        run: |
+          cd collectflow
+          python3 scripts/ci/verify_release_candidate.py \
+            --rc-id "${{ github.event.inputs.rc_id }}" \
+            --backend-dir . \
+            --frontend-dir ../cash-flow-buddy-101 \
+            --expected-backend-sha "${{ github.event.inputs.backend_sha }}" \
+            --expected-frontend-sha "${{ github.event.inputs.frontend_sha }}" \
+            --backend-meta /tmp/backend-image-meta.json \
+            --frontend-meta /tmp/frontend-image-meta.json \
+            --backend-test-report /tmp/backend-test-summary.json \
+            --frontend-test-report /tmp/frontend-test-summary.json \
+            --backend-audit-report /tmp/backend-pip-audit.json \
+            --frontend-audit-report /tmp/frontend-npm-audit.json \
+            --secret-scan-report /tmp/backend-secret-scan.json \
+            --sast-lint-report /tmp/backend-lint-report.json \
+            --output-manifest /tmp/release-manifest.json
+
+      - name: Upload Release Candidate Manifest
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        if: always()
+        with:
+          name: ${{ github.event.inputs.rc_id }}-manifest
+          path: /tmp/release-manifest.json
+          retention-days: 30
