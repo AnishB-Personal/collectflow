@@ -28,6 +28,7 @@ from app.models.domain_models import (
     CommercialInvoiceItem,
     Customer,
     FinancialYear,
+    GstRateMaster,
     PaymentTransaction,
     PurchaseOrder,
     PurchaseOrderItem,
@@ -921,5 +922,150 @@ def test_cf4c3_01_boundary_one_paise_zero_rated_and_unit_price_reconciliation():
                         db.delete(it)
                     db.delete(p_row)
             db.commit()
+
+
+def test_historical_tax_frozen_when_tax_master_updated():
+    """
+    AP-01 Final Acceptance Closure: Historical Tax Integrity Regression.
+    Proves that when a commercial invoice is issued with an active tax master rate (e.g. 18%),
+    subsequent modifications or rate changes to the GstRateMaster table in PostgreSQL
+    do NOT alter the issued invoice's historical tax rate, tax amount, or total amount.
+    """
+    token = _get_token("sandbox_admin", "AdminPass123!")
+    headers = {"Authorization": f"Bearer {token}"}
+    suffix = uuid.uuid4().hex[:8]
+    pan_digits = f"{int(suffix[:4], 16) % 9000 + 1000}"
+
+    # 1. Create dedicated customer
+    cust_resp = client.post(
+        "/api/customers",
+        json={
+            "billing_name": f"Tax Freeze Corp {suffix}",
+            "gst_number": f"29FRZTX{pan_digits}A1Z5",
+            "billing_address": "Indiranagar 100ft Rd, Bangalore",
+            "city": "Bangalore",
+            "state": "Karnataka",
+            "contact_person": "Tax Integrity Lead",
+        },
+        headers=headers,
+    )
+    assert cust_resp.status_code == 200, cust_resp.text
+    cust_id = cust_resp.json()["id"]
+
+    inv_id = None
+    original_rate = None
+    original_cgst = None
+    original_sgst = None
+    original_igst = None
+
+    try:
+        # 2. Issue Commercial Invoice with standard 18% tax
+        # Exclusive: 40,000.00; Tax 18%: 7,200.00 (CGST 3,600.00 + SGST 3,600.00); Total: 47,200.00
+        inv_resp = client.post(
+            "/api/invoices",
+            json={
+                "fy_code": "FY 2026-27",
+                "invoice_number": f"INV-TEST-TAXFREEZE-{suffix}",
+                "invoice_date": "2026-08-10",
+                "customer_id": cust_id,
+                "items": [
+                    {
+                        "desc": "Enterprise Cloud Server Unit",
+                        "quantity": 2.0,
+                        "unit_price": 20000.0,
+                        "tax_rate": 0.18,
+                    }
+                ],
+            },
+            headers=headers,
+        )
+        assert inv_resp.status_code in (200, 201), inv_resp.text
+        inv_data = inv_resp.json()
+        inv_id = inv_data["id"]
+
+        # 3. Verify initial issued invoice figures via GET API
+        inv_initial = client.get(f"/api/invoices/{inv_id}", headers=headers).json()["invoice"]
+        assert Decimal(str(inv_initial["tax_rate"])) == Decimal("0.18")
+        assert Decimal(str(inv_initial["exclusive_amount"])) == Decimal("40000.00")
+        assert Decimal(str(inv_initial["tax_amount"])) == Decimal("7200.00")
+        assert Decimal(str(inv_initial["total_amount"])) == Decimal("47200.00")
+        assert Decimal(str(inv_initial["cgst_amount"])) == Decimal("3600.00")
+        assert Decimal(str(inv_initial["sgst_amount"])) == Decimal("3600.00")
+
+        # 4. Modify the applicable tax master in PostgreSQL
+        # Mutate the 18% GST master rate (id=1) to 28% (0.2800)
+        with get_db_session() as db:
+            gst_master = db.scalar(select(GstRateMaster).where(GstRateMaster.id == 1))
+            assert gst_master is not None
+            original_rate = gst_master.rate
+            original_cgst = gst_master.cgst_rate
+            original_sgst = gst_master.sgst_rate
+            original_igst = gst_master.igst_rate
+
+            gst_master.rate = Decimal("0.2800")
+            gst_master.cgst_rate = Decimal("0.1400")
+            gst_master.sgst_rate = Decimal("0.1400")
+            gst_master.igst_rate = Decimal("0.2800")
+            db.commit()
+
+        # 5. Confirm that tax master now reflects the updated 28% rate in settings API
+        tax_settings_resp = client.get("/api/settings/taxes", headers=headers)
+        assert tax_settings_resp.status_code == 200
+        gst_rates = tax_settings_resp.json()["gst_rates"]
+        master_id_1 = next(r for r in gst_rates if r["id"] == 1)
+        assert Decimal(str(master_id_1["rate"])) == Decimal("0.28")
+
+        # 6. Re-query the previously issued invoice via API — MUST RETAIN HISTORICAL TAX
+        inv_recheck = client.get(f"/api/invoices/{inv_id}", headers=headers).json()["invoice"]
+        assert Decimal(str(inv_recheck["tax_rate"])) == Decimal("0.18")
+        assert Decimal(str(inv_recheck["exclusive_amount"])) == Decimal("40000.00")
+        assert Decimal(str(inv_recheck["tax_amount"])) == Decimal("7200.00")
+        assert Decimal(str(inv_recheck["total_amount"])) == Decimal("47200.00")
+        assert Decimal(str(inv_recheck["cgst_amount"])) == Decimal("3600.00")
+        assert Decimal(str(inv_recheck["sgst_amount"])) == Decimal("3600.00")
+        # Ensure it was NOT dynamically recomputed using the new 28% rate (which would yield 11,200.00 / 51,200.00)
+        assert Decimal(str(inv_recheck["tax_amount"])) != Decimal("11200.00")
+        assert Decimal(str(inv_recheck["total_amount"])) != Decimal("51200.00")
+
+        # 7. Query directly from PostgreSQL database — MUST BE FROZEN IN IMMUTABLE COLUMNS
+        with get_db_session() as db:
+            db_inv = db.scalar(select(CommercialInvoice).where(CommercialInvoice.id == inv_id))
+            assert db_inv is not None
+            assert db_inv.tax_rate == Decimal("0.1800")
+            assert db_inv.exclusive_amount == Decimal("40000.00")
+            assert db_inv.tax_amount == Decimal("7200.00")
+            assert db_inv.total_amount == Decimal("47200.00")
+            assert db_inv.cgst_amount == Decimal("3600.00")
+            assert db_inv.sgst_amount == Decimal("3600.00")
+
+            # Check line items as well
+            db_items = db.scalars(select(CommercialInvoiceItem).where(CommercialInvoiceItem.invoice_id == inv_id)).all()
+            assert len(db_items) == 1
+            assert db_items[0].tax_rate == Decimal("0.1800")
+            assert db_items[0].exclusive_amount == Decimal("40000.00")
+            assert db_items[0].tax_amount == Decimal("7200.00")
+            assert db_items[0].total_amount == Decimal("47200.00")
+
+    finally:
+        # 8. Restore the GstRateMaster row to its original rate to guarantee test isolation
+        with get_db_session() as db:
+            if original_rate is not None:
+                gst_master = db.scalar(select(GstRateMaster).where(GstRateMaster.id == 1))
+                if gst_master:
+                    gst_master.rate = original_rate
+                    gst_master.cgst_rate = original_cgst
+                    gst_master.sgst_rate = original_sgst
+                    gst_master.igst_rate = original_igst
+            if inv_id:
+                for it in db.scalars(select(CommercialInvoiceItem).where(CommercialInvoiceItem.invoice_id == inv_id)).all():
+                    db.delete(it)
+                inv_row = db.scalar(select(CommercialInvoice).where(CommercialInvoice.id == inv_id))
+                if inv_row:
+                    db.delete(inv_row)
+            cust_row = db.scalar(select(Customer).where(Customer.id == cust_id))
+            if cust_row:
+                db.delete(cust_row)
+            db.commit()
+
 
 
