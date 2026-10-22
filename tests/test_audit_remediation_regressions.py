@@ -10,12 +10,13 @@ Targeted Automated Regression Suite for Stage 4C.2 Audit Findings Remediations:
 - L03: Sanitized /ready probe without raw exception leakage
 """
 
+import secrets
 import threading
 from datetime import date
 from decimal import Decimal
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select, delete, func
+from sqlalchemy import select, delete, func, update
 
 from app.main import app
 from app.core.database import get_db_session, validate_isolated_database_url
@@ -560,4 +561,201 @@ def test_statutory_percentage_contract_acceptance_cases():
             for tcode in created_tds_codes:
                 db.execute(delete(TdsSectionMaster).where(TdsSectionMaster.section_code == tcode))
             db.commit()
+
+
+def test_ap01_r02_non_admin_direct_api_mutation_rejection():
+    """AP01-R02: Non-admin roles (viewer, sales, finance) are strictly rejected with HTTP 403 on all user mutation APIs."""
+    roles = ["viewer", "sales", "finance"]
+    passwords = {"viewer": "ViewerPass123!", "sales": "SalesPass123!", "finance": "FinancePass123!"}
+
+    for role in roles:
+        login_res = client.post(
+            "/api/auth/login",
+            json={"username": f"sandbox_{role}", "password": passwords[role]},
+        )
+        assert login_res.status_code == 200, f"Login failed for sandbox_{role}"
+        headers = {"Authorization": f"Bearer {login_res.json()['token']}"}
+
+        # 1. User creation rejected (403)
+        r_create = client.post(
+            "/api/users",
+            json={"username": f"illegal_{role}_user", "password": "IllegalPass123!", "role": "sales"},
+            headers=headers,
+        )
+        assert r_create.status_code == 403, f"Expected 403 for {role} on POST /api/users, got {r_create.status_code}"
+        assert "lacks required permissions" in r_create.json()["detail"]
+
+        # 2. User update rejected (403)
+        r_update = client.put(
+            "/api/users/1",
+            json={"role": "viewer", "full_name": "Hacked Name"},
+            headers=headers,
+        )
+        assert r_update.status_code == 403, f"Expected 403 for {role} on PUT /api/users/1, got {r_update.status_code}"
+
+        # 3. User role update rejected (403)
+        r_role = client.put(
+            "/api/users/1/role",
+            json={"role": "admin"},
+            headers=headers,
+        )
+        assert r_role.status_code == 403, f"Expected 403 for {role} on PUT /api/users/1/role, got {r_role.status_code}"
+
+        # 4. User password reset rejected (403)
+        r_pass = client.put(
+            "/api/users/1/password",
+            json={"new_password": "NewIllegalPass123!"},
+            headers=headers,
+        )
+        assert r_pass.status_code == 403, f"Expected 403 for {role} on PUT /api/users/1/password, got {r_pass.status_code}"
+
+        # 5. User deactivation rejected (403)
+        r_deact = client.put(
+            "/api/users/1/deactivate",
+            headers=headers,
+        )
+        assert r_deact.status_code == 403, f"Expected 403 for {role} on PUT /api/users/1/deactivate, got {r_deact.status_code}"
+
+        # 6. User deletion rejected (403)
+        r_del = client.delete(
+            "/api/users/1",
+            headers=headers,
+        )
+        assert r_del.status_code == 403, f"Expected 403 for {role} on DELETE /api/users/1, got {r_del.status_code}"
+
+
+def test_ap01_r02_user_administration_invariants_and_session_revocation():
+    """
+    AP01-R02: Verify full user administration lifecycle:
+    - User creation with strong Argon2id hashing and password complexity
+    - Read-only directory visibility for non-admin (no leaked credentials)
+    - PostgreSQL persistence
+    - Last-admin demotion & deletion blocks
+    - Self-deletion and self-deactivation blocks
+    - Immediate session revocation on user deactivation and password reset
+    """
+    admin_login = client.post("/api/auth/login", json={"username": "sandbox_admin", "password": "AdminPass123!"})
+    assert admin_login.status_code == 200
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['token']}"}
+    admin_id = admin_login.json()["user"]["id"]
+
+    test_uname = f"sec_test_{secrets.token_hex(4)}"
+    test_pwd = "InitialSecPass123!"
+    created_user_id = None
+
+    try:
+        # 1. User creation by admin
+        create_res = client.post(
+            "/api/users",
+            json={
+                "username": test_uname,
+                "password": test_pwd,
+                "full_name": "Security Test User",
+                "role": "sales",
+            },
+            headers=admin_headers,
+        )
+        assert create_res.status_code == 200
+        created_user_id = create_res.json()["user_id"]
+
+        # 2. PostgreSQL persistence verification
+        with get_db_session() as db:
+            pg_user = db.scalar(select(User).where(User.id == created_user_id))
+            assert pg_user is not None
+            assert pg_user.username == test_uname
+            assert pg_user.role == "sales"
+            assert pg_user.is_active is True
+            # Verify Argon2id hashing used
+            assert pg_user.password_hash.startswith("$argon2id$")
+
+        # 3. Read-only directory visibility to non-admin viewer
+        viewer_login = client.post("/api/auth/login", json={"username": "sandbox_viewer", "password": "ViewerPass123!"})
+        viewer_headers = {"Authorization": f"Bearer {viewer_login.json()['token']}"}
+
+        list_res = client.get("/api/users", headers=viewer_headers)
+        assert list_res.status_code == 200
+        users_list = list_res.json()
+        assert any(u["username"] == test_uname for u in users_list)
+
+        # Confirm directory returns safe metadata projection only (zero credentials leaked)
+        for u in users_list:
+            assert "password" not in u
+            assert "password_hash" not in u
+            assert "salt" not in u
+            assert "token" not in u
+
+        # 4. Last-admin protection checks
+        demote_admin = client.put(f"/api/users/{admin_id}/role", json={"role": "sales"}, headers=admin_headers)
+        assert demote_admin.status_code == 400
+        assert "must have at least one active administrator" in demote_admin.json()["detail"]
+
+        del_admin = client.delete(f"/api/users/{admin_id}", headers=admin_headers)
+        assert del_admin.status_code == 400
+        assert "Cannot delete your own account" in del_admin.json()["detail"]
+
+        deact_admin = client.put(f"/api/users/{admin_id}/deactivate", headers=admin_headers)
+        assert deact_admin.status_code == 400
+        assert "Cannot deactivate your own account" in deact_admin.json()["detail"]
+
+        # 5. Target user logs in
+        # Clear must_change_password temporarily to obtain valid session for API testing
+        with get_db_session() as db:
+            db.execute(update(User).where(User.id == created_user_id).values(must_change_password=False))
+            db.commit()
+
+        target_login = client.post("/api/auth/login", json={"username": test_uname, "password": test_pwd})
+        assert target_login.status_code == 200
+        target_token = target_login.json()["token"]
+        target_headers = {"Authorization": f"Bearer {target_token}"}
+
+        # Active session succeeds
+        me_check = client.get("/api/auth/me", headers=target_headers)
+        assert me_check.status_code == 200
+        assert me_check.json()["user"]["username"] == test_uname
+
+        # 6. Admin deactivates target user -> Session immediately revoked
+        deact_res = client.put(f"/api/users/{created_user_id}/deactivate", headers=admin_headers)
+        assert deact_res.status_code == 200
+
+        # Subsequent call with target token receives HTTP 401
+        me_after_deact = client.get("/api/auth/me", headers=target_headers)
+        assert me_after_deact.status_code == 401
+
+        # Reactivate target user
+        client.put(f"/api/users/{created_user_id}", json={"is_active": True}, headers=admin_headers)
+
+        # 7. Target user logs in again
+        with get_db_session() as db:
+            db.execute(update(User).where(User.id == created_user_id).values(must_change_password=False))
+            db.commit()
+
+        target_login2 = client.post("/api/auth/login", json={"username": test_uname, "password": test_pwd})
+        assert target_login2.status_code == 200
+        target_token2 = target_login2.json()["token"]
+        target_headers2 = {"Authorization": f"Bearer {target_token2}"}
+
+        # Active session succeeds
+        me_check2 = client.get("/api/auth/me", headers=target_headers2)
+        assert me_check2.status_code == 200
+
+        # Admin resets password -> Active session immediately revoked
+        reset_res = client.put(
+            f"/api/users/{created_user_id}/password",
+            json={"new_password": "NewResetPass123!"},
+            headers=admin_headers,
+        )
+        assert reset_res.status_code == 200
+
+        # Subsequent call receives HTTP 401
+        me_after_reset = client.get("/api/auth/me", headers=target_headers2)
+        assert me_after_reset.status_code == 401
+
+    finally:
+        # Cleanup created user and sessions
+        if created_user_id:
+            with get_db_session() as db:
+                db.execute(delete(SessionModel).where(SessionModel.user_id == created_user_id))
+                db.execute(delete(User).where(User.id == created_user_id))
+                db.commit()
+
 
