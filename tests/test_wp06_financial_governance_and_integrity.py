@@ -559,7 +559,7 @@ def test_18_pending_business_approval_correctly_returns_blocked(monkeypatch):
         "expected_sha_pinning": {"status": "PASS", "pinned": True},
         "backend_sha_checkpoint": {"status": "PASS", "sha": backend_sha},
         "frontend_sha_checkpoint": {"status": "PASS", "sha": frontend_sha},
-        "schema_revision": {"status": "PASS", "revision": "77e73a1cb221"},
+        "schema_revision": {"status": "PASS", "revision": "c9a1e847f520"},
         "dataset_environment": {"status": "PASS", "database": "collectflow_test"},
         "dataset_population": {"status": "PASS", "counts": {"invoices": 1, "payments": 2, "reversals": 1, "unbilled_pos": 1}},
         "invoice_balance_invariants": {"status": "PASS"},
@@ -664,7 +664,7 @@ def test_21_empty_dataset_rejected_by_technical_acceptance(tmp_path):
     with patch("app.core.database.get_db_session") as mock_db_ctx:
         mock_db = MagicMock()
         mock_db_ctx.return_value.__enter__.return_value = mock_db
-        mock_db.execute.return_value.scalar.side_effect = ["collectflow_test", "collectflow_user", "77e73a1cb221"]
+        mock_db.execute.return_value.scalar.side_effect = ["collectflow_test", "collectflow_user", "c9a1e847f520"]
         # Return empty list for invoices
         mock_db.scalars.return_value.all.return_value = []
 
@@ -705,7 +705,7 @@ def test_22_orphan_reversal_and_mismatched_linkage_rejected(tmp_path):
     with patch("app.core.database.get_db_session") as mock_db_ctx:
         mock_db = MagicMock()
         mock_db_ctx.return_value.__enter__.return_value = mock_db
-        mock_db.execute.return_value.scalar.side_effect = ["collectflow_test", "collectflow_user", "77e73a1cb221"]
+        mock_db.execute.return_value.scalar.side_effect = ["collectflow_test", "collectflow_user", "c9a1e847f520"]
         mock_db.scalars.return_value.all.side_effect = [
             [mock_inv],              # invoices
             [mock_pay, mock_rev],     # payments
@@ -768,7 +768,7 @@ def test_23_altered_settlement_totals_rejected(tmp_path):
     with patch("app.core.database.get_db_session") as mock_db_ctx:
         mock_db = MagicMock()
         mock_db_ctx.return_value.__enter__.return_value = mock_db
-        mock_db.execute.return_value.scalar.side_effect = ["collectflow_test", "collectflow_user", "77e73a1cb221"]
+        mock_db.execute.return_value.scalar.side_effect = ["collectflow_test", "collectflow_user", "c9a1e847f520"]
         mock_db.scalars.return_value.all.side_effect = [
             [mock_inv],
             [mock_pay, mock_parent, mock_rev],

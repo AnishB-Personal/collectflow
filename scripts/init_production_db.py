@@ -4,7 +4,7 @@ Provides a secure, repeatable, deterministic initialization workflow for Postgre
 
 Enforces:
 1. Verification of environment mode and target database configuration.
-2. Verification of expected Alembic schema revision ('77e73a1cb221').
+2. Verification of expected Alembic schema revision ('c9a1e847f520').
 3. Strict refusal of test databases ('collectflow_test') or unknown/unsafe targets.
 4. Pre-existing business and identity data validation (fails closed if non-empty, inconsistent, or unprovenanced).
 5. Transaction-scoped PostgreSQL advisory lock serialization (pg_advisory_xact_lock) for administrator bootstrap.
@@ -48,7 +48,7 @@ from app.models.domain_models import (
     User,
 )
 
-EXPECTED_ALEMBIC_REVISION = "77e73a1cb221"
+EXPECTED_ALEMBIC_REVISION = "c9a1e847f520"
 ADMIN_BOOTSTRAP_LOCK_ID = 847291048291048291
 
 PROHIBITED_BOOTSTRAP_USERNAMES = {
