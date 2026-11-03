@@ -435,7 +435,10 @@ def _compile_export_records(
             tax_amt = Decimal("0.00") if is_cancelled else _quantize_2dec(inv.tax_amount)
             bal = Decimal("0.00") if is_cancelled else max(Decimal("0.00"), tot_amt - st["total"])
 
-            if scope == "outstanding" and bal <= Decimal("0.00"):
+            if scope == "issued" and is_cancelled:
+                continue
+
+            if scope == "outstanding" and (is_cancelled or bal <= Decimal("0.00")):
                 continue
 
             days_overdue = 0

@@ -2,7 +2,8 @@ import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-ALLOWED_CURRENCIES = {"INR", "USD", "EUR", "GBP", "AED"}
+# AP-01 Scope: Strictly INR transactions only. Foreign currency commercial transactions are prohibited.
+ALLOWED_CURRENCIES = {"INR"}
 DEFAULT_CURRENCY = "INR"
 
 

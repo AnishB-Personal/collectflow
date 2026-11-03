@@ -73,6 +73,7 @@ def get_reporting_summary(
         if target_date:
             inv_stmt = select(CommercialInvoice).where(
                 CommercialInvoice.invoice_date <= target_date,
+                CommercialInvoice.currency == "INR",
                 or_(
                     CommercialInvoice.lifecycle_status == "ISSUED",
                     (CommercialInvoice.lifecycle_status == "CANCELLED")
@@ -81,7 +82,8 @@ def get_reporting_summary(
             )
         else:
             inv_stmt = select(CommercialInvoice).where(
-                CommercialInvoice.lifecycle_status == "ISSUED"
+                CommercialInvoice.lifecycle_status == "ISSUED",
+                CommercialInvoice.currency == "INR",
             )
 
         if fy and fy.upper() not in ("ALL", "ALL FY"):
@@ -134,8 +136,11 @@ def get_reporting_summary(
             if bal > Decimal("0.00") and inv.due_date < ref_date:
                 total_overdue += bal
 
-        # 3. Unbilled Purchase Orders
-        po_stmt = select(PurchaseOrder).where(PurchaseOrder.status == "UNBILLED")
+        # 3. Unbilled Purchase Orders (INR only)
+        po_stmt = select(PurchaseOrder).where(
+            PurchaseOrder.status == "UNBILLED",
+            PurchaseOrder.currency == "INR",
+        )
         if fy and fy.upper() not in ("ALL", "ALL FY"):
             po_stmt = po_stmt.where(PurchaseOrder.fy_code == fy)
         if target_date:
@@ -203,6 +208,7 @@ def get_ar_aging_report(
             .join(User, CommercialInvoice.executive_id == User.id)
             .outerjoin(PurchaseOrder, CommercialInvoice.po_id == PurchaseOrder.id)
             .where(CommercialInvoice.invoice_date <= target_date)
+            .where(CommercialInvoice.currency == "INR")
             .where(
                 or_(
                     CommercialInvoice.lifecycle_status == "ISSUED",
@@ -331,12 +337,23 @@ def get_executive_attainment_report(
         )
         target_rows = db.execute(targets_stmt).all()
 
-        # Query qualifying issued invoices for this FY
+        # Query qualifying issued invoices for this FY (restricted to INR)
         inv_stmt = select(CommercialInvoice).where(
             CommercialInvoice.fy_code == target_fy,
             CommercialInvoice.lifecycle_status == "ISSUED",
+            CommercialInvoice.currency == "INR",
         )
         invoices = db.execute(inv_stmt).scalars().all()
+
+        # Preload settlements for matching invoices to calculate true net outstanding receivables
+        inv_ids = [inv.id for inv in invoices]
+        inv_settlements: Dict[int, Decimal] = {}
+        if inv_ids:
+            pay_stmt = select(PaymentTransaction).where(
+                PaymentTransaction.invoice_id.in_(inv_ids)
+            )
+            for p in db.execute(pay_stmt).scalars().all():
+                inv_settlements[p.invoice_id] = inv_settlements.get(p.invoice_id, Decimal("0.00")) + _quantize_2dec(p.total_settled)
 
         # Group invoices by executive_id
         exec_sales: Dict[int, Decimal] = {}
@@ -348,16 +365,17 @@ def get_executive_attainment_report(
             exec_sales[ex_id] = exec_sales.get(ex_id, Decimal("0.00")) + _quantize_2dec(
                 inv.exclusive_amount
             )
-            # Estimate balance
-            exec_outstanding[ex_id] = exec_outstanding.get(
-                ex_id, Decimal("0.00")
-            ) + _quantize_2dec(inv.total_amount)
+            # Calculate actual outstanding balance = gross total - settlements
+            settled = inv_settlements.get(inv.id, Decimal("0.00"))
+            bal = max(Decimal("0.00"), _quantize_2dec(inv.total_amount) - settled)
+            exec_outstanding[ex_id] = exec_outstanding.get(ex_id, Decimal("0.00")) + bal
             exec_order_count[ex_id] = exec_order_count.get(ex_id, 0) + 1
 
         # Query unbilled purchase orders for this FY to record excluded sales
         po_stmt = select(PurchaseOrder).where(
             PurchaseOrder.fy_code == target_fy,
             PurchaseOrder.status == "UNBILLED",
+            PurchaseOrder.currency == "INR",
         )
         unbilled_pos = db.execute(po_stmt).scalars().all()
         excluded_unbilled_sales = sum(
@@ -459,19 +477,21 @@ def get_customer_exposure_report(
     with get_db_session() as db:
         customers = db.query(Customer).order_by(Customer.billing_name.asc()).all()
 
-        # Invoices query
+        # Invoices query (INR only)
         inv_stmt = select(CommercialInvoice).where(
             CommercialInvoice.lifecycle_status == "ISSUED",
             CommercialInvoice.invoice_date <= target_date,
+            CommercialInvoice.currency == "INR",
         )
         if fy and fy.upper() not in ("ALL", "ALL FY"):
             inv_stmt = inv_stmt.where(CommercialInvoice.fy_code == fy)
         invoices = db.execute(inv_stmt).scalars().all()
 
-        # Unbilled POs query
+        # Unbilled POs query (INR only)
         po_stmt = select(PurchaseOrder).where(
             PurchaseOrder.status == "UNBILLED",
             PurchaseOrder.po_date <= target_date,
+            PurchaseOrder.currency == "INR",
         )
         if fy and fy.upper() not in ("ALL", "ALL FY"):
             po_stmt = po_stmt.where(PurchaseOrder.fy_code == fy)

@@ -100,7 +100,12 @@ class OrderConvert(BaseModel):
     due_date: Optional[str] = None  # Defaults to Net 30 if omitted
 
 
-def _serialize_order(po: PurchaseOrder, customer: Optional[Customer] = None, executive: Optional[User] = None) -> Dict[str, Any]:
+def _serialize_order(
+    po: PurchaseOrder,
+    customer: Optional[Customer] = None,
+    executive: Optional[User] = None,
+    invoice: Optional[CommercialInvoice] = None,
+) -> Dict[str, Any]:
     c_name = customer.billing_name if customer else (po.customer.billing_name if po.customer else None)
     c_gstin = customer.gst_number if customer else (po.customer.gst_number if po.customer else None)
     c_addr = customer.billing_address if customer else (po.customer.billing_address if po.customer else None)
@@ -126,6 +131,10 @@ def _serialize_order(po: PurchaseOrder, customer: Optional[Customer] = None, exe
     total_amt_dec = Decimal(str(po.total_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     is_unbilled = po.status == "UNBILLED"
 
+    inv_num = invoice.invoice_number if invoice else None
+    inv_date = invoice.invoice_date.isoformat() if invoice and invoice.invoice_date else None
+    inv_due = invoice.due_date.isoformat() if invoice and invoice.due_date else None
+
     return {
         "id": po.id,
         "fy_code": po.fy_code,
@@ -147,9 +156,9 @@ def _serialize_order(po: PurchaseOrder, customer: Optional[Customer] = None, exe
         "tax_amount": _format_money(po.tax_amount),
         "total_amount": f"{total_amt_dec:.2f}",
         "unbilled_amount": f"{total_amt_dec:.2f}" if is_unbilled else "0.00",
-        "invoice_number": None,
-        "invoice_date": None,
-        "due_date": None,
+        "invoice_number": inv_num,
+        "invoice_date": inv_date,
+        "due_date": inv_due,
         "remarks": po.remarks,
         "status": po.status,
         "computed_status": "UNBILLED" if is_unbilled else po.status,
@@ -179,9 +188,10 @@ def list_orders(
     offset = (page - 1) * limit
     with get_db_session() as db:
         stmt = (
-            select(PurchaseOrder, Customer, User)
+            select(PurchaseOrder, Customer, User, CommercialInvoice)
             .join(Customer, PurchaseOrder.customer_id == Customer.id)
             .join(User, PurchaseOrder.executive_id == User.id)
+            .outerjoin(CommercialInvoice, CommercialInvoice.po_id == PurchaseOrder.id)
         )
 
         if search and search.strip():
@@ -220,8 +230,8 @@ def list_orders(
         results = db.execute(stmt).all()
 
         serialized = [
-            _serialize_order(po, cust, exec_user)
-            for po, cust, exec_user in results
+            _serialize_order(po, cust, exec_user, inv)
+            for po, cust, exec_user, inv in results
         ]
 
         return {
@@ -236,17 +246,18 @@ def list_orders(
 def get_order(id: int, user: dict = Depends(get_current_user)):
     with get_db_session() as db:
         row = db.execute(
-            select(PurchaseOrder, Customer, User)
+            select(PurchaseOrder, Customer, User, CommercialInvoice)
             .join(Customer, PurchaseOrder.customer_id == Customer.id)
             .join(User, PurchaseOrder.executive_id == User.id)
+            .outerjoin(CommercialInvoice, CommercialInvoice.po_id == PurchaseOrder.id)
             .where(PurchaseOrder.id == id)
         ).first()
 
         if not row:
             raise HTTPException(status_code=404, detail="Purchase order not found")
 
-        po, cust, exec_user = row
-        return _serialize_order(po, cust, exec_user)
+        po, cust, exec_user, inv = row
+        return _serialize_order(po, cust, exec_user, inv)
 
 
 @router.post("", status_code=201)
@@ -277,12 +288,21 @@ def create_order(item: OrderCreate, user: dict = Depends(require_sales_finance_a
         if not exec_user:
             raise HTTPException(status_code=404, detail=f"Executive user with ID {exec_id} not found")
 
-        # 4. PO Number generation & uniqueness check
+        # 4. PO Number generation & uniqueness check (case-insensitive under statutory policy)
         po_num = item.po_number.strip() if item.po_number else None
         if not po_num:
             po_num = f"PO-{datetime.date.today().strftime('%Y%m%d')}-{item.customer_id}"
 
-        existing_po = db.scalar(select(PurchaseOrder).where(PurchaseOrder.po_number == po_num))
+        curr = (item.currency or "INR").strip().upper()
+        if curr != "INR":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported currency: {curr}. Only INR currency is supported under AP-01.",
+            )
+
+        existing_po = db.scalar(
+            select(PurchaseOrder).where(func.lower(PurchaseOrder.po_number) == po_num.lower())
+        )
         if existing_po:
             raise HTTPException(status_code=409, detail=f"Purchase order number '{po_num}' already exists")
 
@@ -424,13 +444,20 @@ def update_order(id: int, item: OrderUpdate, user: dict = Depends(require_sales_
                 detail=f"Cannot edit purchase order in '{po.status}' status. Only UNBILLED orders can be modified.",
             )
 
-        # PO Number update & uniqueness
+        # PO Number update & uniqueness (case-insensitive)
         if item.po_number and item.po_number.strip():
             new_num = item.po_number.strip()
-            if new_num != po.po_number:
-                existing = db.scalar(select(PurchaseOrder).where(PurchaseOrder.po_number == new_num, PurchaseOrder.id != id))
+            if new_num.lower() != po.po_number.lower():
+                existing = db.scalar(
+                    select(PurchaseOrder).where(
+                        func.lower(PurchaseOrder.po_number) == new_num.lower(),
+                        PurchaseOrder.id != id,
+                    )
+                )
                 if existing:
                     raise HTTPException(status_code=409, detail=f"Purchase order number '{new_num}' already exists")
+                po.po_number = new_num
+            else:
                 po.po_number = new_num
 
         # Date update & fiscal year validation
@@ -461,7 +488,13 @@ def update_order(id: int, item: OrderUpdate, user: dict = Depends(require_sales_
             po.executive_id = item.executive_id
 
         if item.currency is not None:
-            po.currency = item.currency
+            new_curr = item.currency.strip().upper()
+            if new_curr != "INR":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported currency: {new_curr}. Only INR currency is supported under AP-01.",
+                )
+            po.currency = new_curr
         if item.exchange_rate is not None and item.exchange_rate > 0:
             po.exchange_rate = Decimal(str(item.exchange_rate))
         if item.remarks is not None:
@@ -588,6 +621,13 @@ def convert_order_to_invoice(id: int, item: OrderConvert, user: dict = Depends(r
             raise HTTPException(
                 status_code=400,
                 detail=f"Cannot convert cancelled purchase order '{po.po_number}'",
+            )
+
+        # Currency restriction under AP-01
+        if (po.currency or "INR").upper() != "INR":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot convert purchase order with unsupported currency '{po.currency}'. Only INR is supported under AP-01.",
             )
 
         # 2. Check invoice number uniqueness
