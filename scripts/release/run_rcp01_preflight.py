@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 ACCEPTED_WP06_BACKEND_SHA = "12582f7abb3c391e2d80d61ada179629d7825eac"
 ACCEPTED_WP06_FRONTEND_SHA = "c6fc51a75135b0343d9c7ad90a80ba5fb5b61260"
-EXPECTED_ALEMBIC_REVISION = "c9a1e847f520"
+EXPECTED_ALEMBIC_REVISION = "e8b7c6d5e4f3"
 PREFLIGHT_BRANCH = "feature/rcp01-security-evidence-remediation"
 
 

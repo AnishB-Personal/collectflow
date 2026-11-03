@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.core.database import get_db_session
 from app.models.domain_models import (
@@ -288,7 +289,7 @@ def create_order(item: OrderCreate, user: dict = Depends(require_sales_finance_a
         if not exec_user:
             raise HTTPException(status_code=404, detail=f"Executive user with ID {exec_id} not found")
 
-        # 4. PO Number generation & uniqueness check (case-insensitive under statutory policy)
+        # 4. PO Number generation & uniqueness check (case-insensitive & trimmed under product policy)
         po_num = item.po_number.strip() if item.po_number else None
         if not po_num:
             po_num = f"PO-{datetime.date.today().strftime('%Y%m%d')}-{item.customer_id}"
@@ -300,11 +301,15 @@ def create_order(item: OrderCreate, user: dict = Depends(require_sales_finance_a
                 detail=f"Unsupported currency: {curr}. Only INR currency is supported under AP-01.",
             )
 
-        existing_po = db.scalar(
-            select(PurchaseOrder).where(func.lower(PurchaseOrder.po_number) == po_num.lower())
-        )
-        if existing_po:
-            raise HTTPException(status_code=409, detail=f"Purchase order number '{po_num}' already exists")
+        norm_po = po_num.strip().lower()
+        if norm_po not in ("no po", "recurring / direct invoice"):
+            existing_po = db.scalar(
+                select(PurchaseOrder).where(
+                    func.lower(func.trim(PurchaseOrder.po_number)) == norm_po
+                )
+            )
+            if existing_po:
+                raise HTTPException(status_code=409, detail=f"Purchase order number '{po_num}' already exists")
 
         # 5. Resolve line items & exact decimal calculation
         raw_items: List[OrderItemCreate] = []
@@ -403,7 +408,14 @@ def create_order(item: OrderCreate, user: dict = Depends(require_sales_finance_a
             items=db_items,
         )
         db.add(new_po)
-        db.flush()
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            db.rollback()
+            exc_str = str(exc).lower()
+            if "uq_po_number" in exc_str or "po_number" in exc_str:
+                raise HTTPException(status_code=409, detail=f"Purchase order number '{po_num}' already exists")
+            raise
 
         # 7. Atomic Audit Log
         log_security_audit(
@@ -420,7 +432,14 @@ def create_order(item: OrderCreate, user: dict = Depends(require_sales_finance_a
             },
             db=db,
         )
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            exc_str = str(exc).lower()
+            if "uq_po_number" in exc_str or "po_number" in exc_str:
+                raise HTTPException(status_code=409, detail=f"Purchase order number '{po_num}' already exists")
+            raise
 
         return _serialize_order(new_po, cust, exec_user)
 
@@ -444,18 +463,21 @@ def update_order(id: int, item: OrderUpdate, user: dict = Depends(require_sales_
                 detail=f"Cannot edit purchase order in '{po.status}' status. Only UNBILLED orders can be modified.",
             )
 
-        # PO Number update & uniqueness (case-insensitive)
+        # PO Number update & uniqueness (case-insensitive & trimmed, excluding approved placeholders)
         if item.po_number and item.po_number.strip():
             new_num = item.po_number.strip()
-            if new_num.lower() != po.po_number.lower():
-                existing = db.scalar(
-                    select(PurchaseOrder).where(
-                        func.lower(PurchaseOrder.po_number) == new_num.lower(),
-                        PurchaseOrder.id != id,
+            norm_new = new_num.lower()
+            norm_curr = po.po_number.strip().lower()
+            if norm_new != norm_curr:
+                if norm_new not in ("no po", "recurring / direct invoice"):
+                    existing = db.scalar(
+                        select(PurchaseOrder).where(
+                            func.lower(func.trim(PurchaseOrder.po_number)) == norm_new,
+                            PurchaseOrder.id != id,
+                        )
                     )
-                )
-                if existing:
-                    raise HTTPException(status_code=409, detail=f"Purchase order number '{new_num}' already exists")
+                    if existing:
+                        raise HTTPException(status_code=409, detail=f"Purchase order number '{new_num}' already exists")
                 po.po_number = new_num
             else:
                 po.po_number = new_num
@@ -557,7 +579,14 @@ def update_order(id: int, item: OrderUpdate, user: dict = Depends(require_sales_
             details={"po_number": po.po_number, "total_amount": float(po.total_amount)},
             db=db,
         )
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            exc_str = str(exc).lower()
+            if "uq_po_number" in exc_str or "po_number" in exc_str:
+                raise HTTPException(status_code=409, detail=f"Purchase order number '{po.po_number}' already exists")
+            raise
 
         cust = db.scalar(select(Customer).where(Customer.id == po.customer_id))
         exec_u = db.scalar(select(User).where(User.id == po.executive_id))

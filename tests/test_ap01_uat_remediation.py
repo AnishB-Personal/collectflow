@@ -139,7 +139,7 @@ class TestCurrencyRestrictionD08AndNegInr001:
 
 
 class TestPurchaseOrderIdUniquenessP01:
-    """Remediation verification for P-01 case-variant PO uniqueness."""
+    """Remediation verification for P-01 case-variant PO uniqueness and concurrency safety."""
 
     def test_case_insensitive_po_number_uniqueness_rejected(self):
         token = _get_admin_token()
@@ -179,6 +179,193 @@ class TestPurchaseOrderIdUniquenessP01:
             assert "already exists" in resp2.json()["detail"].lower()
         finally:
             client.delete(f"/api/orders/{po1_id}", headers={"Authorization": f"Bearer {token}"})
+
+    def test_trimmed_whitespace_po_number_uniqueness_rejected(self):
+        token = _get_admin_token()
+        base_po = f"PO-TRIM-{datetime.date.today().strftime('%Y%m%d%H%M%S')}"
+
+        resp1 = client.post(
+            "/api/orders",
+            json={
+                "fy_code": "FY 2026-27",
+                "po_number": base_po,
+                "po_date": "2026-05-15",
+                "customer_id": 1,
+                "currency": "INR",
+                "exclusive_amount": 15000.0,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp1.status_code == 201
+        po1_id = resp1.json()["id"]
+
+        try:
+            # Whitespace and casing variant
+            resp2 = client.post(
+                "/api/orders",
+                json={
+                    "fy_code": "FY 2026-27",
+                    "po_number": f"  {base_po.lower()}  ",
+                    "po_date": "2026-05-16",
+                    "customer_id": 1,
+                    "currency": "INR",
+                    "exclusive_amount": 25000.0,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp2.status_code == 409
+            assert "already exists" in resp2.json()["detail"].lower()
+        finally:
+            client.delete(f"/api/orders/{po1_id}", headers={"Authorization": f"Bearer {token}"})
+
+    def test_update_po_case_insensitive_duplicate_rejected(self):
+        token = _get_admin_token()
+        ts = datetime.date.today().strftime('%Y%m%d%H%M%S')
+        po_a = f"PO-UP-A-{ts}"
+        po_b = f"PO-UP-B-{ts}"
+
+        r1 = client.post(
+            "/api/orders",
+            json={"fy_code": "FY 2026-27", "po_number": po_a, "po_date": "2026-05-15", "customer_id": 1, "currency": "INR", "exclusive_amount": 10000.0},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        r2 = client.post(
+            "/api/orders",
+            json={"fy_code": "FY 2026-27", "po_number": po_b, "po_date": "2026-05-15", "customer_id": 1, "currency": "INR", "exclusive_amount": 12000.0},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r1.status_code == 201
+        assert r2.status_code == 201
+        id_a = r1.json()["id"]
+        id_b = r2.json()["id"]
+
+        try:
+            # Update order B to order A's number with lowercase and spaces
+            r_up = client.put(
+                f"/api/orders/{id_b}",
+                json={"po_number": f"  {po_a.lower()}  "},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert r_up.status_code == 409
+            assert "already exists" in r_up.json()["detail"].lower()
+        finally:
+            client.delete(f"/api/orders/{id_a}", headers={"Authorization": f"Bearer {token}"})
+            client.delete(f"/api/orders/{id_b}", headers={"Authorization": f"Bearer {token}"})
+
+    def test_approved_exceptions_allowed_to_repeat(self):
+        token = _get_admin_token()
+        # "No PO" and "Recurring / Direct Invoice" with varied casing/whitespace must be permitted repeatedly
+        created_ids = []
+        try:
+            placeholders = ["No PO", "  no po  ", "NO PO", "Recurring / Direct Invoice", " recurring / direct invoice "]
+            for p in placeholders:
+                r = client.post(
+                    "/api/orders",
+                    json={
+                        "fy_code": "FY 2026-27",
+                        "po_number": p,
+                        "po_date": "2026-05-15",
+                        "customer_id": 1,
+                        "currency": "INR",
+                        "exclusive_amount": 5000.0,
+                    },
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert r.status_code == 201, f"Placeholder '{p}' was rejected: {r.text}"
+                created_ids.append(r.json()["id"])
+        finally:
+            for cid in created_ids:
+                client.delete(f"/api/orders/{cid}", headers={"Authorization": f"Bearer {token}"})
+
+    def test_database_level_functional_unique_index_enforcement(self):
+        """Verify PostgreSQL functional unique index enforces uniqueness at database layer."""
+        from app.core.database import get_db_session
+        from app.models.domain_models import PurchaseOrder
+        from sqlalchemy.exc import IntegrityError
+        from decimal import Decimal
+        import datetime
+
+        base_po = f"PO-DB-INDEX-{datetime.date.today().strftime('%Y%m%d%H%M%S')}"
+        with get_db_session() as db:
+            po1 = PurchaseOrder(
+                fy_code="FY 2026-27",
+                po_number=base_po.upper(),
+                po_date=datetime.date(2026, 5, 15),
+                customer_id=1,
+                executive_id=1,
+                currency="INR",
+                exclusive_amount=Decimal("1000.00"),
+                tax_rate=Decimal("0.1800"),
+                tax_amount=Decimal("180.00"),
+                total_amount=Decimal("1180.00"),
+            )
+            db.add(po1)
+            db.commit()
+            po1_id = po1.id
+
+            try:
+                # Direct SQL insert with case variation bypassing router validation
+                po2 = PurchaseOrder(
+                    fy_code="FY 2026-27",
+                    po_number=f"  {base_po.lower()}  ",
+                    po_date=datetime.date(2026, 5, 16),
+                    customer_id=1,
+                    executive_id=1,
+                    currency="INR",
+                    exclusive_amount=Decimal("2000.00"),
+                    tax_rate=Decimal("0.1800"),
+                    tax_amount=Decimal("360.00"),
+                    total_amount=Decimal("2360.00"),
+                )
+                db.add(po2)
+                try:
+                    db.commit()
+                    assert False, "Database constraint should have rejected case-variant duplicate PO"
+                except IntegrityError:
+                    db.rollback()
+            finally:
+                with get_db_session() as clean_db:
+                    clean_po = clean_db.scalar(select(PurchaseOrder).where(PurchaseOrder.id == po1_id))
+                    if clean_po:
+                        clean_db.delete(clean_po)
+                        clean_db.commit()
+
+    def test_concurrent_po_insert_race_condition(self):
+        """Verify concurrent requests attempting to insert duplicate case-variant PO are safely serialized."""
+        import concurrent.futures
+        token = _get_admin_token()
+        base_po = f"PO-CONC-{datetime.date.today().strftime('%Y%m%d%H%M%S')}"
+
+        def try_insert(po_label):
+            return client.post(
+                "/api/orders",
+                json={
+                    "fy_code": "FY 2026-27",
+                    "po_number": po_label,
+                    "po_date": "2026-05-15",
+                    "customer_id": 1,
+                    "currency": "INR",
+                    "exclusive_amount": 10000.0,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        labels = [base_po.upper(), base_po.lower(), f"  {base_po}  "]
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(try_insert, lbl) for lbl in labels]
+            for f in concurrent.futures.as_completed(futures):
+                results.append(f.result())
+
+        status_codes = [r.status_code for r in results]
+        # Exactly one must succeed (201), the other two must be rejected with 409
+        assert status_codes.count(201) == 1, f"Expected exactly one 201, got {status_codes}"
+        assert status_codes.count(409) == 2, f"Expected two 409s, got {status_codes}"
+
+        # Clean up the created PO
+        for r in results:
+            if r.status_code == 201:
+                client.delete(f"/api/orders/{r.json()['id']}", headers={"Authorization": f"Bearer {token}"})
 
 
 class TestExportExclusionsD02:

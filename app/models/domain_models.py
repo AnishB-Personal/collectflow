@@ -27,6 +27,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Index,
     text,
+    func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
@@ -161,7 +162,7 @@ class PurchaseOrder(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     fy_code = Column(String(20), ForeignKey("financial_years.code"), nullable=False)
-    po_number = Column(String(50), unique=True, nullable=False)
+    po_number = Column(String(50), nullable=False)
     po_date = Column(Date, nullable=False)
     customer_id = Column(Integer, ForeignKey("customers.id", ondelete="RESTRICT"), nullable=False)
     executive_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
@@ -188,6 +189,12 @@ class PurchaseOrder(Base):
         Index("idx_po_customer", "customer_id"),
         Index("idx_po_executive", "executive_id"),
         Index("idx_po_status", "status"),
+        Index(
+            "uq_po_number_lower_trim",
+            func.lower(func.trim(po_number)),
+            unique=True,
+            postgresql_where=text("lower(trim(po_number)) NOT IN ('no po', 'recurring / direct invoice')"),
+        ),
     )
 
 
