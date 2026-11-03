@@ -189,12 +189,7 @@ class PurchaseOrder(Base):
         Index("idx_po_customer", "customer_id"),
         Index("idx_po_executive", "executive_id"),
         Index("idx_po_status", "status"),
-        Index(
-            "uq_po_number_lower_trim",
-            func.lower(func.trim(po_number)),
-            unique=True,
-            postgresql_where=text("lower(trim(po_number)) NOT IN ('no po', 'recurring / direct invoice')"),
-        ),
+        Index("idx_po_number", "po_number"),
     )
 
 

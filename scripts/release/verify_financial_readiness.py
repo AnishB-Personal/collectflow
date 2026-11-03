@@ -44,7 +44,7 @@ if os.environ.get("COLLECTFLOW_ENV") == "test" and "COLLECTFLOW_DATABASE_URL" no
         "postgresql+psycopg://collectflow_user:collectflow_secret@127.0.0.1:5432/collectflow_test"
     )
 
-EXPECTED_ALEMBIC_REVISION = "e8b7c6d5e4f3"
+EXPECTED_ALEMBIC_REVISION = "f1a2b3c4d5e6"
 APPROVED_TEST_ENVS = {"test", "ci", "isolated_test"}
 APPROVED_TEST_DATABASES = {"collectflow_test", "collectflow_ci"}
 BASELINE_MIN_TOTAL_TESTS = 374

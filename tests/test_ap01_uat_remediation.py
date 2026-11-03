@@ -15,9 +15,10 @@ Validates the remediation of independently documented UAT findings:
 
 import datetime
 from decimal import Decimal
+import uuid
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 
 from app.core.database import get_db_session
 from app.main import app
@@ -138,19 +139,21 @@ class TestCurrencyRestrictionD08AndNegInr001:
             client.delete(f"/api/orders/{order_id}", headers={"Authorization": f"Bearer {token}"})
 
 
-class TestPurchaseOrderIdUniquenessP01:
-    """Remediation verification for P-01 case-variant PO uniqueness and concurrency safety."""
+class TestPurchaseOrderIdPolicyP01:
+    """Remediation verification for P-01: PO references are customer-supplied external references,
 
-    def test_case_insensitive_po_number_uniqueness_rejected(self):
+    not unique business identifiers. Multiple orders may share the same PO reference.
+    """
+
+    def test_repeated_po_reference_same_customer_permitted(self):
         token = _get_admin_token()
-        base_po = f"PO-CASE-{datetime.date.today().strftime('%Y%m%d%H%M%S')}"
+        po_ref = f"PO-SAME-CUST-{datetime.date.today().strftime('%Y%m%d%H%M%S')}"
 
-        # 1. Create uppercase PO
-        resp1 = client.post(
+        r1 = client.post(
             "/api/orders",
             json={
                 "fy_code": "FY 2026-27",
-                "po_number": base_po.upper(),
+                "po_number": po_ref,
                 "po_date": "2026-05-15",
                 "customer_id": 1,
                 "currency": "INR",
@@ -158,67 +161,102 @@ class TestPurchaseOrderIdUniquenessP01:
             },
             headers={"Authorization": f"Bearer {token}"},
         )
-        assert resp1.status_code == 201, f"Failed creating first PO: {resp1.text}"
-        po1_id = resp1.json()["id"]
+        assert r1.status_code == 201, f"Failed creating first PO: {r1.text}"
+        id1 = r1.json()["id"]
 
         try:
-            # 2. Attempt to create lowercase variant of same PO
-            resp2 = client.post(
+            # Second order for the SAME customer with identical PO reference must be accepted
+            r2 = client.post(
                 "/api/orders",
                 json={
                     "fy_code": "FY 2026-27",
-                    "po_number": base_po.lower(),
+                    "po_number": po_ref,
                     "po_date": "2026-05-16",
                     "customer_id": 1,
                     "currency": "INR",
-                    "exclusive_amount": 20000.0,
+                    "exclusive_amount": 15000.0,
                 },
                 headers={"Authorization": f"Bearer {token}"},
             )
-            assert resp2.status_code == 409, f"Expected 409 for case-variant duplicate PO, got {resp2.status_code}: {resp2.text}"
-            assert "already exists" in resp2.json()["detail"].lower()
+            assert r2.status_code == 201, f"Expected 201 for repeated PO reference, got {r2.status_code}: {r2.text}"
+            id2 = r2.json()["id"]
+            assert id1 != id2, "Each purchase order must retain its unique internal database identifier"
+            assert r1.json()["po_number"] == po_ref
+            assert r2.json()["po_number"] == po_ref
         finally:
-            client.delete(f"/api/orders/{po1_id}", headers={"Authorization": f"Bearer {token}"})
+            client.delete(f"/api/orders/{id1}", headers={"Authorization": f"Bearer {token}"})
+            if "id2" in locals():
+                client.delete(f"/api/orders/{id2}", headers={"Authorization": f"Bearer {token}"})
 
-    def test_trimmed_whitespace_po_number_uniqueness_rejected(self):
+    def test_repeated_po_reference_across_different_customers_permitted(self):
         token = _get_admin_token()
-        base_po = f"PO-TRIM-{datetime.date.today().strftime('%Y%m%d%H%M%S')}"
+        po_ref = f"PO-DIFF-CUST-{datetime.date.today().strftime('%Y%m%d%H%M%S')}"
 
-        resp1 = client.post(
-            "/api/orders",
+        # Create or ensure second customer exists
+        cust_resp = client.post(
+            "/api/customers",
             json={
-                "fy_code": "FY 2026-27",
-                "po_number": base_po,
-                "po_date": "2026-05-15",
-                "customer_id": 1,
-                "currency": "INR",
-                "exclusive_amount": 15000.0,
+                "billing_name": f"Partner Corp {datetime.date.today().strftime('%H%M%S')}",
+                "gstin": "29ABCDE1234F1Z5",
+                "state": "Karnataka",
+                "state_code": "29",
+                "payment_terms_days": 30,
             },
             headers={"Authorization": f"Bearer {token}"},
         )
-        assert resp1.status_code == 201
-        po1_id = resp1.json()["id"]
+        cid2 = cust_resp.json()["id"] if cust_resp.status_code == 201 else 2
+
+        r1 = client.post(
+            "/api/orders",
+            json={"fy_code": "FY 2026-27", "po_number": po_ref, "po_date": "2026-05-15", "customer_id": 1, "currency": "INR", "exclusive_amount": 10000.0},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r1.status_code == 201
+        id1 = r1.json()["id"]
 
         try:
-            # Whitespace and casing variant
-            resp2 = client.post(
+            # Order for different customer with identical PO reference
+            r2 = client.post(
                 "/api/orders",
-                json={
-                    "fy_code": "FY 2026-27",
-                    "po_number": f"  {base_po.lower()}  ",
-                    "po_date": "2026-05-16",
-                    "customer_id": 1,
-                    "currency": "INR",
-                    "exclusive_amount": 25000.0,
-                },
+                json={"fy_code": "FY 2026-27", "po_number": po_ref, "po_date": "2026-05-16", "customer_id": cid2, "currency": "INR", "exclusive_amount": 20000.0},
                 headers={"Authorization": f"Bearer {token}"},
             )
-            assert resp2.status_code == 409
-            assert "already exists" in resp2.json()["detail"].lower()
+            assert r2.status_code == 201, f"Expected 201 across different customers, got {r2.status_code}: {r2.text}"
+            id2 = r2.json()["id"]
+            assert id1 != id2
         finally:
-            client.delete(f"/api/orders/{po1_id}", headers={"Authorization": f"Bearer {token}"})
+            client.delete(f"/api/orders/{id1}", headers={"Authorization": f"Bearer {token}"})
+            if "id2" in locals():
+                client.delete(f"/api/orders/{id2}", headers={"Authorization": f"Bearer {token}"})
 
-    def test_update_po_case_insensitive_duplicate_rejected(self):
+    def test_case_variant_and_whitespace_repeated_po_reference_permitted(self):
+        token = _get_admin_token()
+        base_po = f"PO-FLEX-{datetime.date.today().strftime('%Y%m%d%H%M%S')}"
+
+        r1 = client.post(
+            "/api/orders",
+            json={"fy_code": "FY 2026-27", "po_number": base_po.upper(), "po_date": "2026-05-15", "customer_id": 1, "currency": "INR", "exclusive_amount": 10000.0},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r1.status_code == 201
+        id1 = r1.json()["id"]
+
+        try:
+            # Case variant and whitespace
+            r2 = client.post(
+                "/api/orders",
+                json={"fy_code": "FY 2026-27", "po_number": f"  {base_po.lower()}  ", "po_date": "2026-05-16", "customer_id": 1, "currency": "INR", "exclusive_amount": 12000.0},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert r2.status_code == 201, f"Case-variant duplicate PO should be permitted: {r2.text}"
+            id2 = r2.json()["id"]
+            assert id1 != id2
+        finally:
+            client.delete(f"/api/orders/{id1}", headers={"Authorization": f"Bearer {token}"})
+            if "id2" in locals():
+                client.delete(f"/api/orders/{id2}", headers={"Authorization": f"Bearer {token}"})
+
+    def test_update_po_reference_to_existing_reference_permitted(self):
         token = _get_admin_token()
         ts = datetime.date.today().strftime('%Y%m%d%H%M%S')
         po_a = f"PO-UP-A-{ts}"
@@ -240,132 +278,151 @@ class TestPurchaseOrderIdUniquenessP01:
         id_b = r2.json()["id"]
 
         try:
-            # Update order B to order A's number with lowercase and spaces
+            # Update order B to order A's PO number -> must succeed
             r_up = client.put(
                 f"/api/orders/{id_b}",
-                json={"po_number": f"  {po_a.lower()}  "},
+                json={"po_number": po_a},
                 headers={"Authorization": f"Bearer {token}"},
             )
-            assert r_up.status_code == 409
-            assert "already exists" in r_up.json()["detail"].lower()
+            assert r_up.status_code == 200, f"Expected 200 updating to existing PO reference, got {r_up.status_code}: {r_up.text}"
+            assert r_up.json()["po_number"] == po_a
         finally:
             client.delete(f"/api/orders/{id_a}", headers={"Authorization": f"Bearer {token}"})
             client.delete(f"/api/orders/{id_b}", headers={"Authorization": f"Bearer {token}"})
 
-    def test_approved_exceptions_allowed_to_repeat(self):
-        token = _get_admin_token()
-        # "No PO" and "Recurring / Direct Invoice" with varied casing/whitespace must be permitted repeatedly
-        created_ids = []
-        try:
-            placeholders = ["No PO", "  no po  ", "NO PO", "Recurring / Direct Invoice", " recurring / direct invoice "]
-            for p in placeholders:
-                r = client.post(
-                    "/api/orders",
-                    json={
-                        "fy_code": "FY 2026-27",
-                        "po_number": p,
-                        "po_date": "2026-05-15",
-                        "customer_id": 1,
-                        "currency": "INR",
-                        "exclusive_amount": 5000.0,
-                    },
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-                assert r.status_code == 201, f"Placeholder '{p}' was rejected: {r.text}"
-                created_ids.append(r.json()["id"])
-        finally:
-            for cid in created_ids:
-                client.delete(f"/api/orders/{cid}", headers={"Authorization": f"Bearer {token}"})
-
-    def test_database_level_functional_unique_index_enforcement(self):
-        """Verify PostgreSQL functional unique index enforces uniqueness at database layer."""
-        from app.core.database import get_db_session
-        from app.models.domain_models import PurchaseOrder
-        from sqlalchemy.exc import IntegrityError
-        from decimal import Decimal
-        import datetime
-
-        base_po = f"PO-DB-INDEX-{datetime.date.today().strftime('%Y%m%d%H%M%S')}"
-        with get_db_session() as db:
-            po1 = PurchaseOrder(
-                fy_code="FY 2026-27",
-                po_number=base_po.upper(),
-                po_date=datetime.date(2026, 5, 15),
-                customer_id=1,
-                executive_id=1,
-                currency="INR",
-                exclusive_amount=Decimal("1000.00"),
-                tax_rate=Decimal("0.1800"),
-                tax_amount=Decimal("180.00"),
-                total_amount=Decimal("1180.00"),
-            )
-            db.add(po1)
-            db.commit()
-            po1_id = po1.id
-
-            try:
-                # Direct SQL insert with case variation bypassing router validation
-                po2 = PurchaseOrder(
-                    fy_code="FY 2026-27",
-                    po_number=f"  {base_po.lower()}  ",
-                    po_date=datetime.date(2026, 5, 16),
-                    customer_id=1,
-                    executive_id=1,
-                    currency="INR",
-                    exclusive_amount=Decimal("2000.00"),
-                    tax_rate=Decimal("0.1800"),
-                    tax_amount=Decimal("360.00"),
-                    total_amount=Decimal("2360.00"),
-                )
-                db.add(po2)
-                try:
-                    db.commit()
-                    assert False, "Database constraint should have rejected case-variant duplicate PO"
-                except IntegrityError:
-                    db.rollback()
-            finally:
-                with get_db_session() as clean_db:
-                    clean_po = clean_db.scalar(select(PurchaseOrder).where(PurchaseOrder.id == po1_id))
-                    if clean_po:
-                        clean_db.delete(clean_po)
-                        clean_db.commit()
-
-    def test_concurrent_po_insert_race_condition(self):
-        """Verify concurrent requests attempting to insert duplicate case-variant PO are safely serialized."""
+    def test_concurrent_order_creation_same_po_reference(self):
+        """Verify concurrent requests creating orders with the same external PO reference all succeed."""
         import concurrent.futures
         token = _get_admin_token()
-        base_po = f"PO-CONC-{datetime.date.today().strftime('%Y%m%d%H%M%S')}"
+        base_po = f"PO-CONC-LEGIT-{datetime.date.today().strftime('%Y%m%d%H%M%S')}"
 
-        def try_insert(po_label):
+        def create_order_task(amt):
             return client.post(
                 "/api/orders",
                 json={
                     "fy_code": "FY 2026-27",
-                    "po_number": po_label,
+                    "po_number": base_po,
                     "po_date": "2026-05-15",
                     "customer_id": 1,
                     "currency": "INR",
-                    "exclusive_amount": 10000.0,
+                    "exclusive_amount": float(amt),
                 },
                 headers={"Authorization": f"Bearer {token}"},
             )
 
-        labels = [base_po.upper(), base_po.lower(), f"  {base_po}  "]
+        amounts = [10000.0, 20000.0, 30000.0]
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [executor.submit(try_insert, lbl) for lbl in labels]
+            futures = [executor.submit(create_order_task, a) for a in amounts]
             for f in concurrent.futures.as_completed(futures):
                 results.append(f.result())
 
         status_codes = [r.status_code for r in results]
-        # Exactly one must succeed (201), the other two must be rejected with 409
-        assert status_codes.count(201) == 1, f"Expected exactly one 201, got {status_codes}"
-        assert status_codes.count(409) == 2, f"Expected two 409s, got {status_codes}"
+        assert status_codes == [201, 201, 201], f"All concurrent orders with same PO reference should succeed, got {status_codes}"
+        ids = [r.json()["id"] for r in results]
+        assert len(set(ids)) == 3, f"Each order must receive a unique internal ID: {ids}"
 
-        # Clean up the created PO
-        for r in results:
-            if r.status_code == 201:
-                client.delete(f"/api/orders/{r.json()['id']}", headers={"Authorization": f"Bearer {token}"})
+        # Clean up
+        for order_id in ids:
+            client.delete(f"/api/orders/{order_id}", headers={"Authorization": f"Bearer {token}"})
+
+    def test_po_reference_search_associates_correct_customers(self):
+        token = _get_admin_token()
+        po_search = f"PO-SEARCH-{datetime.date.today().strftime('%Y%m%d%H%M%S')}"
+
+        r = client.post(
+            "/api/orders",
+            json={"fy_code": "FY 2026-27", "po_number": po_search, "po_date": "2026-05-15", "customer_id": 1, "currency": "INR", "exclusive_amount": 10000.0},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 201
+        oid = r.json()["id"]
+
+        try:
+            # Query orders listing with search
+            search_resp = client.get(
+                f"/api/orders?search={po_search}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert search_resp.status_code == 200
+            items = search_resp.json()["data"]
+            assert len(items) >= 1
+            found = next((i for i in items if i["id"] == oid), None)
+            assert found is not None
+            assert found["po_number"] == po_search
+            assert found["customer_id"] == 1
+        finally:
+            client.delete(f"/api/orders/{oid}", headers={"Authorization": f"Bearer {token}"})
+
+    def test_duplicate_conversion_and_invoice_uniqueness_still_enforced(self):
+        token = _get_admin_token()
+        ts = uuid.uuid4().hex[:10]
+        po_num = f"PO-CONV-{ts}"
+        inv_num = f"INV-DUP-TEST-{ts}"
+        po2_num = f"PO-OTHER-{ts}"
+
+        r_po = client.post(
+            "/api/orders",
+            json={"fy_code": "FY 2026-27", "po_number": po_num, "po_date": "2026-05-15", "customer_id": 1, "currency": "INR", "exclusive_amount": 10000.0},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r_po.status_code == 201
+        poid = r_po.json()["id"]
+
+        try:
+            # 1. Convert to invoice
+            r_conv = client.post(
+                f"/api/orders/{poid}/convert",
+                json={"invoice_number": inv_num, "invoice_date": "2026-05-15"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert r_conv.status_code == 201, f"Failed converting PO: {r_conv.text}"
+
+            # 2. Duplicate conversion of same PO must be rejected (409)
+            r_reconv = client.post(
+                f"/api/orders/{poid}/convert",
+                json={"invoice_number": f"INV-OTHER-{ts}", "invoice_date": "2026-05-15"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert r_reconv.status_code == 409, f"Expected 409 for duplicate conversion, got {r_reconv.status_code}"
+            assert "already been converted" in r_reconv.json()["detail"].lower()
+
+            # 3. Duplicate invoice number rejection remains enforced
+            r_po2 = client.post(
+                "/api/orders",
+                json={"fy_code": "FY 2026-27", "po_number": po2_num, "po_date": "2026-05-15", "customer_id": 1, "currency": "INR", "exclusive_amount": 5000.0},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            poid2 = r_po2.json()["id"]
+            try:
+                r_conv2 = client.post(
+                    f"/api/orders/{poid2}/convert",
+                    json={"invoice_number": inv_num, "invoice_date": "2026-05-15"},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert r_conv2.status_code == 409, f"Expected 409 for duplicate invoice number, got {r_conv2.status_code}"
+                assert "already exists" in r_conv2.json()["detail"].lower()
+            finally:
+                client.delete(f"/api/orders/{poid2}", headers={"Authorization": f"Bearer {token}"})
+        finally:
+            with get_db_session() as session:
+                session.execute(
+                    text("DELETE FROM commercial_invoice_items WHERE invoice_id IN (SELECT id FROM commercial_invoices WHERE invoice_number LIKE :inv)"),
+                    {"inv": f"INV-%-{ts}%"}
+                )
+                session.execute(
+                    text("DELETE FROM commercial_invoices WHERE invoice_number LIKE :inv"),
+                    {"inv": f"INV-%-{ts}%"}
+                )
+                session.execute(
+                    text("DELETE FROM purchase_order_items WHERE po_id IN (SELECT id FROM purchase_orders WHERE po_number LIKE :po)"),
+                    {"po": f"PO-%-{ts}%"}
+                )
+                session.execute(
+                    text("DELETE FROM purchase_orders WHERE po_number LIKE :po"),
+                    {"po": f"PO-%-{ts}%"}
+                )
+                session.commit()
 
 
 class TestExportExclusionsD02:
