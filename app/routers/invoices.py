@@ -169,7 +169,7 @@ def _serialize_invoice(
             if inv.due_date and inv.due_date < today:
                 days_overdue = (today - inv.due_date).days
 
-    po_num = po.po_number if po else (inv.remarks if inv.po_id is None else None)
+    po_num = po.po_number if po else None
     po_dt = po.po_date.isoformat() if po and po.po_date else None
 
     return {

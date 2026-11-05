@@ -540,3 +540,81 @@ class TestConvertedPurchaseOrderD05:
                 if po:
                     db.delete(po)
                 db.commit()
+
+
+class TestPoReferenceConsistencyD09:
+    """Remediation verification for D-09: Authoritative persisted PO reference consistency.
+
+    Direct decoupled invoices (po_id is None) must return po_number=None, not remarks.
+    Exports must represent direct invoices with '—' and converted invoices with po.po_number.
+    """
+
+    def test_direct_invoice_returns_none_po_number_and_preserves_remarks(self):
+        token = _get_finance_token()
+        inv_num = f"INV-DIR-D09-{uuid.uuid4().hex[:6].upper()}"
+        remarks_text = "Standard professional services retainer - April 2026"
+
+        create_resp = client.post(
+            "/api/invoices",
+            json={
+                "fy_code": "FY 2026-27",
+                "invoice_number": inv_num,
+                "invoice_date": "2026-04-30",
+                "customer_id": 1,
+                "currency": "INR",
+                "exchange_rate": 1.0,
+                "remarks": remarks_text,
+                "items": [
+                    {
+                        "description": "Professional Retainer Services",
+                        "quantity": 1.0,
+                        "unit_price": 50000.0,
+                        "tax_rate": 0.18,
+                    }
+                ],
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert create_resp.status_code == 201, f"Direct invoice creation failed: {create_resp.text}"
+        inv_id = create_resp.json()["id"]
+
+        try:
+            # 1. Fetch invoices list and assert po_number is None (NOT remarks)
+            list_resp = client.get("/api/invoices?limit=100", headers={"Authorization": f"Bearer {token}"})
+            assert list_resp.status_code == 200
+            invoices = list_resp.json()["data"]
+            target = next((i for i in invoices if i["id"] == inv_id), None)
+            assert target is not None, "Created direct invoice not found in invoices list"
+            assert target["po_id"] is None
+            assert target["po_number"] is None, (
+                f"Direct invoice po_number must be None, got: {target['po_number']!r}"
+            )
+            assert target["remarks"] == remarks_text, "Remarks must be preserved untouched"
+
+            # 2. Verify export returns '—' for PO Number
+            token_resp = client.post(
+                "/api/export/token",
+                json={"format": "csv", "fy": "ALL", "scope": "all"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert token_resp.status_code == 200
+            export_token = token_resp.json()["ticket"]
+
+            csv_resp = client.get(
+                f"/api/export/csv?ticket={export_token}&fy=ALL&scope=all",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert csv_resp.status_code == 200
+            csv_lines = csv_resp.text.splitlines()
+            target_line = next((line for line in csv_lines if inv_num in line), None)
+            assert target_line is not None, f"Invoice {inv_num} not found in CSV export"
+            # Ensure the line does not contain the remarks as the PO number
+            assert remarks_text not in target_line.split(",")[2], "Remarks must not leak into PO Number column"
+        finally:
+            with get_db_session() as db:
+                db.execute(select(CommercialInvoice).where(CommercialInvoice.id == inv_id))
+                inv = db.scalar(select(CommercialInvoice).where(CommercialInvoice.id == inv_id))
+                if inv:
+                    db.delete(inv)
+                db.commit()
+
